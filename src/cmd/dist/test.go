@@ -29,6 +29,7 @@ func cmdtest() {
 	var t tester
 	var noRebuild bool
 	flag.BoolVar(&t.listMode, "list", false, "list available tests")
+	flag.BoolVar(&t.jsonMode, "json", false, "pass -json to inner go test commands")
 	flag.BoolVar(&t.rebuild, "rebuild", false, "rebuild everything first")
 	flag.BoolVar(&noRebuild, "no-rebuild", false, "overrides -rebuild (historical dreg)")
 	flag.BoolVar(&t.keepGoing, "k", false, "keep going even when error occurred")
@@ -50,6 +51,7 @@ func cmdtest() {
 type tester struct {
 	race        bool
 	listMode    bool
+	jsonMode    bool
 	rebuild     bool
 	failed      bool
 	keepGoing   bool
@@ -294,9 +296,13 @@ func short() string {
 // Callers should use goTest and then pass flags overriding these
 // defaults as later arguments in the command line.
 func (t *tester) goTest() []string {
-	return []string{
+	cmdline := []string{
 		"go", "test", "-short=" + short(), "-count=1", t.tags(), t.runFlag(""),
 	}
+	if t.jsonMode {
+		cmdline = append(cmdline, "-json")
+	}
+	return cmdline
 }
 
 func (t *tester) tags() string {
@@ -378,6 +384,9 @@ func (t *tester) registerStdTest(pkg string, useG3 bool) {
 				t.tags(),
 				t.timeout(timeoutSec),
 				"-gcflags=all=" + gcflags,
+			}
+			if t.jsonMode {
+				args = append(args, "-json")
 			}
 			if t.race {
 				args = append(args, "-race")
