@@ -3,6 +3,7 @@ module std
 go 1.22
 
 require (
+	github.com/golang-fips/openssl/v2 v2.0.0-rc.2
 	golang.org/x/crypto v0.12.0
 	golang.org/x/net v0.14.1-0.20230809150940-1e23797619c9
 )

@@ -59,6 +59,7 @@ type Flags struct {
 	PreemptibleLoops  bool
 	StaticLockRanking bool
 	BoringCrypto      bool
+	OpenSSLCrypto     bool
 
 	// SystemCrypto enables the OpenSSL or CNG crypto experiment depending on
 	// which one is appropriate on the target GOOS.

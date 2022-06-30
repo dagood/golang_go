@@ -1152,6 +1152,7 @@ var hostobj []Hostobj
 // These packages can use internal linking mode.
 // Others trigger external mode.
 var internalpkg = []string{
+	"vendor/github.com/golang-fips/openssl/v2",
 	"crypto/internal/boring",
 	"crypto/internal/boring/syso",
 	"crypto/x509",

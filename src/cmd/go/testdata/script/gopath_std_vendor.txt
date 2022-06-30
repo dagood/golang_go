@@ -1,5 +1,14 @@
 env GO111MODULE=off
 
+# Disable OpenSSLCrypto backend while evaluating test dependencies to avoid importing
+# vendored crypto module dependencies like golang-fips/openssl. This test script
+# is not set up to handle any vendored libraries being imported other than
+# golang.org/x/net/http2/hpack, so we must make sure it is the only one.
+#
+# See https://github.com/microsoft/go/issues/481 for more details, such as the
+# dependency chain that would cause the failure if the gocrypt tag isn't used.
+env GOEXPERIMENT=none
+
 [!compiler:gc] skip
 
 go list -f '{{.Dir}}' vendor/golang.org/x/net/http2/hpack

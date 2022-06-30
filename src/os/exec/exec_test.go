@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"internal/goexperiment"
 	"internal/poll"
 	"internal/testenv"
 	"io"
@@ -698,6 +699,14 @@ func TestExtraFiles(t *testing.T) {
 
 	if runtime.GOOS == "windows" {
 		t.Skipf("skipping test on %q", runtime.GOOS)
+	}
+
+	if goexperiment.OpenSSLCrypto {
+		// OpenSSL default behavior is to maintain open FDs to any
+		// random devices that get used by the random number library.
+		// Since those FDs are not marked FD_CLOEXEC or O_CLOEXEC,
+		// they also get inherited by children.
+		t.Skip("skipping test because test was run with OpenSSLCrypto")
 	}
 
 	// Force network usage, to verify the epoll (or whatever) fd

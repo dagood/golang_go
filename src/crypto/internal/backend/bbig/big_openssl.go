@@ -2,16 +2,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !boringcrypto && !goexperiment.opensslcrypto
+//go:build goexperiment.opensslcrypto
 
 package bbig
 
-import "math/big"
+import "github.com/golang-fips/openssl/v2/bbig"
 
-func Enc(b *big.Int) []uint {
-	return nil
-}
-
-func Dec(b []uint) *big.Int {
-	return nil
-}
+var Enc = bbig.Enc
+var Dec = bbig.Dec

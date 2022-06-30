@@ -427,6 +427,8 @@ var depsRules = `
 
 	crypto/cipher,
 	crypto/internal/boring/bcache
+	< github.com/golang-fips/openssl/v2/internal/subtle
+	< github.com/golang-fips/openssl/v2
 	< crypto/internal/boring
 	< crypto/internal/backend
 	< crypto/boring;
@@ -461,6 +463,7 @@ var depsRules = `
 
 	# CRYPTO-MATH is core bignum-based crypto - no cgo, net; fmt now ok.
 	CRYPTO, FMT, math/big
+	< github.com/golang-fips/openssl/v2/bbig
 	< crypto/internal/boring/bbig
 	< crypto/internal/backend/bbig
 	< crypto/rand
@@ -709,7 +712,7 @@ var buildIgnore = []byte("\n//go:build ignore")
 
 func findImports(pkg string) ([]string, error) {
 	vpkg := pkg
-	if strings.HasPrefix(pkg, "golang.org") {
+	if strings.HasPrefix(pkg, "golang.org") || strings.HasPrefix(pkg, "github.com") {
 		vpkg = "vendor/" + pkg
 	}
 	dir := filepath.Join(Default.GOROOT, "src", vpkg)
@@ -719,7 +722,7 @@ func findImports(pkg string) ([]string, error) {
 	}
 	var imports []string
 	var haveImport = map[string]bool{}
-	if pkg == "crypto/internal/boring" {
+	if pkg == "crypto/internal/boring" || pkg == "github.com/golang-fips/openssl/v2" {
 		haveImport["C"] = true // kludge: prevent C from appearing in crypto/internal/boring imports
 	}
 	fset := token.NewFileSet()
