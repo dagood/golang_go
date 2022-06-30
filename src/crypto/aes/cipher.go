@@ -7,7 +7,7 @@ package aes
 import (
 	"crypto/cipher"
 	"crypto/internal/alias"
-	"crypto/internal/boring"
+	boring "crypto/internal/backend"
 	"strconv"
 )
 

@@ -8,7 +8,7 @@ package ecdh
 
 import (
 	"crypto"
-	"crypto/internal/boring"
+	boring "crypto/internal/backend"
 	"crypto/subtle"
 	"errors"
 	"io"

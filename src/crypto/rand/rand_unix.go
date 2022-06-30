@@ -10,7 +10,7 @@
 package rand
 
 import (
-	"crypto/internal/boring"
+	boring "crypto/internal/backend"
 	"errors"
 	"io"
 	"os"

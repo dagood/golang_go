@@ -7,8 +7,8 @@
 package rsa
 
 import (
-	"crypto/internal/boring"
-	"crypto/internal/boring/bbig"
+	boring "crypto/internal/backend"
+	"crypto/internal/backend/bbig"
 	"crypto/internal/boring/bcache"
 	"math/big"
 )

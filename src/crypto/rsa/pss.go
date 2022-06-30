@@ -9,7 +9,7 @@ package rsa
 import (
 	"bytes"
 	"crypto"
-	"crypto/internal/boring"
+	boring "crypto/internal/backend"
 	"errors"
 	"hash"
 	"io"

@@ -9,7 +9,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto"
-	"crypto/internal/boring"
+	boring "crypto/internal/backend"
 	"crypto/rand"
 	"crypto/sha512"
 	"encoding/hex"

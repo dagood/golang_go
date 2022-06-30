@@ -5,7 +5,7 @@
 package ecdh
 
 import (
-	"crypto/internal/boring"
+	boring "crypto/internal/backend"
 	"crypto/internal/nistec"
 	"crypto/internal/randutil"
 	"encoding/binary"

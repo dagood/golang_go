@@ -8,7 +8,7 @@ package sha512
 
 import (
 	"bytes"
-	"crypto/internal/boring"
+	boring "crypto/internal/backend"
 	"crypto/rand"
 	"encoding"
 	"encoding/hex"

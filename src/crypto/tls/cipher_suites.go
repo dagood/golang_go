@@ -10,7 +10,7 @@ import (
 	"crypto/cipher"
 	"crypto/des"
 	"crypto/hmac"
-	"crypto/internal/boring"
+	boring "crypto/internal/backend"
 	"crypto/rc4"
 	"crypto/sha1"
 	"crypto/sha256"

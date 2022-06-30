@@ -6,7 +6,7 @@ package rsa
 
 import (
 	"crypto"
-	"crypto/internal/boring"
+	boring "crypto/internal/backend"
 	"crypto/internal/randutil"
 	"crypto/subtle"
 	"errors"

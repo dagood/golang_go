@@ -8,7 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto"
-	"crypto/internal/boring"
+	boring "crypto/internal/backend"
 	"crypto/rand"
 	. "crypto/rsa"
 	"crypto/sha1"

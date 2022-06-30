@@ -8,7 +8,7 @@ package sha256
 
 import (
 	"bytes"
-	"crypto/internal/boring"
+	boring "crypto/internal/backend"
 	"crypto/rand"
 	"encoding"
 	"fmt"

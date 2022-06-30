@@ -428,6 +428,7 @@ var depsRules = `
 	crypto/cipher,
 	crypto/internal/boring/bcache
 	< crypto/internal/boring
+	< crypto/internal/backend
 	< crypto/boring;
 
 	crypto/internal/alias
@@ -461,6 +462,7 @@ var depsRules = `
 	# CRYPTO-MATH is core bignum-based crypto - no cgo, net; fmt now ok.
 	CRYPTO, FMT, math/big
 	< crypto/internal/boring/bbig
+	< crypto/internal/backend/bbig
 	< crypto/rand
 	< crypto/ed25519
 	< encoding/asn1

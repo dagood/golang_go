@@ -22,7 +22,7 @@ timing side-channels:
 package hmac
 
 import (
-	"crypto/internal/boring"
+	boring "crypto/internal/backend"
 	"crypto/subtle"
 	"hash"
 )

@@ -12,7 +12,7 @@ package sha512
 
 import (
 	"crypto"
-	"crypto/internal/boring"
+	boring "crypto/internal/backend"
 	"encoding/binary"
 	"errors"
 	"hash"
