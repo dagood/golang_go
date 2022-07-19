@@ -21,6 +21,7 @@ import (
 	"hash/crc32"
 	"hash/crc64"
 	"hash/fnv"
+	"internal/goexperiment"
 	"testing"
 )
 
@@ -76,6 +77,9 @@ func TestMarshalHash(t *testing.T) {
 			}
 			h2m, ok := h2.(encoding.BinaryMarshaler)
 			if !ok {
+				if goexperiment.CNGCrypto {
+					t.Skip("CNGCrypto does not hash marshaling")
+				}
 				t.Fatalf("Hash does not implement MarshalBinary")
 			}
 			enc, err := h2m.MarshalBinary()

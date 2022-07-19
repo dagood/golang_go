@@ -427,6 +427,10 @@ var depsRules = `
 
 	crypto/cipher,
 	crypto/internal/boring/bcache
+	< github.com/microsoft/go-crypto-winnative/internal/subtle
+	< github.com/microsoft/go-crypto-winnative/internal/sysdll
+	< github.com/microsoft/go-crypto-winnative/internal/bcrypt
+	< github.com/microsoft/go-crypto-winnative/cng
 	< github.com/golang-fips/openssl/v2/internal/subtle
 	< github.com/golang-fips/openssl/v2
 	< crypto/internal/boring
@@ -463,6 +467,7 @@ var depsRules = `
 
 	# CRYPTO-MATH is core bignum-based crypto - no cgo, net; fmt now ok.
 	CRYPTO, FMT, math/big
+	< github.com/microsoft/go-crypto-winnative/cng/bbig
 	< github.com/golang-fips/openssl/v2/bbig
 	< crypto/internal/boring/bbig
 	< crypto/internal/backend/bbig

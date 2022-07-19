@@ -214,7 +214,9 @@ func signPSSWithSalt(priv *PrivateKey, hash crypto.Hash, hashed, salt []byte) ([
 		return nil, err
 	}
 
-	if boring.Enabled {
+	if boring.Enabled &&
+		boring.IsRSAKeySupported(len(priv.Primes)) {
+
 		bkey, err := boringPrivateKey(priv)
 		if err != nil {
 			return nil, err
@@ -295,8 +297,9 @@ func SignPSS(rand io.Reader, priv *PrivateKey, hash crypto.Hash, digest []byte, 
 	// it's probably relied upon by some. It's a tolerable promise because a
 	// well-specified number of random bytes is included in the signature, in a
 	// well-specified way.
+	if boring.Enabled && rand == boring.RandReader &&
+		boring.IsHashSupported(hash) && boring.IsRSAKeySupported(len(priv.Primes)) {
 
-	if boring.Enabled && rand == boring.RandReader {
 		bkey, err := boringPrivateKey(priv)
 		if err != nil {
 			return nil, err
@@ -339,7 +342,9 @@ func SignPSS(rand io.Reader, priv *PrivateKey, hash crypto.Hash, digest []byte, 
 // argument may be nil, in which case sensible defaults are used. opts.Hash is
 // ignored.
 func VerifyPSS(pub *PublicKey, hash crypto.Hash, digest []byte, sig []byte, opts *PSSOptions) error {
-	if boring.Enabled {
+	if boring.Enabled &&
+		boring.IsSaltSupported(opts.saltLength()) && boring.IsHashSupported(hash) {
+
 		bkey, err := boringPublicKey(pub)
 		if err != nil {
 			return err

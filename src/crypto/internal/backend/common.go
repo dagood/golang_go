@@ -5,7 +5,9 @@
 package backend
 
 import (
+	"crypto"
 	"crypto/internal/boring/sig"
+	"internal/goexperiment"
 	"runtime"
 	"syscall"
 )
@@ -67,7 +69,11 @@ func hasSuffix(s, t string) bool {
 // UnreachableExceptTests marks code that should be unreachable
 // when backend is in use. It panics.
 func UnreachableExceptTests() {
-	if Enabled {
+	// runtime_arg0 is not supported on windows.
+	// We are going through the same code patch on linux,
+	// so if we are unintentionally calling an 'unreachable' function,
+	// we will catch it there.
+	if Enabled && !goexperiment.CNGCrypto {
 		name := runtime_arg0()
 		// If ran on Windows we'd need to allow _test.exe and .test.exe as well.
 		if !hasSuffix(name, "_test") && !hasSuffix(name, ".test") {
@@ -75,4 +81,29 @@ func UnreachableExceptTests() {
 			panic("cryptobackend: invalid code execution")
 		}
 	}
+}
+
+func IsRSAKeySupported(primes int) bool {
+	if goexperiment.CNGCrypto {
+		return primes == 2
+	}
+	return true
+}
+
+func IsHashSupported(h crypto.Hash) bool {
+	if goexperiment.CNGCrypto {
+		return h != crypto.MD5SHA1
+	}
+	return true
+}
+
+func IsSaltSupported(salt int) bool {
+	if goexperiment.CNGCrypto {
+		return salt != 0 // rsa.PSSSaltLengthAuto
+	}
+	return true
+}
+
+func IsP224Supported() bool {
+	return !goexperiment.CNGCrypto
 }

@@ -35,6 +35,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"hash"
+	"internal/goexperiment"
 	"io"
 	"math"
 	"math/big"
@@ -476,7 +477,11 @@ func mgf1XOR(out []byte, hash hash.Hash, seed []byte) {
 var ErrMessageTooLong = errors.New("crypto/rsa: message too long for RSA key size")
 
 func encrypt(pub *PublicKey, plaintext []byte) ([]byte, error) {
-	boring.Unreachable()
+	if !goexperiment.CNGCrypto {
+		// CNGCrypto calls encrypt() when the salt length
+		// or the hash function are not supported.
+		boring.Unreachable()
+	}
 
 	// Most of the CPU time for encryption and verification is spent in this
 	// NewModulusFromBig call, because PublicKey doesn't have a Precomputed
@@ -639,7 +644,9 @@ const noCheck = false
 // m^e is calculated and compared with ciphertext, in order to defend against
 // errors in the CRT computation.
 func decrypt(priv *PrivateKey, ciphertext []byte, check bool) ([]byte, error) {
-	if len(priv.Primes) <= 2 {
+	if len(priv.Primes) <= 2 && !goexperiment.CNGCrypto {
+		// CNGCrypto calls decrypt() when the salt length
+		// or the hash function are not supported.
 		boring.Unreachable()
 	}
 
@@ -719,7 +726,9 @@ func decryptOAEP(hash, mgfHash hash.Hash, random io.Reader, priv *PrivateKey, ci
 		return nil, ErrDecryption
 	}
 
-	if boring.Enabled {
+	if boring.Enabled &&
+		boring.IsRSAKeySupported(len(priv.Primes)) {
+
 		bkey, err := boringPrivateKey(priv)
 		if err != nil {
 			return nil, err

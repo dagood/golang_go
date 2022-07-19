@@ -8,10 +8,17 @@
 package rand
 
 import (
+	boring "crypto/internal/backend"
 	"internal/syscall/windows"
 )
 
-func init() { Reader = &rngReader{} }
+func init() {
+	if boring.Enabled {
+		Reader = boring.RandReader
+		return
+	}
+	Reader = &rngReader{}
+}
 
 type rngReader struct{}
 

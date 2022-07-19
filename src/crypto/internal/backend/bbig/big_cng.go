@@ -2,8 +2,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !boringcrypto && !goexperiment.opensslcrypto && !goexperiment.cngcrypto
+//go:build goexperiment.cngcrypto
 
-package x509
+package bbig
 
-func boringAllowCert(c *Certificate) bool { return true }
+import "github.com/microsoft/go-crypto-winnative/cng/bbig"
+
+var Enc = bbig.Enc
+var Dec = bbig.Dec

@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build boringcrypto || goexperiment.opensslcrypto
+//go:build boringcrypto || goexperiment.opensslcrypto || goexperiment.cngcrypto
 
 // Note: Can run these tests against the non-BoringCrypto
 // version of the code by using "CGO_ENABLED=0 go test".

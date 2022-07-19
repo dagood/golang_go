@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"hash"
+	"internal/goexperiment"
 	"io"
 	"testing"
 )
@@ -719,6 +720,9 @@ func TestGolden(t *testing.T) {
 }
 
 func TestGoldenMarshal(t *testing.T) {
+	if goexperiment.CNGCrypto {
+		t.Skip("CNGCrypto does not support hash marshalling")
+	}
 	tests := []struct {
 		name    string
 		newHash func() hash.Hash
@@ -766,6 +770,9 @@ func TestGoldenMarshal(t *testing.T) {
 }
 
 func TestMarshalMismatch(t *testing.T) {
+	if goexperiment.CNGCrypto {
+		t.Skip("CNGCrypto does not support hash marshaling")
+	}
 	h := []func() hash.Hash{
 		New,
 		New384,
@@ -872,6 +879,9 @@ func safeSum(h hash.Hash) (sum []byte, err error) {
 }
 
 func TestLargeHashes(t *testing.T) {
+	if goexperiment.CNGCrypto {
+		t.Skip("CNGCrypto does not support hash marshalling")
+	}
 	for i, test := range largeUnmarshalTests {
 
 		h := New()

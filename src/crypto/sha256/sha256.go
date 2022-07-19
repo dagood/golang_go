@@ -158,7 +158,7 @@ func New() hash.Hash {
 
 // New224 returns a new hash.Hash computing the SHA224 checksum.
 func New224() hash.Hash {
-	if boring.Enabled {
+	if boring.Enabled && boring.IsP224Supported() {
 		return boring.NewSHA224()
 	}
 	d := new(digest)
@@ -177,7 +177,9 @@ func (d *digest) Size() int {
 func (d *digest) BlockSize() int { return BlockSize }
 
 func (d *digest) Write(p []byte) (nn int, err error) {
-	boring.Unreachable()
+	if boring.Enabled && (!d.is224 || boring.IsP224Supported()) {
+		boring.Unreachable()
+	}
 	nn = len(p)
 	d.len += uint64(nn)
 	if d.nx > 0 {
@@ -201,7 +203,9 @@ func (d *digest) Write(p []byte) (nn int, err error) {
 }
 
 func (d *digest) Sum(in []byte) []byte {
-	boring.Unreachable()
+	if boring.Enabled && (!d.is224 || boring.IsP224Supported()) {
+		boring.Unreachable()
+	}
 	// Make a copy of d so that caller can keep writing and summing.
 	d0 := *d
 	hash := d0.checkSum()
@@ -262,7 +266,7 @@ func Sum256(data []byte) [Size]byte {
 
 // Sum224 returns the SHA224 checksum of the data.
 func Sum224(data []byte) [Size224]byte {
-	if boring.Enabled {
+	if boring.Enabled && boring.IsP224Supported() {
 		return boring.SHA224(data)
 	}
 	var d digest

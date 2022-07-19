@@ -17,6 +17,7 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"internal/goexperiment"
 	"internal/testenv"
 	"math/big"
 	"strings"
@@ -113,6 +114,9 @@ func testKeyBasics(t *testing.T, priv *PrivateKey) {
 	if priv.D.Cmp(priv.N) > 0 {
 		t.Errorf("private exponent too large")
 	}
+	if goexperiment.CNGCrypto && priv.N.BitLen() < 512 {
+		t.Skip("CNGCrypto does not support key sizes lower than 512 and intentionally fails rather than fall back to Go crypto")
+	}
 
 	msg := []byte("hi!")
 	enc, err := EncryptPKCS1v15(rand.Reader, &priv.PublicKey, msg)
@@ -187,7 +191,9 @@ func testEverything(t *testing.T, priv *PrivateKey) {
 	if err := priv.Validate(); err != nil {
 		t.Errorf("Validate() failed: %s", err)
 	}
-
+	if goexperiment.CNGCrypto && priv.N.BitLen() < 512 {
+		t.Skip("CNGCrypto does not support key sizes lower than 512 and intentionally fails rather than fall back to Go crypto")
+	}
 	msg := []byte("test")
 	enc, err := EncryptPKCS1v15(rand.Reader, &priv.PublicKey, msg)
 	if err == ErrMessageTooLong {

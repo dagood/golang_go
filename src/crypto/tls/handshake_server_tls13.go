@@ -13,6 +13,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash"
+	"internal/goexperiment"
 	"io"
 	"time"
 )
@@ -402,6 +403,15 @@ func cloneHash(in hash.Hash, h crypto.Hash) hash.Hash {
 	}
 	marshaler, ok := in.(binaryMarshaler)
 	if !ok {
+		if goexperiment.CNGCrypto {
+			// CNGCrypto hashes do not implement the binaryMarshaler interface,
+			// but do implement the Clone method.
+			if cloner, ok := in.(interface{ Clone() (hash.Hash, error) }); ok {
+				if out, err := cloner.Clone(); err == nil {
+					return out
+				}
+			}
+		}
 		return nil
 	}
 	state, err := marshaler.MarshalBinary()

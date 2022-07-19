@@ -94,7 +94,9 @@ func DecryptPKCS1v15(random io.Reader, priv *PrivateKey, ciphertext []byte) ([]b
 		return nil, err
 	}
 
-	if boring.Enabled {
+	if boring.Enabled &&
+		boring.IsRSAKeySupported(len(priv.Primes)) {
+
 		bkey, err := boringPrivateKey(priv)
 		if err != nil {
 			return nil, err
@@ -188,7 +190,9 @@ func decryptPKCS1v15(priv *PrivateKey, ciphertext []byte) (valid int, em []byte,
 		return
 	}
 
-	if boring.Enabled {
+	if boring.Enabled &&
+		boring.IsRSAKeySupported(len(priv.Primes)) {
+
 		var bkey *boring.PrivateKeyRSA
 		bkey, err = boringPrivateKey(priv)
 		if err != nil {
@@ -296,7 +300,9 @@ func SignPKCS1v15(random io.Reader, priv *PrivateKey, hash crypto.Hash, hashed [
 		return nil, ErrMessageTooLong
 	}
 
-	if boring.Enabled {
+	if boring.Enabled &&
+		boring.IsHashSupported(hash) && boring.IsRSAKeySupported(len(priv.Primes)) {
+
 		bkey, err := boringPrivateKey(priv)
 		if err != nil {
 			return nil, err
@@ -322,7 +328,9 @@ func SignPKCS1v15(random io.Reader, priv *PrivateKey, hash crypto.Hash, hashed [
 // returning a nil error. If hash is zero then hashed is used directly. This
 // isn't advisable except for interoperability.
 func VerifyPKCS1v15(pub *PublicKey, hash crypto.Hash, hashed []byte, sig []byte) error {
-	if boring.Enabled {
+	if boring.Enabled &&
+		boring.IsHashSupported(hash) {
+
 		bkey, err := boringPublicKey(pub)
 		if err != nil {
 			return err

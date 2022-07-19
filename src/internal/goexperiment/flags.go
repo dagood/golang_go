@@ -60,6 +60,7 @@ type Flags struct {
 	StaticLockRanking bool
 	BoringCrypto      bool
 	OpenSSLCrypto     bool
+	CNGCrypto         bool
 
 	// SystemCrypto enables the OpenSSL or CNG crypto experiment depending on
 	// which one is appropriate on the target GOOS.

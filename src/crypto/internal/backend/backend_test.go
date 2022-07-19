@@ -4,9 +4,7 @@
 
 package backend
 
-import (
-	"testing"
-)
+import "testing"
 
 // Test that Unreachable panics.
 func TestUnreachable(t *testing.T) {

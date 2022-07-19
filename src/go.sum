@@ -1,5 +1,7 @@
 github.com/golang-fips/openssl/v2 v2.0.0-rc.2 h1:0RFGh/pnzSAe5LlriE416hQUYxYNFZD9y/53d0ld7K0=
 github.com/golang-fips/openssl/v2 v2.0.0-rc.2/go.mod h1:7tuBqX2Zov8Yq5mJ2yzlKhpnxOnWyEzi38AzeWRuQdg=
+github.com/microsoft/go-crypto-winnative v0.0.0-20230502061212-6eb98854418e h1:BB2UybwbUjtxG2OFs6KnKi8AOlk9rjH7ekjkbW+vHA0=
+github.com/microsoft/go-crypto-winnative v0.0.0-20230502061212-6eb98854418e/go.mod h1:fveERXKbeK+XLmOyU24caKnIT/S5nniAX9XCRHfnrM4=
 golang.org/x/crypto v0.12.0 h1:tFM/ta59kqch6LlvYnPa0yx5a83cL2nHflFhYKvv9Yk=
 golang.org/x/crypto v0.12.0/go.mod h1:NF0Gs7EO5K4qLn+Ylc+fih8BSTeIjAP05siRnAh98yw=
 golang.org/x/net v0.14.1-0.20230809150940-1e23797619c9 h1:eQR0jFW5dN2q8lFzSF7rjkRCOOnBf0llczNvITm6ICs=
