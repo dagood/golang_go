@@ -60,6 +60,21 @@ type Flags struct {
 	StaticLockRanking bool
 	BoringCrypto      bool
 
+	// SystemCrypto enables the OpenSSL or CNG crypto experiment depending on
+	// which one is appropriate on the target GOOS.
+	//
+	// If SystemCrypto is enabled but no crypto experiment is appropriate on the
+	// target GOOS, the build fails.
+	//
+	// Like any other GOEXPERIMENT, the SystemCrypto experiment sets the
+	// "goexperiment.systemcrypto" build tag. However, to make the tag more
+	// useful in build constraints, if any Go backend is enabled,
+	// "goexperiment.systemcrypto" is enabled. This means
+	// "goexperiment.systemcrypto" can be used as a build constraint meaning
+	// "any crypto backend is enabled", even if GOEXPERIMENT=systemcrypto is not
+	// being used to build the Go program.
+	SystemCrypto bool
+
 	// Regabi is split into several sub-experiments that can be
 	// enabled individually. Not all combinations work.
 	// The "regabi" GOEXPERIMENT is an alias for all "working"

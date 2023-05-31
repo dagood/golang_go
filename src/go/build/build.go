@@ -1947,13 +1947,67 @@ func (ctxt *Context) matchTag(name string, allTags map[string]bool) bool {
 		name = "goexperiment.boringcrypto" // boringcrypto is an old name for goexperiment.boringcrypto
 	}
 
+	const system = "goexperiment.systemcrypto"
+	const openssl = "goexperiment.opensslcrypto"
+	const cng = "goexperiment.cngcrypto"
+	const boring = "goexperiment.boringcrypto"
+	// Implement the SystemCrypto GOEXPERIMENT logic. This is done here rather
+	// than during GOEXPERIMENT parsing so "-tags goexperiment.systemcrypto"
+	// will work with "go build".
+	//
+	// This build constraint logic is set up to accomplish two goals:
+	//
+	//   - "goexperiment.systemcrypto" enables the recommended backend for the current GOOS.
+	//     E.g. "//go:build goexperiment.opensslcrypto" is satisfied by
+	//     "goexperiment.systemcrypto", but only on Linux.
+	//
+	//   - "//go:build goexperiment.systemcrypto" is satisfied by any crypto backend.
+	//     This simplifies build constraints that would otherwise need to list
+	//     every single backend.
+	//
+	// "name" is a build constraint being evaluated. Here, we set up bools that
+	// determine what would tags would satisfy this build constraint.
+	satisfiedByAnyBackend := name == system
+	satisfiedBySystemCrypto :=
+		(ctxt.GOOS == "linux" && name == openssl) ||
+			(ctxt.GOOS == "windows" && name == cng)
+	satisfiedBy := func(tag string) bool {
+		if satisfiedByAnyBackend {
+			switch tag {
+			case openssl, cng, boring:
+				return true
+			}
+		}
+		if satisfiedBySystemCrypto && tag == system {
+			return true
+		}
+		return false
+	}
+	// Keep track of all the tags that might influence this build constraint.
+	if allTags != nil {
+		if satisfiedByAnyBackend {
+			allTags[openssl] = true
+			allTags[cng] = true
+			allTags[boring] = true
+		}
+		if satisfiedBySystemCrypto {
+			allTags[system] = true
+		}
+	}
+
 	// other tags
 	for _, tag := range ctxt.BuildTags {
+		if satisfiedBy(tag) {
+			return true
+		}
 		if tag == name {
 			return true
 		}
 	}
 	for _, tag := range ctxt.ToolTags {
+		if satisfiedBy(tag) {
+			return true
+		}
 		if tag == name {
 			return true
 		}
