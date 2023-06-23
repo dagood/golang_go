@@ -77,6 +77,14 @@ type Flags struct {
 	// being used to build the Go program.
 	SystemCrypto bool
 
+	// AllowCryptoFallback allows the use of pure Go crypto if a crypto backend
+	// experiment is enabled but the backend's requirements are not met. This is
+	// used during the Go build itself to allow running the test suite with a
+	// backend experiment enabled. Some parts of the Go build (bootstrapping)
+	// and parts of the test suite run without cgo, so
+	// GOEXPERIMENT=opensslcrypto,allowcryptofallback must be used to succeed.
+	AllowCryptoFallback bool
+
 	// Regabi is split into several sub-experiments that can be
 	// enabled individually. Not all combinations work.
 	// The "regabi" GOEXPERIMENT is an alias for all "working"
