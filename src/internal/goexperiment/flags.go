@@ -85,6 +85,12 @@ type Flags struct {
 	// GOEXPERIMENT=opensslcrypto,allowcryptofallback must be used to succeed.
 	AllowCryptoFallback bool
 
+	// XCryptoBackendSwap enables detection of the golang.org/x/crypto module
+	// and automatically replaces it with an x/crypto module maintained in the
+	// Microsoft Go fork that implements the same API but with the chosen crypto
+	// backend.
+	XCryptoBackendSwap bool
+
 	// Regabi is split into several sub-experiments that can be
 	// enabled individually. Not all combinations work.
 	// The "regabi" GOEXPERIMENT is an alias for all "working"

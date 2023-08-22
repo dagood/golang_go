@@ -134,6 +134,22 @@ func readVendorList(vendorDir string) {
 				}
 			}
 		}
+		// Fix "inconsistent vendoring" errors in -mod= and -mod=vendor modes:
+		//
+		//   golang.org/x/crypto: is replaced in /tmp/xcrypto-replacement-go-89165251.mod, but not marked as replaced in vendor/modules.txt
+		//
+		// We need to fix this without modifying vendor/modules.txt, so create a
+		// fake replacement here. Doing this in the read func means the rest of
+		// the code should behave as if this is correct, and we don't need to
+		// modify e.g. checkVendorConsistency.
+		if xCryptoSwap {
+			mod.Path = "golang.org/x/crypto"
+			mod.Version = ""
+			meta := vendorMeta[mod]
+			meta.Replacement = module.Version{Path: xCryptoNewModPath()}
+			vendorReplaced = append(vendorReplaced, mod)
+			vendorMeta[mod] = meta
+		}
 	})
 }
 

@@ -336,7 +336,11 @@ func importFromModules(ctx context.Context, path string, rs *Requirements, mg *M
 			}
 		}
 
-		if HasModRoot() {
+		if dir, vendorDir, ok := toolsetOverridePackage(path); ok {
+			mods = append(mods, vendorPkgModule[path])
+			dirs = append(dirs, dir)
+			roots = append(roots, vendorDir)
+		} else if HasModRoot() {
 			vendorDir := VendorDir()
 			dir, vendorOK, _ := dirInModule(path, "", vendorDir, false)
 			if vendorOK {

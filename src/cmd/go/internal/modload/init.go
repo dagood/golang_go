@@ -481,6 +481,11 @@ func Init() {
 	// We're in module mode. Set any global variables that need to be set.
 	cfg.ModulesEnabled = true
 	setDefaultBuildMod()
+
+	if err := initXCryptoSwap(); err != nil {
+		base.Fatalf("go: failed to initialize x/crypto replacement: %v", err)
+	}
+
 	list := filepath.SplitList(cfg.BuildContext.GOPATH)
 	if len(list) > 0 && list[0] != "" {
 		gopath = list[0]
@@ -827,6 +832,11 @@ func loadModFile(ctx context.Context, opts *PackageOpts) (*Requirements, error) 
 		// For example, 'go get' does this, since it is expected to resolve paths.
 		//
 		// See golang.org/issue/32027.
+	} else if xCryptoSwap {
+		// We duplicated the go.mod file, but keep using the existing go.sum.
+		// The old sum file will contain an unused x/crypto entry, but this is
+		// fine. We still need it for other modules.
+		modfetch.GoSumFile = strings.TrimSuffix(preXCryptoSwapModFile, ".mod") + ".sum"
 	} else {
 		modfetch.GoSumFile = strings.TrimSuffix(modFilePath(modRoots[0]), ".mod") + ".sum"
 	}
