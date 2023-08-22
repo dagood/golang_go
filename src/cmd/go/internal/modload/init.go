@@ -67,6 +67,10 @@ var (
 	// modRoots != nil implies len(modRoots) > 0
 	modRoots []string
 	gopath   string
+
+	// True if x/crypto is being swapped out with a module replacement.
+	xCryptoSwap           bool
+	preXCryptoSwapModFile string
 )
 
 // EnterModule resets MainModules and requirements to refer to just this one module.
@@ -377,6 +381,21 @@ func Init() {
 	}
 	initialized = true
 
+	// Use build constraint evaluation to find if a crypto backend is enabled in
+	// this build context. Test the build constraint by copying the build
+	// context and assigning OpenFile to avoid reading actual files.
+	backendCheckContext := cfg.BuildContext
+	backendCheckContext.OpenFile = func(path string) (io.ReadCloser, error) {
+		source := "//go:build goexperiment.systemcrypto"
+		return io.NopCloser(strings.NewReader(source)), nil
+	}
+	if match, err := backendCheckContext.MatchFile("", "backendcheck.go"); err != nil {
+		base.Fatalf("error checking for crypto backend: %v", err)
+		return
+	} else if match {
+		xCryptoSwap = true
+	}
+
 	// Keep in sync with WillBeEnabled. We perform extra validation here, and
 	// there are lots of diagnostics and side effects, so we can't use
 	// WillBeEnabled directly.
@@ -434,15 +453,24 @@ func Init() {
 	if modRoots != nil {
 		// modRoot set before Init was called ("go mod init" does this).
 		// No need to search for go.mod.
+		if xCryptoSwap {
+			fmt.Println("I see modRoot is already set, was this 'go mod init'? If it's something else, the x/crypto replacement might be missing.")
+		}
 	} else if RootMode == NoRoot {
 		if cfg.ModFile != "" && !base.InGOFLAGS("-modfile") {
 			base.Fatalf("go: -modfile cannot be used with commands that ignore the current module")
 		}
 		modRoots = nil
+		if xCryptoSwap {
+			fmt.Println("This command doesn't care about modules, so x/crypto replacement doesn't matter.")
+		}
 	} else if workFilePath != "" {
 		// We're in workspace mode, which implies module mode.
 		if cfg.ModFile != "" {
 			base.Fatalf("go: -modfile cannot be used in workspace mode")
+		}
+		if xCryptoSwap {
+			base.Fatalf("go: crypto backend x/crypto replacement doesn't function in workspace mode because '-modfile' is not supported")
 		}
 	} else {
 		if modRoot := findModuleRoot(base.Cwd()); modRoot == "" {
@@ -477,6 +505,40 @@ func Init() {
 	if cfg.ModFile != "" && !strings.HasSuffix(cfg.ModFile, ".mod") {
 		base.Fatalf("go: -modfile=%s: file does not have .mod extension", cfg.ModFile)
 	}
+	if xCryptoSwap {
+		if len(modRoots) != 1 {
+			base.Errorf("go: expected to add x/crypto replacement to 1 modroot, found %v, %#v", len(modRoots), modRoots)
+		}
+		preXCryptoSwapModFile = modFilePath(modRoots[0])
+		data, err := lockedfile.Read(preXCryptoSwapModFile)
+		if err != nil {
+			base.Fatal(err)
+		}
+		modFile, err := modfile.Parse(preXCryptoSwapModFile, data, nil)
+		if err != nil {
+			base.Fatal(err)
+		}
+		modFile.AddReplace(
+			"golang.org/x/crypto",
+			"",
+			xCryptoNewModPath(),
+			"",
+		)
+		modFile.Cleanup()
+		afterData, err := modFile.Format()
+		if err != nil {
+			base.Fatal(err)
+		}
+		f, err := os.CreateTemp("", "xcrypto-replacement-go-*.mod")
+		if err != nil {
+			base.Fatal(err)
+		}
+		if _, err := f.Write(afterData); err != nil {
+			base.Fatal(err)
+		}
+		fmt.Printf("Swapping x/crypto by setting '-modfile' to temp go.mod %q\n", f.Name())
+		cfg.ModFile = f.Name()
+	}
 
 	// We're in module mode. Set any global variables that need to be set.
 	cfg.ModulesEnabled = true
@@ -488,6 +550,10 @@ func Init() {
 			base.Fatalf("$GOPATH/go.mod exists but should not")
 		}
 	}
+}
+
+func xCryptoNewModPath() string {
+	return cfg.BuildContext.GOROOT + "/ms_mod/xcrypto"
 }
 
 // WillBeEnabled checks whether modules should be enabled but does not
@@ -827,6 +893,11 @@ func loadModFile(ctx context.Context, opts *PackageOpts) (*Requirements, error) 
 		// For example, 'go get' does this, since it is expected to resolve paths.
 		//
 		// See golang.org/issue/32027.
+	} else if xCryptoSwap {
+		// We duplicated the go.mod file, but keep using the existing go.sum.
+		// The old sum file will contain an unused x/crypto entry, but this is
+		// fine. We still need it for other modules.
+		modfetch.GoSumFile = strings.TrimSuffix(preXCryptoSwapModFile, ".mod") + ".sum"
 	} else {
 		modfetch.GoSumFile = strings.TrimSuffix(modFilePath(modRoots[0]), ".mod") + ".sum"
 	}
@@ -1781,6 +1852,10 @@ func commitRequirements(ctx context.Context, opts WriteOpts) (err error) {
 
 	index := MainModules.GetSingleIndexOrNil()
 	dirty := index.modFileIsDirty(modFile)
+	if xCryptoSwap {
+		// A dirty go.mod is expected when x/crypto is being replaced.
+		dirty = false
+	}
 	if dirty && cfg.BuildMod != "mod" {
 		// If we're about to fail due to -mod=readonly,
 		// prefer to report a dirty go.mod over a dirty go.sum

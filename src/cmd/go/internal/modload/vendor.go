@@ -91,6 +91,12 @@ func readVendorList(vendorDir string) {
 					}
 					vendorMeta[mod] = meta
 				}
+				if xCryptoSwap && mod.Path == "golang.org/x/crypto" {
+					meta := vendorMeta[mod]
+					meta.Replacement = module.Version{Path: xCryptoNewModPath()}
+					vendorReplaced = append(vendorReplaced, mod)
+					vendorMeta[mod] = meta
+				}
 				continue
 			}
 
@@ -133,6 +139,14 @@ func readVendorList(vendorDir string) {
 					vendorVersion[mod.Path] = mod.Version
 				}
 			}
+		}
+		if xCryptoSwap {
+			mod.Path = "golang.org/x/crypto"
+			mod.Version = ""
+			meta := vendorMeta[mod]
+			meta.Replacement = module.Version{Path: xCryptoNewModPath()}
+			vendorReplaced = append(vendorReplaced, mod)
+			vendorMeta[mod] = meta
 		}
 	})
 }

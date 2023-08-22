@@ -317,6 +317,9 @@ func importFromModules(ctx context.Context, path string, rs *Requirements, mg *M
 		roots = append(roots, modroot)
 		mods = append(mods, module.Version{})
 	}
+	// Keep track of whether this package is a replacement x/crypto.
+	// If so, prevent a duplicate module from being found: that would make the import ambiguous.
+	var moduleOverridden bool
 	// -mod=vendor is special.
 	// Everything must be in the main modules or the main module's or workspace's vendor directory.
 	if cfg.BuildMod == "vendor" {
@@ -346,7 +349,12 @@ func importFromModules(ctx context.Context, path string, rs *Requirements, mg *M
 				// to exist, causing an empty module path to be reported. Do better checking
 				// here.
 				mods = append(mods, vendorPkgModule[path])
-				dirs = append(dirs, dir)
+				if xCryptoSwap && strings.HasPrefix(path, "golang.org/x/crypto") {
+					dirs = append(dirs, filepath.Join(xCryptoNewModPath(), strings.TrimPrefix(path, "golang.org/x/crypto")))
+					moduleOverridden = true
+				} else {
+					dirs = append(dirs, dir)
+				}
 				roots = append(roots, vendorDir)
 			}
 		}
@@ -421,7 +429,7 @@ func importFromModules(ctx context.Context, path string, rs *Requirements, mg *M
 			}
 			if dir, ok, err := dirInModule(path, m.Path, root, isLocal); err != nil {
 				return module.Version{}, "", "", nil, err
-			} else if ok {
+			} else if ok && !moduleOverridden {
 				mods = append(mods, m)
 				roots = append(roots, root)
 				dirs = append(dirs, dir)
