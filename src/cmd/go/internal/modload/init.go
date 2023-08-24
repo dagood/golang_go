@@ -533,6 +533,12 @@ func Init() {
 		if err != nil {
 			base.Fatal(err)
 		}
+		base.AtExit(func() {
+			// Best effort cleanup.
+			if err := os.Remove(f.Name()); err != nil {
+				base.Errorf("go: failed to remove temp go.mod file %q: %v", f.Name(), err)
+			}
+		})
 		if _, err := f.Write(afterData); err != nil {
 			base.Fatal(err)
 		}
