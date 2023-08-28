@@ -1858,10 +1858,6 @@ func commitRequirements(ctx context.Context, opts WriteOpts) (err error) {
 
 	index := MainModules.GetSingleIndexOrNil()
 	dirty := index.modFileIsDirty(modFile)
-	if xCryptoSwap {
-		// A dirty go.mod is expected when x/crypto is being replaced.
-		dirty = false
-	}
 	if dirty && cfg.BuildMod != "mod" {
 		// If we're about to fail due to -mod=readonly,
 		// prefer to report a dirty go.mod over a dirty go.sum

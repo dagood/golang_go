@@ -574,8 +574,7 @@ func goModSummary(m module.Version) (*modFileSummary, error) {
 	actual := resolveReplacement(m)
 	if mustHaveSums() && actual.Version != "" {
 		key := module.Version{Path: actual.Path, Version: actual.Version + "/go.mod"}
-		keyIsLocalSwap := xCryptoSwap && key.Path == xCryptoNewModPath()
-		if !modfetch.HaveSum(key) && !keyIsLocalSwap {
+		if !modfetch.HaveSum(key) {
 			suggestion := fmt.Sprintf(" for go.mod file; to add it:\n\tgo mod download %s", m.Path)
 			return nil, module.VersionError(actual, &sumMissingError{suggestion: suggestion})
 		}

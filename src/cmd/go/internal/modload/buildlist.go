@@ -1131,11 +1131,7 @@ func updatePrunedRoots(ctx context.Context, direct map[string]bool, rs *Requirem
 				// the graph-pruning horizon, which could in turn change the selected
 				// versions of other modules. (For pruned modules adding or removing an
 				// explicit root is a semantic change, not just a cosmetic one.)
-
-				// But incompleteness is expected if we're swapping out x/crypto on the fly.
-				if !xCryptoSwap {
-					return rs, errGoModDirty
-				}
+				return rs, errGoModDirty
 			}
 
 			rs = newRequirements(pruned, roots, direct)

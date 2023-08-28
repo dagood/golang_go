@@ -318,7 +318,6 @@ func importFromModules(ctx context.Context, path string, rs *Requirements, mg *M
 		mods = append(mods, module.Version{})
 	}
 	// Keep track of whether this package is a replacement x/crypto.
-	// If so, prevent a duplicate module from being found: that would make the import ambiguous.
 	var moduleOverridden bool
 	// -mod=vendor is special.
 	// Everything must be in the main modules or the main module's or workspace's vendor directory.
@@ -349,6 +348,9 @@ func importFromModules(ctx context.Context, path string, rs *Requirements, mg *M
 				// to exist, causing an empty module path to be reported. Do better checking
 				// here.
 				mods = append(mods, vendorPkgModule[path])
+				// Swap out x/crypto. This is where the actual redirect happens when using vendor
+				// mode. Otherwise the build would use the x/crypto copy in the vendor directory.
+				// The temp go.mod's "replace" is only followed in other BuildMod modes.
 				if xCryptoSwap && strings.HasPrefix(path, "golang.org/x/crypto") {
 					dirs = append(dirs, filepath.Join(xCryptoNewModPath(), strings.TrimPrefix(path, "golang.org/x/crypto")))
 					moduleOverridden = true
@@ -430,6 +432,9 @@ func importFromModules(ctx context.Context, path string, rs *Requirements, mg *M
 			if dir, ok, err := dirInModule(path, m.Path, root, isLocal); err != nil {
 				return module.Version{}, "", "", nil, err
 			} else if ok && !moduleOverridden {
+				// If we've overridden this module for x/crypto, we need to make sure the module
+				// specified by go.mod is not considered to satisfy the same import. (It seems fine
+				// for it to be considered an alternative.)
 				mods = append(mods, m)
 				roots = append(roots, root)
 				dirs = append(dirs, dir)
