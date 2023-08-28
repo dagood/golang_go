@@ -117,11 +117,15 @@ func NewSHA256() hash.Hash { return openssl.NewSHA256() }
 func NewSHA384() hash.Hash { return openssl.NewSHA384() }
 func NewSHA512() hash.Hash { return openssl.NewSHA512() }
 
+func NewSHA3_256() hash.Hash { return openssl.NewSHA3_256() }
+
 func SHA1(p []byte) (sum [20]byte)   { return openssl.SHA1(p) }
 func SHA224(p []byte) (sum [28]byte) { return openssl.SHA224(p) }
 func SHA256(p []byte) (sum [32]byte) { return openssl.SHA256(p) }
 func SHA384(p []byte) (sum [48]byte) { return openssl.SHA384(p) }
 func SHA512(p []byte) (sum [64]byte) { return openssl.SHA512(p) }
+
+func SHA3_256(p []byte) (sum [32]byte) { return openssl.SHA3_256(p) }
 
 func NewHMAC(h func() hash.Hash, key []byte) hash.Hash { return openssl.NewHMAC(h, key) }
 
