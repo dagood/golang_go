@@ -1,0 +1,43 @@
+# Test that "go test" works with the x/crypto swap feature.
+
+[!net:golang.org] skip
+[!git] skip
+[!GOOS:linux] skip
+[!GOARCH:amd64] skip
+[!cgo] skip
+
+env GO111MODULE=on
+env GOPROXY=direct
+env GOSUMDB=off
+
+go mod tidy
+
+go test .
+
+env GOEXPERIMENT=systemcrypto,xcryptobackendswap
+go test .
+
+-- go.mod --
+module example.com/modswap
+
+require golang.org/x/crypto v0.12.0
+
+-- modswap_test.go --
+package modswap
+
+import (
+	"bytes"
+	"encoding/hex"
+	"testing"
+
+	"golang.org/x/crypto/sha3"
+)
+
+func TestKnownValueSha3_256(t *testing.T) {
+	hash := sha3.New256()
+	r := hash.Sum([]byte("some data to hash"))
+	want, _ := hex.DecodeString("736f6d65206461746120746f2068617368a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a")
+	if !bytes.Equal(r, want) {
+		t.Errorf("want %x, got %x", want, r)
+	}
+}

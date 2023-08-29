@@ -1,0 +1,22 @@
+# x/crypto replacement doesn't work with go.work files. Check that it is properly rejected.
+
+env GOEXPERIMENT=systemcrypto,xcryptobackendswap
+! go build .
+stderr 'go: failed to initialize x/crypto replacement: unable to replace in workspace mode'
+
+-- go.work --
+go 1.22
+
+use .
+
+-- go.mod --
+module example.com/hello
+
+-- main.go --
+package replace
+
+import "fmt"
+
+func main() {
+    fmt.Println("Hello, world!")
+}

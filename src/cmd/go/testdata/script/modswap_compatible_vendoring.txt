@@ -1,0 +1,40 @@
+# Test that if we vendor x/crypto while swapping is enabled, the replacement isn't applied and we
+# vendor "normal" x/crypto.
+
+[!net:golang.org] skip
+[!git] skip
+[!GOOS:linux] skip
+[!GOARCH:amd64] skip
+[!cgo] skip
+
+env GO111MODULE=on
+env GOPROXY=direct
+env GOSUMDB=off
+
+env GOEXPERIMENT=systemcrypto,xcryptobackendswap
+go mod tidy
+go mod vendor
+
+env GOEXPERIMENT=
+# If we got it wrong and the replacement was applied during "go mod vendor",
+# this will fail due to inconsistent vendoring.
+go test .
+
+-- go.mod --
+module example.com/modswap
+
+require golang.org/x/crypto v0.12.0
+
+-- modswap_test.go --
+package modswap
+
+import (
+	"testing"
+
+	"golang.org/x/crypto/sha3"
+)
+
+func TestCallSha3_256(t *testing.T) {
+	hash := sha3.New256()
+	hash.Sum([]byte("some data to hash"))
+}

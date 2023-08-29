@@ -1,0 +1,60 @@
+# When x/crypto is swapped (and only then!), the app should use the OpenSSL backend.
+
+[!net:golang.org] skip
+[!git] skip
+[!GOOS:linux] skip
+[!GOARCH:amd64] skip
+[!cgo] skip
+
+env GO111MODULE=on
+env GOPROXY=direct
+env GOSUMDB=off
+
+go mod tidy
+
+env GOEXPERIMENT=
+go test -run=^TestStandardHasher$ .
+env GOEXPERIMENT=systemcrypto
+go test -run=^TestStandardHasher$ .
+env GOEXPERIMENT=systemcrypto,xcryptobackendswap
+go test -run=^TestOpenSSLHasher$ .
+
+-- go.mod --
+module example.com/modswap
+
+require golang.org/x/crypto v0.12.0
+
+-- modswap_test.go --
+package modswap
+
+import (
+	"bytes"
+	"encoding/hex"
+	"reflect"
+	"testing"
+
+	"golang.org/x/crypto/sha3"
+)
+
+func TestStandardHasher(t *testing.T) {
+	testHasher(t, "*sha3.state")
+}
+
+func TestOpenSSLHasher(t *testing.T) {
+	testHasher(t, "*openssl.sha3_256Hash")
+}
+
+func testHasher(t *testing.T, wantTypeName string) {
+	hash := sha3.New256()
+	// Test that it functions correctly.
+	r := hash.Sum([]byte("some data to hash"))
+	want, _ := hex.DecodeString("736f6d65206461746120746f2068617368a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a")
+	if !bytes.Equal(r, want) {
+		t.Errorf("want %x, got %x", want, r)
+	}
+	// Test that the hasher is from the expected backend.
+	typeName := reflect.TypeOf(hash).String()
+	if typeName != wantTypeName {
+		t.Errorf("want %q, got %q", wantTypeName, typeName)
+	}
+}

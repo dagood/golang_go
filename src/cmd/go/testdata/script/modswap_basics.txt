@@ -1,0 +1,65 @@
+# Test the basics of the x/crypto swap.
+
+[!net:golang.org] skip
+[!git] skip
+
+env GO111MODULE=on
+env GOPROXY=direct
+env GOSUMDB=off
+
+go mod tidy
+
+env GOEXPERIMENT=systemcrypto,xcryptobackendswap
+
+# When vendoring isn't involved, the replacement path is used.
+go list -mod= -deps -f '{{.Dir}}'
+stdout $GOROOT/ms_mod/golang.org/x/crypto
+go list -mod=mod -deps -f '{{.Dir}}'
+stdout $GOROOT/ms_mod/golang.org/x/crypto
+go list -mod=readonly -deps -f '{{.Dir}}'
+stdout $GOROOT/ms_mod/golang.org/x/crypto
+
+# Make sure the build works other than vendor mode.
+go build -mod= .
+go build -mod=mod .
+go build -mod=readonly .
+
+# Vendor mode shouldn't work because we haven't vendored yet.
+! go list -mod=vendor -deps -f '{{.Dir}}'
+stderr 'inconsistent vendoring'
+! go build -mod=vendor .
+
+# We must not do the swap when vendoring or else the replacement gets baked in.
+env GOEXPERIMENT=
+go mod vendor
+
+# Now that vendoring is involved, still use the replacement path.
+env GOEXPERIMENT=systemcrypto,xcryptobackendswap
+go list -mod= -deps -f '{{.Dir}}'
+stdout $GOROOT/ms_mod/golang.org/x/crypto
+go list -mod=mod -deps -f '{{.Dir}}'
+stdout $GOROOT/ms_mod/golang.org/x/crypto
+go list -mod=readonly -deps -f '{{.Dir}}'
+stdout $GOROOT/ms_mod/golang.org/x/crypto
+go list -mod=vendor -deps -f '{{.Dir}}'
+stdout $GOROOT/ms_mod/golang.org/x/crypto
+
+# Make sure the build works and is always the same.
+go build -mod= -o no_mod.out .
+go build -mod=mod -o mod_mod.out .
+go build -mod=readonly -o readonly_mod.out .
+go build -mod=vendor -o vendor_mod.out .
+
+cmp mod_mod.out no_mod.out
+cmp mod_mod.out readonly_mod.out
+cmp mod_mod.out vendor_mod.out
+
+-- go.mod --
+module example.com/modswap
+
+require golang.org/x/crypto v0.12.0
+
+-- imports.go --
+package replace
+
+import _ "golang.org/x/crypto/sha3"

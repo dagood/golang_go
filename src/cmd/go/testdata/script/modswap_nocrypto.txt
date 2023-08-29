@@ -1,0 +1,28 @@
+# Test that if there is no use of x/crypto, the swap feature doesn't change the output assembly. 
+
+env GO111MODULE=on
+
+env GOEXPERIMENT=
+go build -gcflags=-S .
+cp stderr ordinary.out
+
+env GOEXPERIMENT=systemcrypto,xcryptobackendswap
+go build -gcflags=-S .
+cp stderr swapped.out
+
+# We can't directly compare compiled output: the experiment list is embedded
+# in the binary, making it unavoidably different.
+# So, check for the swap by comparing assembly instead.
+cmp ordinary.out swapped.out
+
+-- go.mod --
+module example.com/hello
+
+-- main.go --
+package replace
+
+import "fmt"
+
+func main() {
+    fmt.Println("Hello, world!")
+}
