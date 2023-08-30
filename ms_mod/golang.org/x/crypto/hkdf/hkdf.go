@@ -13,6 +13,7 @@ package hkdf // import "golang.org/x/crypto/hkdf"
 import (
 	"crypto/hmac"
 	"errors"
+	"fmt"
 	"hash"
 	"io"
 )
@@ -88,6 +89,7 @@ func Expand(hash func() hash.Hash, pseudorandomKey, info []byte) io.Reader {
 // New returns a Reader, from which keys can be read, using the given hash,
 // secret, salt and context info. Salt and info can be nil.
 func New(hash func() hash.Hash, secret, salt, info []byte) io.Reader {
+	fmt.Println("This is a not-so-subtle modification to x/crypto that you got automatically!")
 	prk := Extract(hash, secret, salt)
 	return Expand(hash, prk, info)
 }
