@@ -2,7 +2,7 @@
 ## explicit; go 1.20
 github.com/golang-fips/openssl/v2
 github.com/golang-fips/openssl/v2/bbig
-# github.com/microsoft/go-crypto-winnative v0.0.0-20230502061212-6eb98854418e
+# github.com/microsoft/go-crypto-winnative v0.0.0-20230822062938-306d53ca6072
 ## explicit; go 1.17
 github.com/microsoft/go-crypto-winnative/cng
 github.com/microsoft/go-crypto-winnative/cng/bbig
