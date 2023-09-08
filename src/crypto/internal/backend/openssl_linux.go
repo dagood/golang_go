@@ -119,13 +119,30 @@ func NewSHA512() hash.Hash { return openssl.NewSHA512() }
 
 func NewSHA3_256() hash.Hash { return openssl.NewSHA3_256() }
 
-func SHA1(p []byte) (sum [20]byte)   { return openssl.SHA1(p) }
+// xcrypto_backend_map:noescape
+func SHA1(p []byte) (sum [20]byte) { return openssl.SHA1(p) }
+
+// xcrypto_backend_map:noescape
 func SHA224(p []byte) (sum [28]byte) { return openssl.SHA224(p) }
+
+// xcrypto_backend_map:noescape
 func SHA256(p []byte) (sum [32]byte) { return openssl.SHA256(p) }
+
+// xcrypto_backend_map:noescape
 func SHA384(p []byte) (sum [48]byte) { return openssl.SHA384(p) }
+
+// xcrypto_backend_map:noescape
 func SHA512(p []byte) (sum [64]byte) { return openssl.SHA512(p) }
 
+// xcrypto_backend_map:noescape
 func SHA3_256(p []byte) (sum [32]byte) { return openssl.SHA3_256(p) }
+
+func SupportsHash(h crypto.Hash) bool {
+	if h == crypto.SHA3_256 {
+		return openssl.SupportsSHA3_256()
+	}
+	return true
+}
 
 func NewHMAC(h func() hash.Hash, key []byte) hash.Hash { return openssl.NewHMAC(h, key) }
 

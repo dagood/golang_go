@@ -38,7 +38,9 @@ func SHA256(p []byte) (sum [32]byte) { panic("cryptobackend: not available") }
 func SHA384(p []byte) (sum [48]byte) { panic("cryptobackend: not available") }
 func SHA512(p []byte) (sum [64]byte) { panic("cryptobackend: not available") }
 
-func SHA3_256(p []byte) (sum [64]byte) { panic("cryptobackend: not available") }
+func SHA3_256(p []byte) (sum [32]byte) { panic("cryptobackend: not available") }
+
+func SupportsHash(h crypto.Hash) bool { panic("cryptobackend: not available") }
 
 func NewHMAC(h func() hash.Hash, key []byte) hash.Hash { panic("cryptobackend: not available") }
 
