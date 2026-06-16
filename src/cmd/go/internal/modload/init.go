@@ -1611,6 +1611,11 @@ func setDefaultBuildMod(ld *Loader) {
 				goVersion = index.goVersion
 			}
 		}
+		if !ld.inWorkspaceMode() && len(ld.modRoots) == 1 && search.InDir(ld.modRoots[0], cfg.GOROOTsrc) != "" {
+			cfg.BuildModReason = "Module is in GOROOT/src, so vendor directory was not used."
+			cfg.BuildMod = "readonly"
+			return
+		}
 		vendorDir := ""
 		if ld.workFilePath != "" {
 			vendorDir = filepath.Join(filepath.Dir(ld.workFilePath), "vendor")
@@ -1746,12 +1751,6 @@ func findWorkspaceFile(dir string) (root string) {
 		d := filepath.Dir(dir)
 		if d == dir {
 			break
-		}
-		if d == cfg.GOROOT {
-			// As a special case, don't cross GOROOT to find a go.work file.
-			// The standard library and commands built in go always use the vendored
-			// dependencies, so avoid using a most likely irrelevant go.work file.
-			return ""
 		}
 		dir = d
 	}

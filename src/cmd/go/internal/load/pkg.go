@@ -2956,9 +2956,10 @@ func PackagesAndErrors(ld *modload.Loader, ctx context.Context, opts PackageOpts
 	var matches []*search.Match
 	if modload.Init(ld); cfg.ModulesEnabled {
 		modOpts := modload.PackageOpts{
-			ResolveMissingImports: true,
-			LoadTests:             opts.ModResolveTests,
-			SilencePackageErrors:  true,
+			ResolveMissingImports:    true,
+			LoadTests:                opts.ModResolveTests,
+			SilencePackageErrors:     true,
+			VendorModulesInGOROOTSrc: true,
 		}
 		matches, _ = modload.LoadPackages(ld, ctx, modOpts, patterns...)
 	} else {
