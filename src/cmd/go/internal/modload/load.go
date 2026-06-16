@@ -1965,6 +1965,22 @@ func (pld *packageLoader) stdVendor(ld *Loader, parentPath, path string) string 
 		return path
 	}
 
+	// When GOSTDMODULE is enabled and the importing standard-library module is
+	// the main module, resolve its dependencies through the normal module
+	// mechanisms (module cache, GOPROXY, go.work) rather than rewriting the
+	// import to GOROOT/src/vendor. Importers under the global "vendor/" tree are
+	// excluded: those packages resolve from GOROOT/src/vendor by design and are
+	// not part of the std module's own dependencies.
+	if cfg.GOSTDMODULE && !str.HasPathPrefix(parentPath, "vendor") {
+		if str.HasPathPrefix(parentPath, "cmd") {
+			if ld.MainModules.Contains("cmd") {
+				return path
+			}
+		} else if ld.MainModules.Contains("std") {
+			return path
+		}
+	}
+
 	if str.HasPathPrefix(parentPath, "cmd") {
 		if !pld.VendorModulesInGOROOTSrc || !ld.MainModules.Contains("cmd") {
 			vendorPath := pathpkg.Join("cmd", "vendor", path)

@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -484,6 +485,12 @@ var (
 	GOINSECURE                  = Getenv("GOINSECURE")
 	GOVCS                       = Getenv("GOVCS")
 	GOAUTH, GOAUTHChanged       = EnvOrAndChanged("GOAUTH", "netrc")
+
+	// GOSTDMODULE, when set to a true boolean value, makes the go command treat
+	// the standard library module ("std" and "cmd" in GOROOT/src) like a normal
+	// module: its module dependencies are resolved through the module cache,
+	// GOPROXY, and go.work workspaces instead of the GOROOT/src/vendor directory.
+	GOSTDMODULE = boolEnv("GOSTDMODULE")
 )
 
 // EnvOrAndChanged returns the environment variable value
@@ -539,6 +546,17 @@ func envOr(key, def string) string {
 		val = def
 	}
 	return val
+}
+
+// boolEnv returns the boolean value of the named go command environment
+// variable. An unset, empty, or unparseable value reports false.
+func boolEnv(key string) bool {
+	v := Getenv(key)
+	if v == "" {
+		return false
+	}
+	b, err := strconv.ParseBool(v)
+	return err == nil && b
 }
 
 // There is a copy of findGOROOT, isSameDir, and isGOROOT in

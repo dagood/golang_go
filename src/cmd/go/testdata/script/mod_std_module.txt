@@ -1,0 +1,27 @@
+# Tests GOSTDMODULE: when enabled, the standard library module is treated like
+# a normal module, resolving its dependencies through the module cache and
+# GOPROXY instead of the GOROOT/src/vendor directory.
+
+env GO111MODULE=on
+env GOPROXY=off
+
+[!compiler:gc] skip
+
+# GOSTDMODULE is a known configuration variable.
+go env GOSTDMODULE
+stdout '^$'
+
+# By default, within the std module, dependencies resolve from GOROOT/src/vendor.
+cd $GOROOT/src
+go list -deps -f '{{.ImportPath}}' net/http
+stdout ^vendor/golang.org/x/net/http2/hpack$
+! stdout ^golang.org/x/net/http2/hpack$
+
+# With GOSTDMODULE enabled, the import is no longer rewritten to the vendor
+# directory; it resolves as a real module path. With GOPROXY=off and the module
+# absent from the cache, resolution fails, but crucially it fails referring to
+# the real module path rather than the vendored one.
+env GOSTDMODULE=1
+! go list -deps -f '{{.ImportPath}}' net/http
+stderr golang.org/x/net
+! stderr vendor[/\\]golang.org[/\\]x[/\\]net

@@ -2477,6 +2477,14 @@
 //		and https://go.dev/ref/mod#module-proxy for details.
 //	GOROOT
 //		The root of the go tree.
+//	GOSTDMODULE
+//		When set to a true boolean value (for example "1"), treat the standard
+//		library module ("std" and "cmd" in GOROOT/src) like a normal module:
+//		resolve its module dependencies through the module cache, GOPROXY, and
+//		go.work workspaces instead of the vendor directory in GOROOT/src.
+//		This applies when the standard library module is the main module, such
+//		as when developing the standard library itself. The default is to use
+//		the vendored dependencies in GOROOT/src/vendor.
 //	GOSUMDB
 //		The name of checksum database to use and optionally its public key and
 //		URL. See https://go.dev/ref/mod#authenticating.

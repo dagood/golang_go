@@ -1548,6 +1548,22 @@ func appendGoAndToolchainRoots(roots []module.Version, goVersion, toolchain stri
 	return roots
 }
 
+// mainModuleIsStdOrCmd reports whether one of the main modules is the
+// standard library module ("std" or "cmd") rooted in GOROOT/src.
+// mainModuleIsStdOrCmd reports whether one of the main modules is the
+// standard library module ("std" or "cmd") rooted in GOROOT/src.
+func (ld *Loader) mainModuleIsStdOrCmd() bool {
+	if ld.MainModules == nil {
+		return false
+	}
+	for _, m := range ld.MainModules.Versions() {
+		if ld.MainModules.InGorootSrc(m) {
+			return true
+		}
+	}
+	return false
+}
+
 // setDefaultBuildMod sets a default value for cfg.BuildMod if the -mod flag
 // wasn't provided. setDefaultBuildMod may be called multiple times.
 func setDefaultBuildMod(ld *Loader) {
@@ -1597,6 +1613,14 @@ func setDefaultBuildMod(ld *Loader) {
 	}
 
 	if len(ld.modRoots) >= 1 {
+		if cfg.GOSTDMODULE && ld.mainModuleIsStdOrCmd() {
+			// Treat the standard library like a normal module: resolve its
+			// module dependencies through the module cache, GOPROXY, and
+			// go.work workspaces rather than defaulting to vendoring from
+			// GOROOT/src/vendor.
+			cfg.BuildMod = "readonly"
+			return
+		}
 		var goVersion string
 		var versionSource string
 		if ld.inWorkspaceMode() {
@@ -1747,10 +1771,13 @@ func findWorkspaceFile(dir string) (root string) {
 		if d == dir {
 			break
 		}
-		if d == cfg.GOROOT {
+		if d == cfg.GOROOT && !cfg.GOSTDMODULE {
 			// As a special case, don't cross GOROOT to find a go.work file.
 			// The standard library and commands built in go always use the vendored
 			// dependencies, so avoid using a most likely irrelevant go.work file.
+			//
+			// When GOSTDMODULE is enabled the standard library is treated like a
+			// normal module, so an enclosing go.work file should be respected.
 			return ""
 		}
 		dir = d
