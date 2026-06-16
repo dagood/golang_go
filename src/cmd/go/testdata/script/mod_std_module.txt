@@ -7,11 +7,14 @@ env GOPROXY=off
 
 [!compiler:gc] skip
 
-# GOSTDMODULE is a known configuration variable.
+# GOSTDMODULE is a known configuration variable. It defaults to 1 via
+# GOROOT/go.env for builds from this source tree.
 go env GOSTDMODULE
-stdout '^$'
+stdout '^1$'
 
-# By default, within the std module, dependencies resolve from GOROOT/src/vendor.
+# With GOSTDMODULE disabled, within the std module, dependencies resolve from
+# GOROOT/src/vendor.
+env GOSTDMODULE=0
 cd $GOROOT/src
 go list -deps -f '{{.ImportPath}}' net/http
 stdout ^vendor/golang.org/x/net/http2/hpack$
