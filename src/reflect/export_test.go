@@ -58,12 +58,9 @@ func FuncLayout(t Type, rcvr Type) (frametype Type, argSize, retOffset uintptr, 
 		inReg = append(inReg, bool2byte(abid.inRegPtrs.Get(i)))
 		outReg = append(outReg, bool2byte(abid.outRegPtrs.Get(i)))
 	}
-	if ft.Kind_&kindGCProg != 0 {
-		panic("can't handle gc programs")
-	}
 
 	// Expand frame type's GC bitmap into byte-map.
-	ptrs = ft.PtrBytes != 0
+	ptrs = ft.Pointers()
 	if ptrs {
 		nptrs := ft.PtrBytes / goarch.PtrSize
 		gcdata := ft.GcSlice(0, (nptrs+7)/8)
@@ -75,34 +72,27 @@ func FuncLayout(t Type, rcvr Type) (frametype Type, argSize, retOffset uintptr, 
 }
 
 func TypeLinks() []string {
+	first, rest := compiledTypelinks()
+
 	var r []string
-	sections, offset := typelinks()
-	for i, offs := range offset {
-		rodata := sections[i]
-		for _, off := range offs {
-			typ := (*rtype)(resolveTypeOff(unsafe.Pointer(rodata), off))
-			r = append(r, typ.String())
+
+	addTypes := func(types []*abi.Type) {
+		for _, typ := range types {
+			r = append(r, stringFor(typ))
 		}
 	}
+
+	addTypes(first)
+	for _, rt := range rest {
+		addTypes(rt)
+	}
+
 	return r
 }
 
 var GCBits = gcbits
 
 func gcbits(any) []byte // provided by runtime
-
-func MapBucketOf(x, y Type) Type {
-	return toType(bucketOf(x.common(), y.common()))
-}
-
-func CachedBucketOf(m Type) Type {
-	t := m.(*rtype)
-	if Kind(t.t.Kind_&kindMask) != Map {
-		panic("not map")
-	}
-	tt := (*mapType)(unsafe.Pointer(t))
-	return toType(tt.Bucket)
-}
 
 type EmbedWithUnexpMeth struct{}
 
@@ -164,3 +154,11 @@ func SetArgRegs(ints, floats int, floatSize uintptr) (oldInts, oldFloats int, ol
 }
 
 var MethodValueCallCodePtr = methodValueCallCodePtr
+
+var InternalIsZero = isZero
+
+var IsRegularMemory = isRegularMemory
+
+func MapGroupOf(x, y Type) Type {
+	return groupOf(x, y)
+}

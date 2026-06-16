@@ -7,6 +7,7 @@ package bytes_test
 import (
 	. "bytes"
 	"fmt"
+	"internal/testenv"
 	"io"
 	"math/rand"
 	"strconv"
@@ -92,6 +93,22 @@ func fillBytes(t *testing.T, testname string, buf *Buffer, s string, n int, fub 
 func TestNewBuffer(t *testing.T) {
 	buf := NewBuffer(testBytes)
 	check(t, "NewBuffer", buf, testString)
+}
+
+var buf Buffer
+
+// Calling NewBuffer and immediately shallow copying the Buffer struct
+// should not result in any allocations.
+// This can be used to reset the underlying []byte of an existing Buffer.
+func TestNewBufferShallow(t *testing.T) {
+	testenv.SkipIfOptimizationOff(t)
+	n := testing.AllocsPerRun(1000, func() {
+		buf = *NewBuffer(testBytes)
+	})
+	if n > 0 {
+		t.Errorf("allocations occurred while shallow copying")
+	}
+	check(t, "NewBuffer", &buf, testString)
 }
 
 func TestNewBufferString(t *testing.T) {
@@ -196,7 +213,7 @@ func TestLargeByteWrites(t *testing.T) {
 func TestLargeStringReads(t *testing.T) {
 	var buf Buffer
 	for i := 3; i < 30; i += 3 {
-		s := fillString(t, "TestLargeReads (1)", &buf, "", 5, testString[0:len(testString)/i])
+		s := fillString(t, "TestLargeReads (1)", &buf, "", 5, testString[:len(testString)/i])
 		empty(t, "TestLargeReads (2)", &buf, s, make([]byte, len(testString)))
 	}
 	check(t, "TestLargeStringReads (3)", &buf, "")
@@ -205,7 +222,7 @@ func TestLargeStringReads(t *testing.T) {
 func TestLargeByteReads(t *testing.T) {
 	var buf Buffer
 	for i := 3; i < 30; i += 3 {
-		s := fillBytes(t, "TestLargeReads (1)", &buf, "", 5, testBytes[0:len(testBytes)/i])
+		s := fillBytes(t, "TestLargeReads (1)", &buf, "", 5, testBytes[:len(testBytes)/i])
 		empty(t, "TestLargeReads (2)", &buf, s, make([]byte, len(testString)))
 	}
 	check(t, "TestLargeByteReads (3)", &buf, "")
@@ -257,7 +274,7 @@ func TestNil(t *testing.T) {
 func TestReadFrom(t *testing.T) {
 	var buf Buffer
 	for i := 3; i < 30; i += 3 {
-		s := fillBytes(t, "TestReadFrom (1)", &buf, "", 5, testBytes[0:len(testBytes)/i])
+		s := fillBytes(t, "TestReadFrom (1)", &buf, "", 5, testBytes[:len(testBytes)/i])
 		var b Buffer
 		b.ReadFrom(&buf)
 		empty(t, "TestReadFrom (2)", &b, s, make([]byte, len(testString)))
@@ -320,7 +337,7 @@ func TestReadFromNegativeReader(t *testing.T) {
 func TestWriteTo(t *testing.T) {
 	var buf Buffer
 	for i := 3; i < 30; i += 3 {
-		s := fillBytes(t, "TestWriteTo (1)", &buf, "", 5, testBytes[0:len(testBytes)/i])
+		s := fillBytes(t, "TestWriteTo (1)", &buf, "", 5, testBytes[:len(testBytes)/i])
 		var b Buffer
 		buf.WriteTo(&b)
 		empty(t, "TestWriteTo (2)", &b, s, make([]byte, len(testString)))
@@ -337,7 +354,7 @@ func TestWriteAppend(t *testing.T) {
 		got.Write(b)
 	}
 	if !Equal(got.Bytes(), want) {
-		t.Fatalf("Bytes() = %q, want %q", got, want)
+		t.Fatalf("Bytes() = %q, want %q", &got, want)
 	}
 
 	// With a sufficiently sized buffer, there should be no allocations.
@@ -510,6 +527,40 @@ func TestReadString(t *testing.T) {
 		}
 		if err != test.err {
 			t.Errorf("expected error %v, got %v", test.err, err)
+		}
+	}
+}
+
+var peekTests = []struct {
+	buffer   string
+	skip     int
+	n        int
+	expected string
+	err      error
+}{
+	{"", 0, 0, "", nil},
+	{"aaa", 0, 3, "aaa", nil},
+	{"foobar", 0, 2, "fo", nil},
+	{"a", 0, 2, "a", io.EOF},
+	{"helloworld", 4, 3, "owo", nil},
+	{"helloworld", 5, 5, "world", nil},
+	{"helloworld", 5, 6, "world", io.EOF},
+	{"helloworld", 10, 1, "", io.EOF},
+}
+
+func TestPeek(t *testing.T) {
+	for _, test := range peekTests {
+		buf := NewBufferString(test.buffer)
+		buf.Next(test.skip)
+		bytes, err := buf.Peek(test.n)
+		if string(bytes) != test.expected {
+			t.Errorf("expected %q, got %q", test.expected, bytes)
+		}
+		if err != test.err {
+			t.Errorf("expected error %v, got %v", test.err, err)
+		}
+		if buf.Len() != len(test.buffer)-test.skip {
+			t.Errorf("bad length after peek: %d, want %d", buf.Len(), len(test.buffer)-test.skip)
 		}
 	}
 }

@@ -6,9 +6,9 @@ package lex
 
 import (
 	"fmt"
-	"internal/buildcfg"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"text/scanner"
@@ -34,33 +34,18 @@ type Input struct {
 }
 
 // NewInput returns an Input from the given path.
-func NewInput(name string, compilingRuntime bool) *Input {
+func NewInput(name string) *Input {
 	return &Input{
 		// include directories: look in source dir, then -I directories.
 		includes:        append([]string{filepath.Dir(name)}, flags.I...),
 		beginningOfLine: true,
-		macros:          predefine(flags.D, compilingRuntime),
+		macros:          predefine(flags.D),
 	}
 }
 
 // predefine installs the macros set by the -D flag on the command line.
-func predefine(defines flags.MultiFlag, compilingRuntime bool) map[string]*Macro {
+func predefine(defines flags.MultiFlag) map[string]*Macro {
 	macros := make(map[string]*Macro)
-
-	// Set macros for GOEXPERIMENTs so we can easily switch
-	// runtime assembly code based on them.
-	if compilingRuntime {
-		for _, exp := range buildcfg.Experiment.Enabled() {
-			// Define macro.
-			name := "GOEXPERIMENT_" + exp
-			macros[name] = &Macro{
-				name:   name,
-				args:   nil,
-				tokens: Tokenize("1"),
-			}
-		}
-	}
-
 	for _, name := range defines {
 		value := "1"
 		i := strings.IndexRune(name, '=')
@@ -83,7 +68,7 @@ func predefine(defines flags.MultiFlag, compilingRuntime bool) map[string]*Macro
 
 var panicOnError bool // For testing.
 
-func (in *Input) Error(args ...interface{}) {
+func (in *Input) Error(args ...any) {
 	if panicOnError {
 		panic(fmt.Errorf("%s:%d: %s", in.File(), in.Line(), fmt.Sprintln(args...)))
 	}
@@ -92,7 +77,7 @@ func (in *Input) Error(args ...interface{}) {
 }
 
 // expectText is like Error but adds "got XXX" where XXX is a quoted representation of the most recent token.
-func (in *Input) expectText(args ...interface{}) {
+func (in *Input) expectText(args ...any) {
 	in.Error(append(args, "; got", strconv.Quote(in.Stack.Text()))...)
 }
 
@@ -268,7 +253,7 @@ func (in *Input) macroDefinition(name string) ([]string, []Token) {
 					in.Error("bad syntax in definition for macro:", name)
 				}
 				arg := in.Stack.Text()
-				if i := lookup(args, arg); i >= 0 {
+				if slices.Contains(args, arg) {
 					in.Error("duplicate argument", arg, "in definition for macro:", name)
 				}
 				args = append(args, arg)
@@ -294,15 +279,6 @@ func (in *Input) macroDefinition(name string) ([]string, []Token) {
 		tok = in.Stack.Next()
 	}
 	return args, tokens
-}
-
-func lookup(args []string, arg string) int {
-	for i, a := range args {
-		if a == arg {
-			return i
-		}
-	}
-	return -1
 }
 
 // invokeMacro pushes onto the input Stack a Slice that holds the macro definition with the actual

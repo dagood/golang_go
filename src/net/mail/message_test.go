@@ -6,9 +6,11 @@ package mail
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"mime"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -115,7 +117,7 @@ func headerEq(a, b Header) bool {
 		if !ok {
 			return false
 		}
-		if !reflect.DeepEqual(as, bs) {
+		if !slices.Equal(as, bs) {
 			return false
 		}
 	}
@@ -385,8 +387,16 @@ func TestAddressParsingError(t *testing.T) {
 		13: {"group not closed: null@example.com", "expected comma"},
 		14: {"group: first@example.com, second@example.com;", "group with multiple addresses"},
 		15: {"john.doe", "missing '@' or angle-addr"},
-		16: {"john.doe@", "no angle-addr"},
+		16: {"john.doe@", "missing '@' or angle-addr"},
 		17: {"John Doe@foo.bar", "no angle-addr"},
+		18: {" group: null@example.com; (asd", "misformatted parenthetical comment"},
+		19: {" group: ; (asd", "misformatted parenthetical comment"},
+		20: {`(John) Doe <jdoe@machine.example>`, "missing word in phrase:"},
+		21: {"<jdoe@[" + string([]byte{0xed, 0xa0, 0x80}) + "192.168.0.1]>", "invalid utf-8 in domain-literal"},
+		22: {"<jdoe@[[192.168.0.1]>", "bad character in domain-literal"},
+		23: {"<jdoe@[192.168.0.1>", "unclosed domain-literal"},
+		24: {"<jdoe@[256.0.0.1]>", "invalid IP address in domain-literal"},
+		25: {"<jdoe@[fd42::de:ad:be:ef]>", "invalid IP address in domain-literal"},
 	}
 
 	for i, tc := range mustErrTestCases {
@@ -436,24 +446,19 @@ func TestAddressParsing(t *testing.T) {
 				Address: "john.q.public@example.com",
 			}},
 		},
+		// Comment in display name
+		{
+			`John (middle) Doe <jdoe@machine.example>`,
+			[]*Address{{
+				Name:    "John Doe",
+				Address: "jdoe@machine.example",
+			}},
+		},
+		// Display name is quoted string, so comment is not a comment
 		{
 			`"John (middle) Doe" <jdoe@machine.example>`,
 			[]*Address{{
 				Name:    "John (middle) Doe",
-				Address: "jdoe@machine.example",
-			}},
-		},
-		{
-			`John (middle) Doe <jdoe@machine.example>`,
-			[]*Address{{
-				Name:    "John (middle) Doe",
-				Address: "jdoe@machine.example",
-			}},
-		},
-		{
-			`John !@M@! Doe <jdoe@machine.example>`,
-			[]*Address{{
-				Name:    "John !@M@! Doe",
 				Address: "jdoe@machine.example",
 			}},
 		},
@@ -788,6 +793,54 @@ func TestAddressParsing(t *testing.T) {
 				},
 			},
 		},
+		// Comment in group display name
+		{
+			`group (comment:): a@example.com, b@example.com;`,
+			[]*Address{
+				{
+					Address: "a@example.com",
+				},
+				{
+					Address: "b@example.com",
+				},
+			},
+		},
+		{
+			`x(:"):"@a.example;("@b.example;`,
+			[]*Address{
+				{
+					Address: `@a.example;(@b.example`,
+				},
+			},
+		},
+		// Domain-literal
+		{
+			`jdoe@[192.168.0.1]`,
+			[]*Address{{
+				Address: "jdoe@[192.168.0.1]",
+			}},
+		},
+		{
+			`John Doe <jdoe@[192.168.0.1]>`,
+			[]*Address{{
+				Name:    "John Doe",
+				Address: "jdoe@[192.168.0.1]",
+			}},
+		},
+		// IPv6 Domain-literal
+		{
+			`jdoe@[IPv6:fd42::dead:beef:1234]`,
+			[]*Address{{
+				Address: "jdoe@[IPv6:fd42::dead:beef:1234]",
+			}},
+		},
+		{
+			`John Doe <jdoe@[IPv6:fd42::dead:beef:1234]>`,
+			[]*Address{{
+				Name:    "John Doe",
+				Address: "jdoe@[IPv6:fd42::dead:beef:1234]",
+			}},
+		},
 	}
 	for _, test := range tests {
 		if len(test.exp) == 1 {
@@ -938,6 +991,34 @@ func TestAddressParser(t *testing.T) {
 				},
 			},
 		},
+		// Domain-literal
+		{
+			`jdoe@[192.168.0.1]`,
+			[]*Address{{
+				Address: "jdoe@[192.168.0.1]",
+			}},
+		},
+		{
+			`John Doe <jdoe@[192.168.0.1]>`,
+			[]*Address{{
+				Name:    "John Doe",
+				Address: "jdoe@[192.168.0.1]",
+			}},
+		},
+		// IPv6 Domain-literal
+		{
+			`jdoe@[IPv6:fd42::dead:beef:1234]`,
+			[]*Address{{
+				Address: "jdoe@[IPv6:fd42::dead:beef:1234]",
+			}},
+		},
+		{
+			`John Doe <jdoe@[IPv6:fd42::dead:beef:1234]>`,
+			[]*Address{{
+				Name:    "John Doe",
+				Address: "jdoe@[IPv6:fd42::dead:beef:1234]",
+			}},
+		},
 	}
 
 	ap := AddressParser{WordDecoder: &mime.WordDecoder{
@@ -1044,6 +1125,24 @@ func TestAddressString(t *testing.T) {
 			&Address{Name: string([]byte{0xed, 0xa0, 0x80}), Address: "invalid-utf8@example.net"},
 			"=?utf-8?q?=ED=A0=80?= <invalid-utf8@example.net>",
 		},
+		// Domain-literal
+		{
+			&Address{Address: "bob@[192.168.0.1]"},
+			"<bob@[192.168.0.1]>",
+		},
+		{
+			&Address{Name: "Bob", Address: "bob@[192.168.0.1]"},
+			`"Bob" <bob@[192.168.0.1]>`,
+		},
+		// IPv6 Domain-literal
+		{
+			&Address{Address: "bob@[IPv6:fd42::dead:beef:1234]"},
+			"<bob@[IPv6:fd42::dead:beef:1234]>",
+		},
+		{
+			&Address{Name: "Bob", Address: "bob@[IPv6:fd42::dead:beef:1234]"},
+			`"Bob" <bob@[IPv6:fd42::dead:beef:1234]>`,
+		},
 	}
 	for _, test := range tests {
 		s := test.addr.String()
@@ -1097,6 +1196,7 @@ func TestAddressParsingAndFormatting(t *testing.T) {
 		`<"."@example.com>`,
 		`<".."@example.com>`,
 		`<"0:"@0>`,
+		`<Bob@[192.168.0.1]>`,
 	}
 
 	for _, test := range tests {
@@ -1197,5 +1297,34 @@ func TestEmptyAddress(t *testing.T) {
 	list, err = ParseAddressList("a@b c@d")
 	if len(list) > 0 || err == nil {
 		t.Errorf(`ParseAddressList("") = %v, %v, want nil, error`, list, err)
+	}
+}
+
+func BenchmarkConsumePhrase(b *testing.B) {
+	for _, n := range []int{10, 100, 1000, 10000} {
+		b.Run(fmt.Sprintf("words-%d", n), func(b *testing.B) {
+			input := strings.Repeat("=?utf-8?q?hello?= ", n) + "<user@example.com>"
+			for b.Loop() {
+				(&addrParser{s: input}).consumePhrase()
+			}
+		})
+	}
+}
+
+func BenchmarkConsumeComment(b *testing.B) {
+	for _, n := range []int{10, 100, 1000, 10000} {
+		b.Run(fmt.Sprintf("depth-%d", n), func(b *testing.B) {
+			// Build a deeply nested comment: (((...a...)))
+			open := strings.Repeat("(", n)
+			close := strings.Repeat(")", n)
+			// consumeComment expects the leading '(' already consumed,
+			// so we start with one fewer opening paren and the parser
+			// will handle nesting from there.
+			input := open[:n-1] + "a" + close
+			for b.Loop() {
+				p := addrParser{s: input}
+				p.consumeComment()
+			}
+		})
 	}
 }

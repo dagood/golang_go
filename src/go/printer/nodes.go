@@ -11,7 +11,6 @@ package printer
 import (
 	"go/ast"
 	"go/token"
-	"math"
 	"strconv"
 	"strings"
 	"unicode"
@@ -44,10 +43,7 @@ import (
 // linebreaks. At the moment there is no easy way to know about
 // future (not yet interspersed) comments in this function.
 func (p *printer) linebreak(line, min int, ws whiteSpace, newSection bool) (nbreaks int) {
-	n := nlimit(line - p.pos.Line)
-	if n < min {
-		n = min
-	}
+	n := max(nlimit(line-p.pos.Line), min)
 	if n > 0 {
 		p.print(ws)
 		if newSection {
@@ -186,9 +182,9 @@ func (p *printer) exprList(prev0 token.Pos, list []ast.Expr, depth int, mode exp
 
 	// We use the ratio between the geometric mean of the previous key sizes and
 	// the current size to determine if there should be a break in the alignment.
-	// To compute the geometric mean we accumulate the ln(size) values (lnsum)
+	// To compute the geometric mean we accumulate the log₂(size) values (log2sum)
 	// and the number of sizes included (count).
-	lnsum := 0.0
+	log2sum := 0.0
 	count := 0
 
 	// print all list elements
@@ -231,8 +227,8 @@ func (p *printer) exprList(prev0 token.Pos, list []ast.Expr, depth int, mode exp
 			if count == 0 || prevSize <= smallSize && size <= smallSize {
 				useFF = false
 			} else {
-				const r = 2.5                               // threshold
-				geomean := math.Exp(lnsum / float64(count)) // count > 0
+				const r = 2.5                                // threshold
+				geomean := exp2ish(log2sum / float64(count)) // count > 0
 				ratio := float64(size) / geomean
 				useFF = r*ratio <= 1 || r <= ratio
 			}
@@ -263,7 +259,7 @@ func (p *printer) exprList(prev0 token.Pos, list []ast.Expr, depth int, mode exp
 				// the section), reset the geomean variables since we are
 				// starting a new group of elements with the next element.
 				if nbreaks > 1 {
-					lnsum = 0
+					log2sum = 0
 					count = 0
 				}
 			}
@@ -287,7 +283,7 @@ func (p *printer) exprList(prev0 token.Pos, list []ast.Expr, depth int, mode exp
 		}
 
 		if size > 0 {
-			lnsum += math.Log(float64(size))
+			log2sum += log2ish(float64(size))
 			count++
 		}
 
@@ -383,7 +379,7 @@ func (p *printer) parameters(fields *ast.FieldList, mode paramMode) {
 		if closing := p.lineFor(fields.Closing); 0 < prevLine && prevLine < closing {
 			p.print(token.COMMA)
 			p.linebreak(closing, 0, ignore, true)
-		} else if mode == typeTParam && fields.NumFields() == 1 && combinesWithName(fields.List[0].Type) {
+		} else if mode == typeTParam && fields.NumFields() == 1 && combinesWithName(stripParensAlways(fields.List[0].Type)) {
 			// A type parameter list [P T] where the name P and the type expression T syntactically
 			// combine to another valid (value) expression requires a trailing comma, as in [P *T,]
 			// (or an enclosing interface as in [P interface(*T)]), so that the type parameter list
@@ -404,7 +400,7 @@ func (p *printer) parameters(fields *ast.FieldList, mode paramMode) {
 // combinesWithName reports whether a name followed by the expression x
 // syntactically combines to another valid (value) expression. For instance
 // using *T for x, "name *T" syntactically appears as the expression x*T.
-// On the other hand, using  P|Q or *P|~Q for x, "name P|Q" or name *P|~Q"
+// On the other hand, using  P|Q or *P|~Q for x, "name P|Q" or "name *P|~Q"
 // cannot be combined into a valid (value) expression.
 func combinesWithName(x ast.Expr) bool {
 	switch x := x.(type) {
@@ -414,9 +410,7 @@ func combinesWithName(x ast.Expr) bool {
 	case *ast.BinaryExpr:
 		return combinesWithName(x.X) && !isTypeElem(x.Y)
 	case *ast.ParenExpr:
-		// name(x) combines but we are making sure at
-		// the call site that x is never parenthesized.
-		panic("unexpected parenthesized expression")
+		return !isTypeElem(x.X)
 	}
 	return false
 }
@@ -670,9 +664,7 @@ func walkBinary(e *ast.BinaryExpr) (has4, has5 bool, maxProblem int) {
 		h4, h5, mp := walkBinary(l)
 		has4 = has4 || h4
 		has5 = has5 || h5
-		if maxProblem < mp {
-			maxProblem = mp
-		}
+		maxProblem = max(maxProblem, mp)
 	}
 
 	switch r := e.Y.(type) {
@@ -685,9 +677,7 @@ func walkBinary(e *ast.BinaryExpr) (has4, has5 bool, maxProblem int) {
 		h4, h5, mp := walkBinary(r)
 		has4 = has4 || h4
 		has5 = has5 || h5
-		if maxProblem < mp {
-			maxProblem = mp
-		}
+		maxProblem = max(maxProblem, mp)
 
 	case *ast.StarExpr:
 		if e.Op == token.QUO { // `*/`
@@ -699,9 +689,7 @@ func walkBinary(e *ast.BinaryExpr) (has4, has5 bool, maxProblem int) {
 		case "/*", "&&", "&^":
 			maxProblem = 5
 		case "++", "--":
-			if maxProblem < 4 {
-				maxProblem = 4
-			}
+			maxProblem = max(maxProblem, 4)
 		}
 	}
 	return
@@ -983,15 +971,24 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 		if len(x.Args) > 1 {
 			depth++
 		}
-		var wasIndented bool
-		if _, ok := x.Fun.(*ast.FuncType); ok {
-			// conversions to literal function types require parentheses around the type
-			p.print(token.LPAREN)
-			wasIndented = p.possibleSelectorExpr(x.Fun, token.HighestPrec, depth)
-			p.print(token.RPAREN)
-		} else {
-			wasIndented = p.possibleSelectorExpr(x.Fun, token.HighestPrec, depth)
+
+		// Conversions to literal function types or <-chan
+		// types require parentheses around the type.
+		paren := false
+		switch t := x.Fun.(type) {
+		case *ast.FuncType:
+			paren = true
+		case *ast.ChanType:
+			paren = t.Dir == ast.RECV
 		}
+		if paren {
+			p.print(token.LPAREN)
+		}
+		wasIndented := p.possibleSelectorExpr(x.Fun, token.HighestPrec, depth)
+		if paren {
+			p.print(token.RPAREN)
+		}
+
 		p.setPos(x.Lparen)
 		p.print(token.LPAREN)
 		if x.Ellipsis.IsValid() {
@@ -1312,13 +1309,29 @@ func (p *printer) controlClause(isForStmt bool, init ast.Stmt, expr ast.Expr, po
 	}
 }
 
+// isCompositeLitLike reports whether x is a composite literal or an expression
+// whose core is a composite literal (e.g. &T{...}), ignoring parentheses.
+func isCompositeLitLike(x ast.Expr) bool {
+	switch x := stripParensAlways(x).(type) {
+	case *ast.CompositeLit:
+		return true
+	case *ast.UnaryExpr:
+		_, ok := stripParensAlways(x.X).(*ast.CompositeLit)
+		return x.Op == token.AND && ok
+	}
+	return false
+}
+
 // indentList reports whether an expression list would look better if it
 // were indented wholesale (starting with the very first element, rather
 // than starting at the first line break).
+// Currently this function is only used to improve formatting of return
+// statements.
 func (p *printer) indentList(list []ast.Expr) bool {
 	// Heuristic: indentList reports whether there are more than one multi-
-	// line element in the list, or if there is any element that is not
-	// starting on the same line as the previous one ends.
+	// line element (such as a complex expression, but excluding composite
+	// literals) in the list, or if there is any element that is not starting
+	// on the same line as the previous one ends.
 	if len(list) >= 2 {
 		var b = p.lineFor(list[0].Pos())
 		var e = p.lineFor(list[len(list)-1].End())
@@ -1334,8 +1347,10 @@ func (p *printer) indentList(list []ast.Expr) bool {
 					// line as the previous one ended
 					return true
 				}
-				if xb < xe {
-					// x is a multi-line element
+				if xb < xe && !isCompositeLitLike(x) {
+					// x is a multi-line element but not a composite literal
+					// (composite literals have their own field indentation
+					// already, see go.dev/issue/7195)
 					n++
 				}
 				line = xe
@@ -1739,7 +1754,7 @@ func (p *printer) genDecl(d *ast.GenDecl) {
 	p.setPos(d.Pos())
 	p.print(d.Tok, blank)
 
-	if d.Lparen.IsValid() || len(d.Specs) > 1 {
+	if d.Lparen.IsValid() || len(d.Specs) != 1 {
 		// group of parenthesized declarations
 		p.setPos(d.Lparen)
 		p.print(token.LPAREN)

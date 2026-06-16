@@ -16,28 +16,37 @@ func (d *decoder) makeImg(mxx, myy int) {
 		return
 	}
 
-	h0 := d.comp[0].h
-	v0 := d.comp[0].v
-	hRatio := h0 / d.comp[1].h
-	vRatio := v0 / d.comp[1].v
-	var subsampleRatio image.YCbCrSubsampleRatio
-	switch hRatio<<4 | vRatio {
-	case 0x11:
-		subsampleRatio = image.YCbCrSubsampleRatio444
-	case 0x12:
-		subsampleRatio = image.YCbCrSubsampleRatio440
-	case 0x21:
-		subsampleRatio = image.YCbCrSubsampleRatio422
-	case 0x22:
-		subsampleRatio = image.YCbCrSubsampleRatio420
-	case 0x41:
-		subsampleRatio = image.YCbCrSubsampleRatio411
-	case 0x42:
-		subsampleRatio = image.YCbCrSubsampleRatio410
-	default:
-		panic("unreachable")
+	// Determine if we need flex mode for non-standard subsampling.
+	// Flex mode is needed when:
+	// - Cb and Cr have different sampling factors, or
+	// - The Y component doesn't have the maximum sampling factors, or
+	// - The ratio doesn't match any standard YCbCrSubsampleRatio.
+	subsampleRatio := image.YCbCrSubsampleRatio444
+	if d.comp[1].h != d.comp[2].h || d.comp[1].v != d.comp[2].v ||
+		d.maxH != d.comp[0].h || d.maxV != d.comp[0].v {
+		d.flex = true
+	} else {
+		hRatio := d.maxH / d.comp[1].h
+		vRatio := d.maxV / d.comp[1].v
+		switch hRatio<<4 | vRatio {
+		case 0x11:
+			subsampleRatio = image.YCbCrSubsampleRatio444
+		case 0x12:
+			subsampleRatio = image.YCbCrSubsampleRatio440
+		case 0x21:
+			subsampleRatio = image.YCbCrSubsampleRatio422
+		case 0x22:
+			subsampleRatio = image.YCbCrSubsampleRatio420
+		case 0x41:
+			subsampleRatio = image.YCbCrSubsampleRatio411
+		case 0x42:
+			subsampleRatio = image.YCbCrSubsampleRatio410
+		default:
+			d.flex = true
+		}
 	}
-	m := image.NewYCbCr(image.Rect(0, 0, 8*h0*mxx, 8*v0*myy), subsampleRatio)
+
+	m := image.NewYCbCr(image.Rect(0, 0, 8*d.maxH*mxx, 8*d.maxV*myy), subsampleRatio)
 	d.img3 = m.SubImage(image.Rect(0, 0, d.width, d.height)).(*image.YCbCr)
 
 	if d.nComp == 4 {
@@ -143,9 +152,11 @@ func (d *decoder) processSOS(n int) error {
 	}
 
 	// mxx and myy are the number of MCUs (Minimum Coded Units) in the image.
-	h0, v0 := d.comp[0].h, d.comp[0].v // The h and v values from the Y components.
-	mxx := (d.width + 8*h0 - 1) / (8 * h0)
-	myy := (d.height + 8*v0 - 1) / (8 * v0)
+	// The MCU dimensions are based on the maximum sampling factors.
+	// For standard subsampling, maxH/maxV equals h0/v0 (Y's factors).
+	// For flex mode, Y may not have the maximum factors.
+	mxx := (d.width + 8*d.maxH - 1) / (8 * d.maxH)
+	myy := (d.height + 8*d.maxV - 1) / (8 * d.maxV)
 	if d.img1 == nil && d.img3 == nil {
 		d.makeImg(mxx, myy)
 	}
@@ -305,32 +316,15 @@ func (d *decoder) processSOS(n int) error {
 			} // for i
 			mcu++
 			if d.ri > 0 && mcu%d.ri == 0 && mcu < mxx*myy {
-				// A more sophisticated decoder could use RST[0-7] markers to resynchronize from corrupt input,
-				// but this one assumes well-formed input, and hence the restart marker follows immediately.
+				// For well-formed input, the RST[0-7] restart marker follows
+				// immediately. For corrupt input, call findRST to try to
+				// resynchronize.
 				if err := d.readFull(d.tmp[:2]); err != nil {
 					return err
-				}
-
-				// Section F.1.2.3 says that "Byte alignment of markers is
-				// achieved by padding incomplete bytes with 1-bits. If padding
-				// with 1-bits creates a X’FF’ value, a zero byte is stuffed
-				// before adding the marker."
-				//
-				// Seeing "\xff\x00" here is not spec compliant, as we are not
-				// expecting an *incomplete* byte (that needed padding). Still,
-				// some real world encoders (see golang.org/issue/28717) insert
-				// it, so we accept it and re-try the 2 byte read.
-				//
-				// libjpeg issues a warning (but not an error) for this:
-				// https://github.com/LuaDist/libjpeg/blob/6c0fcb8ddee365e7abc4d332662b06900612e923/jdmarker.c#L1041-L1046
-				if d.tmp[0] == 0xff && d.tmp[1] == 0x00 {
-					if err := d.readFull(d.tmp[:2]); err != nil {
+				} else if d.tmp[0] != 0xff || d.tmp[1] != expectedRST {
+					if err := d.findRST(expectedRST); err != nil {
 						return err
 					}
-				}
-
-				if d.tmp[0] != 0xff || d.tmp[1] != expectedRST {
-					return FormatError("bad RST marker")
 				}
 				expectedRST++
 				if expectedRST == rst7Marker+1 {
@@ -456,16 +450,15 @@ func (d *decoder) refineNonZeroes(b *block, zig, zigEnd, nz, delta int32) (int32
 }
 
 func (d *decoder) reconstructProgressiveImage() error {
-	// The h0, mxx, by and bx variables have the same meaning as in the
+	// The mxx, by and bx variables have the same meaning as in the
 	// processSOS method.
-	h0 := d.comp[0].h
-	mxx := (d.width + 8*h0 - 1) / (8 * h0)
+	mxx := (d.width + 8*d.maxH - 1) / (8 * d.maxH)
 	for i := 0; i < d.nComp; i++ {
 		if d.progCoeffs[i] == nil {
 			continue
 		}
-		v := 8 * d.comp[0].v / d.comp[i].v
-		h := 8 * d.comp[0].h / d.comp[i].h
+		v := 8 * d.maxV / d.comp[i].v
+		h := 8 * d.maxH / d.comp[i].h
 		stride := mxx * d.comp[i].h
 		for by := 0; by*v < d.height; by++ {
 			for bx := 0; bx*h < d.width; bx++ {
@@ -486,6 +479,15 @@ func (d *decoder) reconstructBlock(b *block, bx, by, compIndex int) error {
 		b[unzig[zig]] *= qt[zig]
 	}
 	idct(b)
+
+	var h, v int
+	if d.flex {
+		// Flex mode: scale bx and by according to the component's sampling factors.
+		h = d.comp[compIndex].expandH
+		v = d.comp[compIndex].expandV
+		bx, by = bx*h, by*v
+	}
+
 	dst, stride := []byte(nil), 0
 	if d.nComp == 1 {
 		dst, stride = d.img1.Pix[8*(by*d.img1.Stride+bx):], d.img1.Stride
@@ -503,21 +505,76 @@ func (d *decoder) reconstructBlock(b *block, bx, by, compIndex int) error {
 			return UnsupportedError("too many components")
 		}
 	}
+
+	if d.flex {
+		// Flex mode: expand each source pixel to h×v destination pixels.
+		for y := 0; y < 8; y++ {
+			y8 := y * 8
+			yv := y * v
+			for x := 0; x < 8; x++ {
+				val := uint8(max(0, min(255, b[y8+x]+128)))
+				xh := x * h
+				for yy := 0; yy < v; yy++ {
+					for xx := 0; xx < h; xx++ {
+						dst[(yv+yy)*stride+xh+xx] = val
+					}
+				}
+			}
+		}
+		return nil
+	}
+
 	// Level shift by +128, clip to [0, 255], and write to dst.
 	for y := 0; y < 8; y++ {
 		y8 := y * 8
 		yStride := y * stride
 		for x := 0; x < 8; x++ {
-			c := b[y8+x]
-			if c < -128 {
-				c = 0
-			} else if c > 127 {
-				c = 255
-			} else {
-				c += 128
-			}
-			dst[yStride+x] = uint8(c)
+			dst[yStride+x] = uint8(max(0, min(255, b[y8+x]+128)))
 		}
 	}
 	return nil
+}
+
+// findRST advances past the next RST restart marker that matches expectedRST.
+// Other than I/O errors, it is also an error if we encounter an {0xFF, M}
+// two-byte marker sequence where M is not 0x00, 0xFF or the expectedRST.
+//
+// This is similar to libjpeg's jdmarker.c's next_marker function.
+// https://github.com/libjpeg-turbo/libjpeg-turbo/blob/2dfe6c0fe9e18671105e94f7cbf044d4a1d157e6/jdmarker.c#L892-L935
+//
+// Precondition: d.tmp[:2] holds the next two bytes of JPEG-encoded input
+// (input in the d.readFull sense).
+func (d *decoder) findRST(expectedRST uint8) error {
+	for {
+		// i is the index such that, at the bottom of the loop, we read 2-i
+		// bytes into d.tmp[i:2], maintaining the invariant that d.tmp[:2]
+		// holds the next two bytes of JPEG-encoded input. It is either 0 or 1,
+		// so that each iteration advances by 1 or 2 bytes (or returns).
+		i := 0
+
+		if d.tmp[0] == 0xff {
+			if d.tmp[1] == expectedRST {
+				return nil
+			} else if d.tmp[1] == 0xff {
+				i = 1
+			} else if d.tmp[1] != 0x00 {
+				// libjpeg's jdmarker.c's jpeg_resync_to_restart does something
+				// fancy here, treating RST markers within two (modulo 8) of
+				// expectedRST differently from RST markers that are 'more
+				// distant'. Until we see evidence that recovering from such
+				// cases is frequent enough to be worth the complexity, we take
+				// a simpler approach for now. Any marker that's not 0x00, 0xff
+				// or expectedRST is a fatal FormatError.
+				return FormatError("bad RST marker")
+			}
+
+		} else if d.tmp[1] == 0xff {
+			d.tmp[0] = 0xff
+			i = 1
+		}
+
+		if err := d.readFull(d.tmp[i:2]); err != nil {
+			return err
+		}
+	}
 }

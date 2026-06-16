@@ -90,8 +90,9 @@
 //     }
 //
 //     type Alias struct {
-//         Tag  byte // 'A'
+//         Tag  byte // 'A' or 'B'
 //         Pos  Pos
+//         TypeParams []typeOff  // only present if Tag == 'B'
 //         Type typeOff
 //     }
 //
@@ -234,27 +235,7 @@
 
 package typecheck
 
-import (
-	"strings"
-)
-
 const blankMarker = "$"
-
-// TparamName returns the real name of a type parameter, after stripping its
-// qualifying prefix and reverting blank-name encoding. See TparamExportName
-// for details.
-func TparamName(exportName string) string {
-	// Remove the "path" from the type param name that makes it unique.
-	ix := strings.LastIndex(exportName, ".")
-	if ix < 0 {
-		return ""
-	}
-	name := exportName[ix+1:]
-	if strings.HasPrefix(name, blankMarker) {
-		return "_"
-	}
-	return name
-}
 
 // The name used for dictionary parameters or local variables.
 const LocalDictName = ".dict"

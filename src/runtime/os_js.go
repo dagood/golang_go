@@ -32,6 +32,21 @@ func usleep(usec uint32) {
 //go:noescape
 func getRandomData(r []byte)
 
+func readRandom(r []byte) int {
+	getRandomData(r)
+	return len(r)
+}
+
 func goenvs() {
 	goenvs_unix()
+}
+
+//go:nowritebarrierrec
+//go:nosplit
+func libpreinit() {}
+
+//go:nowritebarrierrec
+//go:nosplit
+func newosproc0(stacksize uintptr, fn unsafe.Pointer) {
+	throw("bad newosproc0")
 }

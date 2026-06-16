@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build darwin || (openbsd && !mips64)
+//go:build darwin || openbsd
 
 package syscall
 
@@ -48,8 +48,9 @@ func runtime_AfterForkInChild()
 // they might have been locked at the time of the fork. This means
 // no rescheduling, no malloc calls, and no new stack segments.
 // For the same reason compiler does not race instrument it.
-// The calls to rawSyscall are okay because they are assembly
-// functions that do not grow the stack.
+// The calls to rawSyscall are okay because they are nosplit
+// functions that do not grow the stack and are not race
+// instrumented (go:norace).
 //
 //go:norace
 func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr *ProcAttr, sys *SysProcAttr, pipe int) (pid int, err1 Errno) {
@@ -59,13 +60,12 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 		r1              uintptr
 		nextfd          int
 		i               int
-		err             error
 		pgrp            _C_int
 		cred            *Credential
 		ngroups, groups uintptr
 	)
 
-	rlim, rlimOK := origRlimitNofile.Load().(Rlimit)
+	rlim := origRlimitNofile.Load()
 
 	// guard against side effects of shuffling fds below.
 	// Make sure that nextfd is beyond any currently open files so
@@ -99,8 +99,12 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 
 	// Enable tracing if requested.
 	if sys.Ptrace {
-		if err = ptrace(PTRACE_TRACEME, 0, 0, 0); err != nil {
-			err1 = err.(Errno)
+		if runtime.GOOS == "ios" {
+			err1 = ENOSYS
+			goto childerror
+		}
+		_, _, err1 = rawSyscall6(abi.FuncPCABI0(libc_ptrace_trampoline), PTRACE_TRACEME, 0, 0, 0, 0, 0)
+		if err1 != 0 {
 			goto childerror
 		}
 	}
@@ -272,8 +276,8 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 	}
 
 	// Restore original rlimit.
-	if rlimOK && rlim.Cur != 0 {
-		rawSyscall(abi.FuncPCABI0(libc_setrlimit_trampoline), uintptr(RLIMIT_NOFILE), uintptr(unsafe.Pointer(&rlim)), 0)
+	if rlim != nil {
+		rawSyscall(abi.FuncPCABI0(libc_setrlimit_trampoline), uintptr(RLIMIT_NOFILE), uintptr(unsafe.Pointer(rlim)), 0)
 	}
 
 	// Time to exec.
@@ -288,4 +292,9 @@ childerror:
 	for {
 		rawSyscall(abi.FuncPCABI0(libc_exit_trampoline), 253, 0, 0)
 	}
+}
+
+// forkAndExecFailureCleanup cleans up after an exec failure.
+func forkAndExecFailureCleanup(attr *ProcAttr, sys *SysProcAttr) {
+	// Nothing to do.
 }

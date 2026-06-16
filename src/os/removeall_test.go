@@ -6,6 +6,7 @@ package os_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"internal/testenv"
 	. "os"
@@ -159,40 +160,25 @@ func TestRemoveAllLongPath(t *testing.T) {
 		t.Skip("skipping for not implemented platforms")
 	}
 
-	prevDir, err := Getwd()
-	if err != nil {
-		t.Fatalf("Could not get wd: %s", err)
-	}
+	startPath := t.TempDir()
+	t.Chdir(startPath)
 
-	startPath, err := MkdirTemp("", "TestRemoveAllLongPath-")
-	if err != nil {
-		t.Fatalf("Could not create TempDir: %s", err)
-	}
-	defer RemoveAll(startPath)
-
-	err = Chdir(startPath)
-	if err != nil {
-		t.Fatalf("Could not chdir %s: %s", startPath, err)
-	}
-
-	// Removing paths with over 4096 chars commonly fails
+	// Removing paths with over 4096 chars commonly fails.
+	name := strings.Repeat("a", 100)
 	for i := 0; i < 41; i++ {
-		name := strings.Repeat("a", 100)
-
-		err = Mkdir(name, 0755)
-		if err != nil {
+		if err := Mkdir(name, 0755); err != nil {
 			t.Fatalf("Could not mkdir %s: %s", name, err)
 		}
-
-		err = Chdir(name)
-		if err != nil {
+		if err := Chdir(name); err != nil {
 			t.Fatalf("Could not chdir %s: %s", name, err)
 		}
 	}
 
-	err = Chdir(prevDir)
+	// Chdir out of startPath before attempting to remove it,
+	// otherwise RemoveAll fails on aix, illumos and solaris.
+	err := Chdir(filepath.Join(startPath, ".."))
 	if err != nil {
-		t.Fatalf("Could not chdir %s: %s", prevDir, err)
+		t.Fatalf("Could not chdir: %s", err)
 	}
 
 	err = RemoveAll(startPath)
@@ -202,29 +188,10 @@ func TestRemoveAllLongPath(t *testing.T) {
 }
 
 func TestRemoveAllDot(t *testing.T) {
-	prevDir, err := Getwd()
-	if err != nil {
-		t.Fatalf("Could not get wd: %s", err)
-	}
-	tempDir, err := MkdirTemp("", "TestRemoveAllDot-")
-	if err != nil {
-		t.Fatalf("Could not create TempDir: %s", err)
-	}
-	defer RemoveAll(tempDir)
+	t.Chdir(t.TempDir())
 
-	err = Chdir(tempDir)
-	if err != nil {
-		t.Fatalf("Could not chdir to tempdir: %s", err)
-	}
-
-	err = RemoveAll(".")
-	if err == nil {
+	if err := RemoveAll("."); err == nil {
 		t.Errorf("RemoveAll succeed to remove .")
-	}
-
-	err = Chdir(prevDir)
-	if err != nil {
-		t.Fatalf("Could not chdir %s: %s", prevDir, err)
 	}
 }
 
@@ -272,14 +239,7 @@ func TestRemoveReadOnlyDir(t *testing.T) {
 
 // Issue #29983.
 func TestRemoveAllButReadOnlyAndPathError(t *testing.T) {
-	switch runtime.GOOS {
-	case "js", "wasip1", "windows":
-		t.Skipf("skipping test on %s", runtime.GOOS)
-	}
-
-	if Getuid() == 0 {
-		t.Skip("skipping test when running as root")
-	}
+	testRequiresPermissions(t)
 
 	t.Parallel()
 
@@ -489,7 +449,7 @@ func TestRemoveAllNoFcntl(t *testing.T) {
 		}
 	}
 
-	cmd := testenv.Command(t, "/bin/strace", "-f", "-e", "fcntl", me, "-test.run=TestRemoveAllNoFcntl")
+	cmd := testenv.Command(t, "/bin/strace", "-f", "-e", "fcntl", me, "-test.run=^TestRemoveAllNoFcntl$")
 	cmd = testenv.CleanCmdEnv(cmd)
 	cmd.Env = append(cmd.Env, env+"="+subdir)
 	out, err := cmd.CombinedOutput()
@@ -502,5 +462,75 @@ func TestRemoveAllNoFcntl(t *testing.T) {
 
 	if got := bytes.Count(out, []byte("fcntl")); got >= 100 {
 		t.Errorf("found %d fcntl calls, want < 100", got)
+	}
+}
+
+func TestRemoveAllTrailingSlash(t *testing.T) {
+	slashes := []string{"/"}
+	if runtime.GOOS == "windows" {
+		slashes = append(slashes, `\`)
+	}
+	for _, slash := range slashes {
+		dir := makefs(t, []string{
+			"dir/a/file1",
+			"dir/a/file2",
+			"dir/file3",
+		})
+		path := dir + "/dir"
+		if err := RemoveAll(path + slash); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Stat(path); !IsNotExist(err) {
+			t.Errorf("after RemoveAll(%q), directory still exists", path+slash)
+		}
+	}
+}
+
+func TestRemoveAllSymlinkRemovalFailure(t *testing.T) {
+	testRequiresPermissions(t)
+	dir := makefs(t, []string{
+		"parent/",
+		"parent/link => target",
+	})
+	if err := Chmod(dir+"/parent", 0o555); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		Chmod(dir+"/parent", 0o755)
+	}()
+
+	err := RemoveAll(dir + "/parent/link")
+	if !errors.Is(err, ErrPermission) {
+		t.Fatalf("RemoveAll = %v; want ErrPermission", err)
+	}
+	// Issue #78490: RemoveAll leaked errSymlink, which panics when printed.
+	_ = err.Error()
+}
+
+func testRequiresPermissions(t *testing.T) {
+	t.Helper()
+	switch runtime.GOOS {
+	case "js", "wasip1", "windows":
+		t.Skipf("skipping test: %s does not support chmod", runtime.GOOS)
+	}
+	if Getuid() == 0 {
+		t.Skip("skipping test: running as root (which ignores file permissions)")
+	}
+}
+
+func BenchmarkRemoveAll(b *testing.B) {
+	tmpDir := filepath.Join(b.TempDir(), "target")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		err := CopyFS(tmpDir, DirFS("."))
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+		if err := RemoveAll(tmpDir); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

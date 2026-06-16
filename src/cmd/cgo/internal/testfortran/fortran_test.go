@@ -5,7 +5,6 @@
 package fortran
 
 import (
-	"fmt"
 	"internal/testenv"
 	"os"
 	"os/exec"
@@ -48,14 +47,19 @@ func TestFortran(t *testing.T) {
 		switch runtime.GOOS {
 		case "darwin":
 			libExt = "dylib"
-		case "aix":
+		case "aix", "openbsd":
 			libExt = "a"
 		}
-		libPath, err := exec.Command(fc, append([]string{"-print-file-name=libgfortran." + libExt}, fcExtra...)...).CombinedOutput()
+		libName := "libgfortran." + libExt
+		b, err := exec.Command(fc, append([]string{"-print-file-name=" + libName}, fcExtra...)...).CombinedOutput()
 		if err != nil {
-			t.Errorf("error invoking %s: %s", fc, err)
+			t.Fatalf("error invoking %s: %s", fc, err)
 		}
-		libDir := filepath.Dir(string(libPath))
+		libPath := strings.TrimSpace(string(b))
+		if libPath == libName {
+			t.Fatalf("Failed to get full library path for %q", libName)
+		}
+		libDir := filepath.Dir(libPath)
 		cgoLDFlags := os.Getenv("CGO_LDFLAGS")
 		cgoLDFlags += " -L " + libDir
 		if runtime.GOOS != "aix" {
@@ -75,11 +79,18 @@ func TestFortran(t *testing.T) {
 
 	// Finally, run the actual test.
 	t.Log("go", "run", "./testdata/testprog")
-	out, err := exec.Command("go", "run", "./testdata/testprog").CombinedOutput()
-	if err == nil && string(out) != "ok\n" {
-		err = fmt.Errorf("expected ok")
+	var stdout, stderr strings.Builder
+	cmd := exec.Command(testenv.GoToolPath(t), "run", "./testdata/testprog")
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	t.Logf("%v", cmd)
+	if stderr.Len() != 0 {
+		t.Logf("stderr:\n%s", stderr.String())
 	}
 	if err != nil {
-		t.Errorf("%s\nOutput:\n%s", err, string(out))
+		t.Errorf("%v\n%s", err, stdout.String())
+	} else if stdout.String() != "ok\n" {
+		t.Errorf("stdout:\n%s\nwant \"ok\"", stdout.String())
 	}
 }

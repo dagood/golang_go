@@ -5,11 +5,11 @@
 package types_test
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
 	"go/ast"
-	"go/parser"
 	"go/token"
 	. "go/types"
 )
@@ -108,7 +108,7 @@ func TestNewMethodSet(t *testing.T) {
 			if got, want := sel.Obj().Name(), m.name; got != want {
 				t.Errorf("%s [method %d]: got name = %q at, want %q", src, i, got, want)
 			}
-			if got, want := sel.Index(), m.index; !sameSlice(got, want) {
+			if got, want := sel.Index(), m.index; !slices.Equal(got, want) {
 				t.Errorf("%s [method %d]: got index = %v, want %v", src, i, got, want)
 			}
 			if got, want := sel.Indirect(), m.indirect; got != want {
@@ -143,10 +143,8 @@ type Instance = *Tree[int]
 `
 
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "foo.go", src, 0)
-	if err != nil {
-		panic(err)
-	}
+	f := mustParse(fset, src)
+
 	pkg := NewPackage("pkg", f.Name.Name)
 	if err := NewChecker(nil, fset, pkg, nil).Files([]*ast.File{f}); err != nil {
 		panic(err)
@@ -164,10 +162,7 @@ func (T) m() {} // expected error: invalid receiver type
 `
 
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "p.go", src, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	f := mustParse(fset, src)
 
 	var conf Config
 	pkg, err := conf.Check("p", fset, []*ast.File{f}, nil)

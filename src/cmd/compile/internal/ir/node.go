@@ -9,7 +9,6 @@ package ir
 import (
 	"fmt"
 	"go/constant"
-	"sort"
 
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/types"
@@ -19,6 +18,9 @@ import (
 // A Node is the abstract interface to an IR node.
 type Node interface {
 	// Formatting
+	// For debugging output, use one of
+	//  Dump/FDump/DumpList/FDumplist (in fmt.go)
+	//  DumpAny/FDumpAny (in dump.go)
 	Format(s fmt.State, verb rune)
 
 	// Source position.
@@ -29,6 +31,7 @@ type Node interface {
 	copy() Node
 
 	doChildren(func(Node) bool) bool
+	doChildrenWithHidden(func(Node) bool) bool
 	editChildren(func(Node) Node)
 	editChildrenWithHidden(func(Node) Node)
 
@@ -152,7 +155,7 @@ const (
 	// OCALLFUNC, OCALLMETH, and OCALLINTER have the same structure.
 	// Prior to walk, they are: X(Args), where Args is all regular arguments.
 	// After walk, if any argument whose evaluation might requires temporary variable,
-	// that temporary variable will be pushed to Init, Args will contains an updated
+	// that temporary variable will be pushed to Init, Args will contain an updated
 	// set of arguments.
 	OCALLFUNC  // X(Args) (function call f(args))
 	OCALLMETH  // X(Args) (direct method call x.Method(args))
@@ -169,7 +172,6 @@ const (
 	OPTRLIT    // &X (X is composite literal)
 	OCONV      // Type(X) (type conversion)
 	OCONVIFACE // Type(X) (type conversion, to interface)
-	OCONVIDATA // Builds a data word to store X in an interface. Equivalent to IDATA(CONVIFACE(X)). Is an ir.ConvExpr.
 	OCONVNOP   // Type(X) (type conversion, no effect)
 	OCOPY      // copy(X, Y)
 	ODCL       // var X (declares X of type X.Type)
@@ -216,7 +218,7 @@ const (
 	ORSH              // X >> Y
 	OAND              // X & Y
 	OANDNOT           // X &^ Y
-	ONEW              // new(X); corresponds to calls to new in source code
+	ONEW              // new(X); corresponds to calls to new(T) in source code
 	ONOT              // !X
 	OBITNOT           // ^X
 	OPLUS             // +X
@@ -224,7 +226,7 @@ const (
 	OOROR             // X || Y
 	OPANIC            // panic(X)
 	OPRINT            // print(List)
-	OPRINTN           // println(List)
+	OPRINTLN          // println(List)
 	OPAREN            // (X)
 	OSEND             // Chan <- Value
 	OSLICE            // X[Low : High] (X is untypechecked or slice)
@@ -235,7 +237,6 @@ const (
 	OSLICEHEADER      // sliceheader{Ptr, Len, Cap} (Ptr is unsafe.Pointer, Len is length, Cap is capacity)
 	OSTRINGHEADER     // stringheader{Ptr, Len} (Ptr is unsafe.Pointer, Len is length)
 	ORECOVER          // recover()
-	ORECOVERFP        // recover(Args) w/ explicit FP argument
 	ORECV             // <-X
 	ORUNESTR          // Type(X) (Type is string, X is rune)
 	OSELRECV2         // like OAS2: Lhs = Rhs where len(Lhs)=2, len(Rhs)=1, Rhs[0].Op = ORECV (appears as .Var of OCASE)
@@ -244,9 +245,6 @@ const (
 	OREAL             // real(X)
 	OIMAG             // imag(X)
 	OCOMPLEX          // complex(X, Y)
-	OALIGNOF          // unsafe.Alignof(X)
-	OOFFSETOF         // unsafe.Offsetof(X)
-	OSIZEOF           // unsafe.Sizeof(X)
 	OUNSAFEADD        // unsafe.Add(X, Y)
 	OUNSAFESLICE      // unsafe.Slice(X, Y)
 	OUNSAFESLICEDATA  // unsafe.SliceData(X)
@@ -286,17 +284,19 @@ const (
 	// for the captured variables, parameters, retvars, & INLMARK op),
 	// Body (body of the inlined function), and ReturnVars (list of
 	// return values)
-	OINLCALL       // intermediary representation of an inlined call.
-	OEFACE         // itable and data words of an empty-interface value.
-	OITAB          // itable word of an interface value.
-	OIDATA         // data word of an interface value in X
-	OSPTR          // base pointer of a slice or string. Bounded==1 means known non-nil.
-	OCFUNC         // reference to c function pointer (not go func value)
-	OCHECKNIL      // emit code to ensure pointer/interface not nil
-	ORESULT        // result of a function call; Xoffset is stack offset
-	OINLMARK       // start of an inlined body, with file/line of caller. Xoffset is an index into the inline tree.
-	OLINKSYMOFFSET // offset within a name
-	OJUMPTABLE     // A jump table structure for implementing dense expression switches
+	OINLCALL         // intermediary representation of an inlined call.
+	OMAKEFACE        // construct an interface value from rtype/itab and data pointers
+	OITAB            // rtype/itab pointer of an interface value
+	OIDATA           // data pointer of an interface value
+	OSPTR            // base pointer of a slice or string. Bounded==1 means known non-nil.
+	OCFUNC           // reference to c function pointer (not go func value)
+	OCHECKNIL        // emit code to ensure pointer/interface not nil
+	ORESULT          // result of a function call; Xoffset is stack offset
+	OINLMARK         // start of an inlined body, with file/line of caller. Xoffset is an index into the inline tree.
+	OLINKSYMOFFSET   // offset within a name
+	OJUMPTABLE       // A jump table structure for implementing dense expression switches
+	OINTERFACESWITCH // A type switch with interface cases
+	OMOVE2HEAP       // Promote a stack-backed slice to heap
 
 	// opcodes for generics
 	ODYNAMICDOTTYPE  // x = i.(T) where T is a type parameter (or derived from a type parameter)
@@ -306,8 +306,7 @@ const (
 	// arch-specific opcodes
 	OTAILCALL    // tail call to another function
 	OGETG        // runtime.getg() (read g pointer)
-	OGETCALLERPC // runtime.getcallerpc() (continuation PC in caller frame)
-	OGETCALLERSP // runtime.getcallersp() (stack pointer in caller frame)
+	OGETCALLERSP // internal/runtime/sys.GetCallerSP() (stack pointer in caller frame)
 
 	OEND
 )
@@ -322,10 +321,17 @@ func (op Op) IsCmp() bool {
 	return false
 }
 
-// Nodes is a pointer to a slice of *Node.
-// For fields that are not used in most nodes, this is used instead of
-// a slice to save space.
+// Nodes is a slice of Node.
 type Nodes []Node
+
+// ToNodes returns s as a slice of Nodes.
+func ToNodes[T Node](s []T) Nodes {
+	res := make(Nodes, len(s))
+	for i, n := range s {
+		res[i] = n
+	}
+	return res
+}
 
 // Append appends entries to Nodes.
 func (n *Nodes) Append(a ...Node) {
@@ -424,16 +430,6 @@ func (s *NameSet) Add(n *Name) {
 	(*s)[n] = struct{}{}
 }
 
-// Sorted returns s sorted according to less.
-func (s NameSet) Sorted(less func(*Name, *Name) bool) []*Name {
-	var res []*Name
-	for n := range s {
-		res = append(res, n)
-	}
-	sort.Slice(res, func(i, j int) bool { return less(res[i], res[j]) })
-	return res
-}
-
 type PragmaFlag uint16
 
 const (
@@ -470,9 +466,7 @@ func IsConst(n Node, ct constant.Kind) bool {
 
 // IsNil reports whether n represents the universal untyped zero value "nil".
 func IsNil(n Node) bool {
-	// Check n.Orig because constant propagation may produce typed nil constants,
-	// which don't exist in the Go spec.
-	return n != nil && Orig(n).Op() == ONIL
+	return n != nil && n.Op() == ONIL
 }
 
 func IsBlank(n Node) bool {
@@ -486,11 +480,6 @@ func IsBlank(n Node) bool {
 // n must be a function or a method.
 func IsMethod(n Node) bool {
 	return n.Type().Recv() != nil
-}
-
-func HasNamedResults(fn *Func) bool {
-	typ := fn.Type()
-	return typ.NumResults() > 0 && types.OrigSym(typ.Result(0).Sym) != nil
 }
 
 // HasUniquePos reports whether n has a unique position that can be

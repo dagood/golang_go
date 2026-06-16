@@ -56,10 +56,9 @@ func TestTestRun(t *testing.T) {
 		"fib.go",
 		"hello.go",
 	} {
-		file := file
 		wantFile := strings.Replace(file, ".go", ".out", 1)
 		t.Run(file, func(t *testing.T) {
-			cmd := exec.Command("go", "run", file)
+			cmd := exec.Command(testenv.GoToolPath(t), "run", file)
 			got, err := cmd.CombinedOutput()
 			if err != nil {
 				t.Fatalf("%v: %s\n%s", cmd, err, got)

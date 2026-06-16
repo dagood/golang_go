@@ -41,11 +41,18 @@ func retpolineR15()
 //go:noescape
 func asmcgocall_no_g(fn, arg unsafe.Pointer)
 
+//go:systemstack
+func asmcgocall_landingpad()
+
 // Used by reflectcall and the reflect package.
 //
 // Spills/loads arguments in registers to/from an internal/abi.RegArgs
 // respectively. Does not follow the Go ABI.
+//
+//go:linknamestd spillArgs
 func spillArgs()
+
+//go:linknamestd unspillArgs
 func unspillArgs()
 
 // getfp returns the frame pointer register of its caller or 0 if not implemented.

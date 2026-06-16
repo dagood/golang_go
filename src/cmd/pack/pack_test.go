@@ -6,6 +6,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"cmd/internal/archive"
 	"fmt"
 	"internal/testenv"
@@ -15,7 +16,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -34,23 +34,8 @@ func TestMain(m *testing.M) {
 
 // packPath returns the path to the "pack" binary to run.
 func packPath(t testing.TB) string {
-	t.Helper()
-	testenv.MustHaveExec(t)
-
-	packPathOnce.Do(func() {
-		packExePath, packPathErr = os.Executable()
-	})
-	if packPathErr != nil {
-		t.Fatal(packPathErr)
-	}
-	return packExePath
+	return testenv.Executable(t)
 }
-
-var (
-	packPathOnce sync.Once
-	packExePath  string
-	packPathErr  error
-)
 
 // testCreate creates an archive in the specified directory.
 func testCreate(t *testing.T, dir string) {
@@ -160,20 +145,7 @@ func TestExtract(t *testing.T) {
 	ar.addFile(goodbyeFile.Reset())
 	ar.a.File().Close()
 	// Now extract one file. We chdir to the directory of the archive for simplicity.
-	pwd, err := os.Getwd()
-	if err != nil {
-		t.Fatal("os.Getwd: ", err)
-	}
-	err = os.Chdir(dir)
-	if err != nil {
-		t.Fatal("os.Chdir: ", err)
-	}
-	defer func() {
-		err := os.Chdir(pwd)
-		if err != nil {
-			t.Fatal("os.Chdir: ", err)
-		}
-	}()
+	t.Chdir(dir)
 	ar = openArchive(name, os.O_RDONLY, []string{goodbyeFile.name})
 	ar.scan(ar.extractContents)
 	ar.a.File().Close()
@@ -192,7 +164,9 @@ func TestExtract(t *testing.T) {
 // Test that pack-created archives can be understood by the tools.
 func TestHello(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
-	testenv.MustInternalLink(t, false)
+	// N.B. the build below explicitly doesn't pass through
+	// -asan/-msan/-race, so we don't care about those.
+	testenv.MustInternalLink(t, testenv.NoSpecialBuildTypes)
 
 	dir := t.TempDir()
 	hello := filepath.Join(dir, "hello.go")
@@ -407,6 +381,49 @@ func TestRWithNonexistentFile(t *testing.T) {
 	goBin := testenv.GoToolPath(t)
 	run(goBin, "tool", "compile", "-p=p", "-o", "p.o", "p.go")
 	run(packPath(t), "r", "p.a", "p.o") // should succeed
+}
+
+func TestOutputPathSanitization(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create pack.a containing a file named "longpathname".
+	// Note that "go tool pack" requires that all files be at least 8 bytes long.
+	const validPathName = "longpathname"
+	if err := os.WriteFile(dir+"/"+validPathName, make([]byte, 8), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	doRun(t, dir, packPath(t), "grc", "pack.a", validPathName)
+
+	// Create evil.a from pack.a, replacing "longpathname" with "out/pathname".
+	b, err := os.ReadFile(dir + "/pack.a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := bytes.Index(b, []byte(validPathName))
+	if idx < 0 {
+		t.Fatalf("%v not found in pack.a", validPathName)
+	}
+	copy(b[idx:], "out/")
+	os.WriteFile(dir+"/evil.a", b, 0o666)
+
+	// Extract evil.a. It should fail and not extract a file to /out.
+	os.Mkdir(dir+"/out", 0o777)
+
+	cmd := testenv.Command(t, packPath(t), "x", "evil.a")
+	cmd.Dir = dir
+	_, err = cmd.CombinedOutput()
+	if err == nil {
+		t.Errorf("pack x evil.a: unexpected success")
+	}
+
+	ents, err := os.ReadDir(dir + "/out")
+	if err != nil {
+		t.Error(err)
+	}
+	for _, e := range ents {
+		t.Errorf("unexpected file in /out: %q", e.Name())
+	}
+
 }
 
 // doRun runs a program in a directory and returns the output.

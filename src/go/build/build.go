@@ -17,6 +17,7 @@ import (
 	"internal/goroot"
 	"internal/goversion"
 	"internal/platform"
+	"internal/syslist"
 	"io"
 	"io/fs"
 	"os"
@@ -24,11 +25,12 @@ import (
 	pathpkg "path"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
+	_ "unsafe" // for linkname
 )
 
 // A Context specifies the supporting context for a build.
@@ -286,6 +288,7 @@ func (ctxt *Context) SrcDirs() []string {
 // if set, or else the compiled code's GOARCH, GOOS, and GOROOT.
 var Default Context = defaultContext()
 
+// Keep consistent with cmd/go/internal/cfg.defaultGOPATH.
 func defaultGOPATH() string {
 	env := "HOME"
 	if runtime.GOOS == "windows" {
@@ -305,7 +308,27 @@ func defaultGOPATH() string {
 	return ""
 }
 
-var defaultToolTags, defaultReleaseTags []string
+// defaultToolTags should be an internal detail,
+// but widely used packages access it using linkname.
+// Notable members of the hall of shame include:
+//   - github.com/gopherjs/gopherjs
+//
+// Do not remove or change the type signature.
+// See go.dev/issue/67401.
+//
+//go:linkname defaultToolTags
+var defaultToolTags []string
+
+// defaultReleaseTags should be an internal detail,
+// but widely used packages access it using linkname.
+// Notable members of the hall of shame include:
+//   - github.com/gopherjs/gopherjs
+//
+// Do not remove or change the type signature.
+// See go.dev/issue/67401.
+//
+//go:linkname defaultReleaseTags
+var defaultReleaseTags []string
 
 func defaultContext() Context {
 	var c Context
@@ -336,7 +359,7 @@ func defaultContext() Context {
 
 	env := os.Getenv("CGO_ENABLED")
 	if env == "" {
-		env = defaultCGO_ENABLED
+		env = buildcfg.DefaultCGO_ENABLED
 	}
 	switch env {
 	case "1":
@@ -495,13 +518,13 @@ func (p *Package) IsCommand() bool {
 	return p.Name == "main"
 }
 
-// ImportDir is like Import but processes the Go package found in
+// ImportDir is like [Import] but processes the Go package found in
 // the named directory.
 func (ctxt *Context) ImportDir(dir string, mode ImportMode) (*Package, error) {
 	return ctxt.Import(".", dir, mode)
 }
 
-// NoGoError is the error used by Import to describe a directory
+// NoGoError is the error used by [Import] to describe a directory
 // containing no buildable Go source files. (It may still contain
 // test files, files hidden by build tags, and so on.)
 type NoGoError struct {
@@ -549,7 +572,7 @@ var installgoroot = godebug.New("installgoroot")
 //   - files with build constraints not satisfied by the context
 //
 // If an error occurs, Import returns a non-nil error and a non-nil
-// *Package containing partial information.
+// *[Package] containing partial information.
 func (ctxt *Context) Import(path string, srcDir string, mode ImportMode) (*Package, error) {
 	p := &Package{
 		ImportPath: path,
@@ -723,7 +746,7 @@ func (ctxt *Context) Import(path string, srcDir string, mode ImportMode) (*Packa
 				}
 				tried.goroot = dir
 			}
-			if ctxt.Compiler == "gccgo" && goroot.IsStandardPackage(ctxt.GOROOT, ctxt.Compiler, path) {
+			if ctxt.Compiler == "gccgo" && goroot.IsStandardPackage(os.ReadDir, ctxt.GOROOT, ctxt.Compiler, path) {
 				// TODO(bcmills): Setting p.Dir here is misleading, because gccgo
 				// doesn't actually load its standard-library packages from this
 				// directory. See if we can leave it unset.
@@ -1029,7 +1052,7 @@ Found:
 	for tag := range allTags {
 		p.AllTags = append(p.AllTags, tag)
 	}
-	sort.Strings(p.AllTags)
+	slices.Sort(p.AllTags)
 
 	p.EmbedPatterns, p.EmbedPatternPos = cleanDecls(embedPos)
 	p.TestEmbedPatterns, p.TestEmbedPatternPos = cleanDecls(testEmbedPos)
@@ -1044,10 +1067,10 @@ Found:
 	// The standard assemblers expect .s files.
 	if len(p.CgoFiles) > 0 {
 		p.SFiles = append(p.SFiles, Sfiles...)
-		sort.Strings(p.SFiles)
+		slices.Sort(p.SFiles)
 	} else {
 		p.IgnoredOtherFiles = append(p.IgnoredOtherFiles, Sfiles...)
-		sort.Strings(p.IgnoredOtherFiles)
+		slices.Sort(p.IgnoredOtherFiles)
 	}
 
 	if badGoError != nil {
@@ -1089,7 +1112,7 @@ func uniq(list []string) []string {
 	}
 	out := make([]string, len(list))
 	copy(out, list)
-	sort.Strings(out)
+	slices.Sort(out)
 	uniq := out[:0]
 	for _, x := range out {
 		if len(uniq) == 0 || uniq[len(uniq)-1] != x {
@@ -1116,7 +1139,7 @@ func (ctxt *Context) importGo(p *Package, path, srcDir string, mode ImportMode) 
 	// we must not being doing special things like AllowBinary or IgnoreVendor,
 	// and all the file system callbacks must be nil (we're meant to use the local file system).
 	if mode&AllowBinary != 0 || mode&IgnoreVendor != 0 ||
-		ctxt.JoinPath != nil || ctxt.SplitPathList != nil || ctxt.IsAbsPath != nil || ctxt.IsDir != nil || ctxt.HasSubdir != nil || ctxt.ReadDir != nil || ctxt.OpenFile != nil || !equal(ctxt.ToolTags, defaultToolTags) || !equal(ctxt.ReleaseTags, defaultReleaseTags) {
+		ctxt.JoinPath != nil || ctxt.SplitPathList != nil || ctxt.IsAbsPath != nil || ctxt.IsDir != nil || ctxt.HasSubdir != nil || ctxt.ReadDir != nil || ctxt.OpenFile != nil || !slices.Equal(ctxt.ToolTags, defaultToolTags) || !slices.Equal(ctxt.ReleaseTags, defaultReleaseTags) || ctxt.UseAllFiles {
 		return errNoModules
 	}
 
@@ -1256,18 +1279,6 @@ func (ctxt *Context) importGo(p *Package, path, srcDir string, mode ImportMode) 
 	return nil
 }
 
-func equal(x, y []string) bool {
-	if len(x) != len(y) {
-		return false
-	}
-	for i, xi := range x {
-		if xi != y[i] {
-			return false
-		}
-	}
-	return true
-}
-
 // hasGoFiles reports whether dir contains any files with names ending in .go.
 // For a vendor check we must exclude directories that contain no .go files.
 // Otherwise it is not possible to vendor just a/b/c and still import the
@@ -1389,7 +1400,7 @@ func parseWord(data []byte) (word, rest []byte) {
 }
 
 // MatchFile reports whether the file with the given name in the given directory
-// matches the context and would be included in a Package created by ImportDir
+// matches the context and would be included in a [Package] created by [ImportDir]
 // of that directory.
 //
 // MatchFile considers the name of the file and may use ctxt.OpenFile to
@@ -1503,7 +1514,7 @@ func cleanDecls(m map[string][]token.Position) ([]string, map[string][]token.Pos
 	for path := range m {
 		all = append(all, path)
 	}
-	sort.Strings(all)
+	slices.Sort(all)
 	return all, m
 }
 
@@ -1604,6 +1615,15 @@ func (ctxt *Context) shouldBuild(content []byte, allTags map[string]bool) (shoul
 	return shouldBuild, sawBinaryOnly, nil
 }
 
+// parseFileHeader should be an internal detail,
+// but widely used packages access it using linkname.
+// Notable members of the hall of shame include:
+//   - github.com/bazelbuild/bazel-gazelle
+//
+// Do not remove or change the type signature.
+// See go.dev/issue/67401.
+//
+//go:linkname parseFileHeader
 func parseFileHeader(content []byte) (trimmed, goBuild []byte, sawBinaryOnly bool, err error) {
 	end := 0
 	p := content
@@ -1676,7 +1696,7 @@ Lines:
 // that affect the way cgo's C code is built.
 func (ctxt *Context) saveCgo(filename string, di *Package, cg *ast.CommentGroup) error {
 	text := cg.Text()
-	for _, line := range strings.Split(text, "\n") {
+	for line := range strings.SplitSeq(text, "\n") {
 		orig := line
 
 		// Line is
@@ -1684,6 +1704,11 @@ func (ctxt *Context) saveCgo(filename string, di *Package, cg *ast.CommentGroup)
 		//
 		line = strings.TrimSpace(line)
 		if len(line) < 5 || line[:4] != "#cgo" || (line[4] != ' ' && line[4] != '\t') {
+			continue
+		}
+
+		// #cgo (nocallback|noescape) <function name>
+		if fields := strings.Fields(line); len(fields) == 3 && (fields[1] == "nocallback" || fields[1] == "noescape") {
 			continue
 		}
 
@@ -1940,7 +1965,7 @@ func (ctxt *Context) matchTag(name string, allTags map[string]bool) bool {
 	if ctxt.GOOS == "ios" && name == "darwin" {
 		return true
 	}
-	if name == "unix" && unixOS[ctxt.GOOS] {
+	if name == "unix" && syslist.UnixOS[ctxt.GOOS] {
 		return true
 	}
 	if name == "boringcrypto" {
@@ -1948,23 +1973,8 @@ func (ctxt *Context) matchTag(name string, allTags map[string]bool) bool {
 	}
 
 	// other tags
-	for _, tag := range ctxt.BuildTags {
-		if tag == name {
-			return true
-		}
-	}
-	for _, tag := range ctxt.ToolTags {
-		if tag == name {
-			return true
-		}
-	}
-	for _, tag := range ctxt.ReleaseTags {
-		if tag == name {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(ctxt.BuildTags, name) || slices.Contains(ctxt.ToolTags, name) ||
+		slices.Contains(ctxt.ReleaseTags, name)
 }
 
 // goodOSArchFile returns false if the name contains a $GOOS or $GOARCH
@@ -2003,14 +2013,14 @@ func (ctxt *Context) goodOSArchFile(name string, allTags map[string]bool) bool {
 		l = l[:n-1]
 	}
 	n := len(l)
-	if n >= 2 && knownOS[l[n-2]] && knownArch[l[n-1]] {
+	if n >= 2 && syslist.KnownOS[l[n-2]] && syslist.KnownArch[l[n-1]] {
 		if allTags != nil {
 			// In case we short-circuit on l[n-1].
 			allTags[l[n-2]] = true
 		}
 		return ctxt.matchTag(l[n-1], allTags) && ctxt.matchTag(l[n-2], allTags)
 	}
-	if n >= 1 && (knownOS[l[n-1]] || knownArch[l[n-1]]) {
+	if n >= 1 && (syslist.KnownOS[l[n-1]] || syslist.KnownArch[l[n-1]]) {
 		return ctxt.matchTag(l[n-1], allTags)
 	}
 	return true

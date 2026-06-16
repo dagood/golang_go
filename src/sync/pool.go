@@ -6,6 +6,7 @@ package sync
 
 import (
 	"internal/race"
+	rtatomic "internal/runtime/atomic"
 	"runtime"
 	"sync/atomic"
 	"unsafe"
@@ -42,10 +43,12 @@ import (
 //
 // A Pool must not be copied after first use.
 //
-// In the terminology of the Go memory model, a call to Put(x) “synchronizes before”
-// a call to Get returning that same value x.
+// In the terminology of [the Go memory model], a call to Put(x) “synchronizes before”
+// a call to [Pool.Get] returning that same value x.
 // Similarly, a call to New returning x “synchronizes before”
 // a call to Get returning that same value x.
+//
+// [the Go memory model]: https://go.dev/ref/mem
 type Pool struct {
 	noCopy noCopy
 
@@ -76,7 +79,9 @@ type poolLocal struct {
 }
 
 // from runtime
-func fastrandn(n uint32) uint32
+//
+//go:linkname runtime_randn runtime.randn
+func runtime_randn(n uint32) uint32
 
 var poolRaceHash [128]uint64
 
@@ -97,7 +102,7 @@ func (p *Pool) Put(x any) {
 		return
 	}
 	if race.Enabled {
-		if fastrandn(4) == 0 {
+		if runtime_randn(4) == 0 {
 			// Randomly drop x on floor.
 			return
 		}
@@ -116,10 +121,10 @@ func (p *Pool) Put(x any) {
 	}
 }
 
-// Get selects an arbitrary item from the Pool, removes it from the
+// Get selects an arbitrary item from the [Pool], removes it from the
 // Pool, and returns it to the caller.
 // Get may choose to ignore the pool and treat it as empty.
-// Callers should not assume any relation between values passed to Put and
+// Callers should not assume any relation between values passed to [Pool.Put] and
 // the values returned by Get.
 //
 // If Get would otherwise return nil and p.New is non-nil, Get returns
@@ -155,8 +160,8 @@ func (p *Pool) Get() any {
 
 func (p *Pool) getSlow(pid int) any {
 	// See the comment in pin regarding ordering of the loads.
-	size := runtime_LoadAcquintptr(&p.localSize) // load-acquire
-	locals := p.local                            // load-consume
+	size := rtatomic.LoadAcquintptr(&p.localSize) // load-acquire
+	locals := p.local                             // load-consume
 	// Try to steal one element from other procs.
 	for i := 0; i < int(size); i++ {
 		l := indexLocal(locals, (pid+i+1)%int(size))
@@ -208,8 +213,8 @@ func (p *Pool) pin() (*poolLocal, int) {
 	// Since we've disabled preemption, GC cannot happen in between.
 	// Thus here we must observe local at least as large localSize.
 	// We can observe a newer/larger local, it is fine (we must observe its zero-initialized-ness).
-	s := runtime_LoadAcquintptr(&p.localSize) // load-acquire
-	l := p.local                              // load-consume
+	s := rtatomic.LoadAcquintptr(&p.localSize) // load-acquire
+	l := p.local                               // load-consume
 	if uintptr(pid) < s {
 		return indexLocal(l, pid), pid
 	}
@@ -236,10 +241,20 @@ func (p *Pool) pinSlow() (*poolLocal, int) {
 	size := runtime.GOMAXPROCS(0)
 	local := make([]poolLocal, size)
 	atomic.StorePointer(&p.local, unsafe.Pointer(&local[0])) // store-release
-	runtime_StoreReluintptr(&p.localSize, uintptr(size))     // store-release
+	rtatomic.StoreReluintptr(&p.localSize, uintptr(size))    // store-release
 	return &local[pid], pid
 }
 
+// poolCleanup should be an internal detail,
+// but widely used packages access it using linkname.
+// Notable members of the hall of shame include:
+//   - github.com/bytedance/gopkg
+//   - github.com/songzhibin97/gkit
+//
+// Do not remove or change the type signature.
+// See go.dev/issue/67401.
+//
+//go:linkname poolCleanup
 func poolCleanup() {
 	// This function is called with the world stopped, at the beginning of a garbage collection.
 	// It must not allocate and probably should not call any runtime functions.
@@ -292,13 +307,3 @@ func indexLocal(l unsafe.Pointer, i int) *poolLocal {
 func runtime_registerPoolCleanup(cleanup func())
 func runtime_procPin() int
 func runtime_procUnpin()
-
-// The below are implemented in runtime/internal/atomic and the
-// compiler also knows to intrinsify the symbol we linkname into this
-// package.
-
-//go:linkname runtime_LoadAcquintptr runtime/internal/atomic.LoadAcquintptr
-func runtime_LoadAcquintptr(ptr *uintptr) uintptr
-
-//go:linkname runtime_StoreReluintptr runtime/internal/atomic.StoreReluintptr
-func runtime_StoreReluintptr(ptr *uintptr, val uintptr) uintptr

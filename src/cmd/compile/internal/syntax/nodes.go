@@ -4,6 +4,8 @@
 
 package syntax
 
+import "fmt"
+
 // ----------------------------------------------------------------------------
 // Nodes
 
@@ -17,6 +19,7 @@ type Node interface {
 	//    associated with that production; usually the left-most one
 	//    ('[' for IndexExpr, 'if' for IfStmt, etc.)
 	Pos() Pos
+	SetPos(Pos)
 	aNode()
 }
 
@@ -26,8 +29,9 @@ type node struct {
 	pos Pos
 }
 
-func (n *node) Pos() Pos { return n.pos }
-func (*node) aNode()     {}
+func (n *node) Pos() Pos       { return n.pos }
+func (n *node) SetPos(pos Pos) { n.pos = pos }
+func (*node) aNode()           {}
 
 // ----------------------------------------------------------------------------
 // Files
@@ -40,6 +44,10 @@ type File struct {
 	EOF       Pos
 	GoVersion string
 	node
+}
+
+func (f *File) String() string {
+	return fmt.Sprintf("File{PkgName:%v, DeclList:%v}", f.PkgName, f.DeclList)
 }
 
 // ----------------------------------------------------------------------------
@@ -110,6 +118,18 @@ type (
 		decl
 	}
 )
+
+func (d *FuncDecl) String() string {
+	return fmt.Sprintf("FuncDecl{Name:%v}", d.Name)
+}
+
+func (d *TypeDecl) String() string {
+	return fmt.Sprintf("TypeDecl{Name:%v}", d.Name)
+}
+
+func (d *VarDecl) String() string {
+	return fmt.Sprintf("FuncDecl{NameList:%v}", d.NameList)
+}
 
 type decl struct{ node }
 
@@ -389,8 +409,9 @@ type (
 	}
 
 	CallStmt struct {
-		Tok  token // Go or Defer
-		Call Expr
+		Tok     token // Go or Defer
+		Call    Expr
+		DeferAt Expr // argument to runtime.deferprocat
 		stmt
 	}
 

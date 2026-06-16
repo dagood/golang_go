@@ -6,20 +6,30 @@
 package tool
 
 import (
+	"cmd/internal/telemetry/counter"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"go/build"
 	"internal/platform"
+	"maps"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
+	"slices"
 	"sort"
 	"strings"
 
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
+	"cmd/go/internal/load"
+	"cmd/go/internal/modindex"
+	"cmd/go/internal/modload"
+	"cmd/go/internal/str"
+	"cmd/go/internal/work"
 )
 
 var CmdTool = &base.Command{
@@ -28,12 +38,34 @@ var CmdTool = &base.Command{
 	Short:     "run specified go tool",
 	Long: `
 Tool runs the go tool command identified by the arguments.
+
+Go ships with a number of builtin tools, and additional tools
+may be defined in the go.mod of the current module. 'go get -tool'
+can be used to define additional tools in the current module's
+go.mod file. See 'go help get' for more information.
+
+The command can be specified using the full package path to the tool declared with
+a tool directive. The default binary name of the tool, which is the last component of
+the package path, excluding the major version suffix, can also be used if it is unique
+among declared tools.
+
 With no arguments it prints the list of known tools.
 
 The -n flag causes tool to print the command that would be
 executed but not execute it.
 
-For more about each tool command, see 'go doc cmd/<command>'.
+The -modfile=file.mod build flag causes tool to use an alternate file
+instead of the go.mod in the module root directory.
+
+Tool also provides the -C, -overlay, and -modcacherw build flags.
+
+The go command places $GOROOT/bin at the beginning of $PATH in the
+environment of commands run via tool directives, so that they use the
+same 'go' as the parent 'go tool'.
+
+For more about build flags, see 'go help build'.
+
+For more about each builtin tool command, see 'go doc cmd/<command>'.
 `,
 }
 
@@ -52,25 +84,18 @@ func isGccgoTool(tool string) bool {
 
 func init() {
 	base.AddChdirFlag(&CmdTool.Flag)
+	base.AddModCommonFlags(&CmdTool.Flag)
 	CmdTool.Flag.BoolVar(&toolN, "n", false, "")
 }
 
 func runTool(ctx context.Context, cmd *base.Command, args []string) {
+	moduleLoader := modload.NewLoader()
 	if len(args) == 0 {
-		listTools()
+		counter.Inc("go/subcommand:tool")
+		listTools(moduleLoader, ctx)
 		return
 	}
 	toolName := args[0]
-	// The tool name must be lower-case letters, numbers or underscores.
-	for _, c := range toolName {
-		switch {
-		case 'a' <= c && c <= 'z', '0' <= c && c <= '9', c == '_':
-		default:
-			fmt.Fprintf(os.Stderr, "go: bad tool name %q\n", toolName)
-			base.SetExitStatus(2)
-			return
-		}
-	}
 
 	toolPath, err := base.ToolPath(toolName)
 	if err != nil {
@@ -82,59 +107,44 @@ func runTool(ctx context.Context, cmd *base.Command, args []string) {
 			//
 			// If the dist tool does not exist, impersonate this command.
 			if impersonateDistList(args[2:]) {
+				// If it becomes necessary, we could increment an additional counter to indicate
+				// that we're impersonating dist list if knowing that becomes important?
+				counter.Inc("go/subcommand:tool-dist")
 				return
 			}
 		}
 
+		// See if tool can be a builtin tool. If so, try to build and run it.
+		// buildAndRunBuiltinTool will fail if the install target of the loaded package is not
+		// the tool directory.
+		if tool := loadBuiltinTool(toolName); tool != "" {
+			// Increment a counter for the tool subcommand with the tool name.
+			counter.Inc("go/subcommand:tool-" + toolName)
+			buildAndRunBuiltinTool(moduleLoader, ctx, toolName, tool, args[1:])
+			return
+		}
+
+		// Try to build and run mod tool.
+		tool := loadModTool(moduleLoader, ctx, toolName)
+		if tool != "" {
+			buildAndRunModtool(moduleLoader, ctx, toolName, tool, args[1:])
+			return
+		}
+
+		counter.Inc("go/subcommand:tool-unknown")
+
 		// Emit the usual error for the missing tool.
 		_ = base.Tool(toolName)
+	} else {
+		// Increment a counter for the tool subcommand with the tool name.
+		counter.Inc("go/subcommand:tool-" + toolName)
 	}
 
-	if toolN {
-		cmd := toolPath
-		if len(args) > 1 {
-			cmd += " " + strings.Join(args[1:], " ")
-		}
-		fmt.Printf("%s\n", cmd)
-		return
-	}
-	args[0] = toolPath // in case the tool wants to re-exec itself, e.g. cmd/dist
-	toolCmd := &exec.Cmd{
-		Path:   toolPath,
-		Args:   args,
-		Stdin:  os.Stdin,
-		Stdout: os.Stdout,
-		Stderr: os.Stderr,
-	}
-	err = toolCmd.Start()
-	if err == nil {
-		c := make(chan os.Signal, 100)
-		signal.Notify(c)
-		go func() {
-			for sig := range c {
-				toolCmd.Process.Signal(sig)
-			}
-		}()
-		err = toolCmd.Wait()
-		signal.Stop(c)
-		close(c)
-	}
-	if err != nil {
-		// Only print about the exit status if the command
-		// didn't even run (not an ExitError) or it didn't exit cleanly
-		// or we're printing command lines too (-x mode).
-		// Assume if command exited cleanly (even with non-zero status)
-		// it printed any messages it wanted to print.
-		if e, ok := err.(*exec.ExitError); !ok || !e.Exited() || cfg.BuildX {
-			fmt.Fprintf(os.Stderr, "go tool %s: %s\n", toolName, err)
-		}
-		base.SetExitStatus(1)
-		return
-	}
+	runBuiltTool(toolName, nil, append([]string{toolPath}, args[1:]...))
 }
 
 // listTools prints a list of the available tools in the tools directory.
-func listTools() {
+func listTools(ld *modload.Loader, ctx context.Context) {
 	f, err := os.Open(build.ToolDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "go: no tool directory: %s\n", err)
@@ -149,8 +159,11 @@ func listTools() {
 		return
 	}
 
+	ambiguous := make(map[string]bool) // names that can't be used as aliases because they are ambiguous
 	sort.Strings(names)
 	for _, name := range names {
+		ambiguous[name] = true
+
 		// Unify presentation by going to lower case.
 		// If it's windows, don't show the .exe suffix.
 		name = strings.TrimSuffix(strings.ToLower(name), cfg.ToolExeSuffix())
@@ -161,6 +174,29 @@ func listTools() {
 			continue
 		}
 		fmt.Println(name)
+	}
+
+	ld.InitWorkfile()
+	modload.LoadModFile(ld, ctx)
+	modTools := slices.Sorted(maps.Keys(ld.MainModules.Tools()))
+	seen := make(map[string]bool) // aliases we've seen already
+	for _, tool := range modTools {
+		alias := defaultExecName(tool)
+		switch {
+		case ambiguous[alias]:
+			continue
+		case seen[alias]:
+			ambiguous[alias] = true
+		default:
+			seen[alias] = true
+		}
+	}
+	for _, tool := range modTools {
+		if alias := defaultExecName(tool); !ambiguous[alias] {
+			fmt.Printf("%s (%s)\n", alias, tool)
+			continue
+		}
+		fmt.Println(tool)
 	}
 }
 
@@ -221,4 +257,184 @@ func impersonateDistList(args []string) (handled bool) {
 
 	os.Stdout.Write(out)
 	return true
+}
+
+func defaultExecName(importPath string) string {
+	var p load.Package
+	p.ImportPath = importPath
+	return p.DefaultExecName()
+}
+
+func loadBuiltinTool(toolName string) string {
+	if !base.ValidToolName(toolName) {
+		return ""
+	}
+	cmdTool := path.Join("cmd", toolName)
+	if !modindex.IsStandardPackage(cfg.GOROOT, cfg.BuildContext.Compiler, cmdTool) {
+		return ""
+	}
+	// Create a fake package and check to see if it would be installed to the tool directory.
+	// If not, it's not a builtin tool.
+	p := &load.Package{PackagePublic: load.PackagePublic{Name: "main", ImportPath: cmdTool, Goroot: true}}
+	if load.InstallTargetDir(p) != load.ToTool {
+		return ""
+	}
+	return cmdTool
+}
+
+func loadModTool(ld *modload.Loader, ctx context.Context, name string) string {
+	ld.InitWorkfile()
+	modload.LoadModFile(ld, ctx)
+
+	matches := []string{}
+	for tool := range ld.MainModules.Tools() {
+		if tool == name || defaultExecName(tool) == name {
+			matches = append(matches, tool)
+		}
+	}
+
+	if len(matches) == 1 {
+		return matches[0]
+	}
+
+	if len(matches) > 1 {
+		message := fmt.Sprintf("tool %q is ambiguous; choose one of:\n\t", name)
+		for _, tool := range matches {
+			message += tool + "\n\t"
+		}
+		base.Fatal(errors.New(message))
+	}
+
+	return ""
+}
+
+func builtTool(runAction *work.Action) string {
+	linkAction := runAction.Deps[0]
+	if toolN {
+		// #72824: If -n is set, use the cached path if we can.
+		// This is only necessary if the binary wasn't cached
+		// before this invocation of the go command: if the binary
+		// was cached, BuiltTarget() will be the cached executable.
+		// It's only in the "first run", where we actually do the build
+		// and save the result to the cache that BuiltTarget is not
+		// the cached binary. Ideally, we would set BuiltTarget
+		// to the cached path even in the first run, but if we
+		// copy the binary to the cached path, and try to run it
+		// in the same process, we'll run into the dreaded #22315
+		// resulting in occasional ETXTBSYs. Instead of getting the
+		// ETXTBSY and then retrying just don't use the cached path
+		// on the first run if we're going to actually run the binary.
+		if cached := linkAction.CachedExecutable(); cached != "" {
+			return cached
+		}
+	}
+	return linkAction.BuiltTarget()
+}
+
+func buildAndRunBuiltinTool(ld *modload.Loader, ctx context.Context, toolName, tool string, args []string) {
+	// Override GOOS and GOARCH for the build to build the tool using
+	// the same GOOS and GOARCH as this go command.
+	cfg.ForceHost()
+
+	// Ignore go.mod and go.work: we don't need them, and we want to be able
+	// to run the tool even if there's an issue with the module or workspace the
+	// user happens to be in.
+	ld.RootMode = modload.NoRoot
+
+	runFunc := func(b *work.Builder, ctx context.Context, a *work.Action) error {
+		cmdline := str.StringList(builtTool(a), a.Args)
+		return runBuiltTool(toolName, nil, cmdline)
+	}
+
+	buildAndRunTool(ld, ctx, tool, args, runFunc)
+}
+
+func buildAndRunModtool(ld *modload.Loader, ctx context.Context, toolName, tool string, args []string) {
+	runFunc := func(b *work.Builder, ctx context.Context, a *work.Action) error {
+		// Use the ExecCmd to run the binary, as go run does. ExecCmd allows users
+		// to provide a runner to run the binary, for example a simulator for binaries
+		// that are cross-compiled to a different platform.
+		cmdline := str.StringList(work.FindExecCmd(), builtTool(a), a.Args)
+		// Use same environment go run uses to start the executable:
+		// the original environment with cfg.GOROOTbin added to the path.
+		env := slices.Clip(cfg.OrigEnv)
+		env = base.AppendPATH(env)
+
+		return runBuiltTool(toolName, env, cmdline)
+	}
+
+	buildAndRunTool(ld, ctx, tool, args, runFunc)
+}
+
+func buildAndRunTool(ld *modload.Loader, ctx context.Context, tool string, args []string, runTool work.ActorFunc) {
+	work.BuildInit(ld)
+	b := work.NewBuilder("", ld.VendorDirOrEmpty)
+	defer func() {
+		if err := b.Close(); err != nil {
+			base.Fatal(err)
+		}
+	}()
+
+	pkgOpts := load.PackageOpts{MainOnly: true}
+	p := load.PackagesAndErrors(ld, ctx, pkgOpts, []string{tool})[0]
+	p.Internal.OmitDebug = true
+	p.Internal.ExeName = p.DefaultExecName()
+
+	a1 := b.LinkAction(ld, work.ModeBuild, work.ModeBuild, p)
+	a1.CacheExecutable = true
+	a := &work.Action{Mode: "go tool", Actor: runTool, Args: args, Deps: []*work.Action{a1}}
+	b.Do(ctx, a)
+}
+
+func runBuiltTool(toolName string, env, cmdline []string) error {
+	if toolN {
+		fmt.Println(strings.Join(cmdline, " "))
+		return nil
+	}
+
+	toolCmd := &exec.Cmd{
+		Path:   cmdline[0],
+		Args:   cmdline,
+		Stdin:  os.Stdin,
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
+		Env:    env,
+	}
+	err := toolCmd.Start()
+	if err == nil {
+		c := make(chan os.Signal, 100)
+		signal.Notify(c, signalsToForward...)
+		go func() {
+			for sig := range c {
+				toolCmd.Process.Signal(sig)
+			}
+		}()
+		err = toolCmd.Wait()
+		signal.Stop(c)
+		close(c)
+	}
+	if err != nil {
+		// Only print about the exit status if the command
+		// didn't even run (not an ExitError) or if it didn't exit cleanly
+		// or we're printing command lines too (-x mode).
+		// Assume if command exited cleanly (even with non-zero status)
+		// it printed any messages it wanted to print.
+		e, ok := err.(*exec.ExitError)
+		if !ok || !e.Exited() || cfg.BuildX {
+			fmt.Fprintf(os.Stderr, "go tool %s: %s\n", toolName, err)
+		}
+		if ok {
+			n := e.ExitCode()
+			if n == -1 {
+				// If the tool was terminated by a signal,
+				// set a non-zero exit status. See go.dev/issue/79540.
+				n = 1
+			}
+			base.SetExitStatus(n)
+		} else {
+			base.SetExitStatus(1)
+		}
+	}
+
+	return nil
 }

@@ -68,13 +68,15 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 		pgrp            _C_int
 		cred            *Credential
 		ngroups, groups uintptr
-		upid            uintptr
+		upid, ppid      uintptr
 	)
 
-	rlim, rlimOK := origRlimitNofile.Load().(Rlimit)
+	rlim := origRlimitNofile.Load()
 
 	// Record parent PID so child can test if it has died.
-	ppid, _, _ := RawSyscall(SYS_GETPID, 0, 0, 0)
+	if sys.Pdeathsig != 0 {
+		ppid, _, _ = RawSyscall(SYS_GETPID, 0, 0, 0)
+	}
 
 	// guard against side effects of shuffling fds below.
 	// Make sure that nextfd is beyond any currently open files so
@@ -300,8 +302,8 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 	}
 
 	// Restore original rlimit.
-	if rlimOK && rlim.Cur != 0 {
-		RawSyscall(SYS_SETRLIMIT, uintptr(RLIMIT_NOFILE), uintptr(unsafe.Pointer(&rlim)), 0)
+	if rlim != nil {
+		RawSyscall(SYS_SETRLIMIT, uintptr(RLIMIT_NOFILE), uintptr(unsafe.Pointer(rlim)), 0)
 	}
 
 	// Time to exec.
@@ -316,4 +318,9 @@ childerror:
 	for {
 		RawSyscall(SYS_EXIT, 253, 0, 0)
 	}
+}
+
+// forkAndExecFailureCleanup cleans up after an exec failure.
+func forkAndExecFailureCleanup(attr *ProcAttr, sys *SysProcAttr) {
+	// Nothing to do.
 }

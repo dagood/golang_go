@@ -31,7 +31,7 @@ import (
 
 const (
 	// Registry key security and access rights.
-	// See https://msdn.microsoft.com/en-us/library/windows/desktop/ms724878.aspx
+	// See https://learn.microsoft.com/en-us/windows/win32/sysinfo/registry-key-security-and-access-rights
 	// for details.
 	ALL_ACCESS         = 0xf003f
 	CREATE_LINK        = 0x00020
@@ -98,7 +98,7 @@ func (k Key) ReadSubKeyNames() ([]string, error) {
 
 	names := make([]string, 0)
 	// Registry key size limit is 255 bytes and described there:
-	// https://msdn.microsoft.com/library/windows/desktop/ms724872.aspx
+	// https://learn.microsoft.com/en-us/windows/win32/sysinfo/registry-element-size-limits
 	buf := make([]uint16, 256) //plus extra room for terminating zero byte
 loopItems:
 	for i := uint32(0); ; i++ {
@@ -132,7 +132,11 @@ loopItems:
 func CreateKey(k Key, path string, access uint32) (newk Key, openedExisting bool, err error) {
 	var h syscall.Handle
 	var d uint32
-	err = regCreateKeyEx(syscall.Handle(k), syscall.StringToUTF16Ptr(path),
+	pathp, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, false, err
+	}
+	err = regCreateKeyEx(syscall.Handle(k), pathp,
 		0, nil, _REG_OPTION_NON_VOLATILE, access, nil, &h, &d)
 	if err != nil {
 		return 0, false, err
@@ -142,7 +146,11 @@ func CreateKey(k Key, path string, access uint32) (newk Key, openedExisting bool
 
 // DeleteKey deletes the subkey path of key k and its values.
 func DeleteKey(k Key, path string) error {
-	return regDeleteKey(syscall.Handle(k), syscall.StringToUTF16Ptr(path))
+	pathp, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	return regDeleteKey(syscall.Handle(k), pathp)
 }
 
 // A KeyInfo describes the statistics of a key. It is returned by Stat.

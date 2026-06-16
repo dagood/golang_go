@@ -5,18 +5,19 @@
 package abi
 
 import (
+	"internal/goarch"
 	"unsafe"
 )
 
 // Type is the runtime representation of a Go type.
 //
-// Type is also referenced implicitly
-// (in the form of expressions involving constants and arch.PtrSize)
-// in cmd/compile/internal/reflectdata/reflect.go
-// and cmd/link/internal/ld/decodesym.go
-// (e.g. data[2*arch.PtrSize+4] references the TFlag field)
-// unsafe.OffsetOf(Type{}.TFlag) cannot be used directly in those
-// places because it varies with cross compilation and experiments.
+// Be careful about accessing this type at build time, as the version
+// of this type in the compiler/linker may not have the same layout
+// as the version in the target binary, due to pointer width
+// differences and any experiments. Use cmd/compile/internal/rttype
+// or the functions in compiletype.go to access this type instead.
+// (TODO: this admonition applies to every type in this package.
+// Put it in some shared location?)
 type Type struct {
 	Size_       uintptr
 	PtrBytes    uintptr // number of (prefix) bytes in the type that can contain pointers
@@ -24,13 +25,21 @@ type Type struct {
 	TFlag       TFlag   // extra type information flags
 	Align_      uint8   // alignment of variable with this type
 	FieldAlign_ uint8   // alignment of struct field with this type
-	Kind_       uint8   // enumeration for C
+	Kind_       Kind    // what kind of type this is (string, int, ...)
 	// function for comparing objects of this type
 	// (ptr to object A, ptr to object B) -> ==?
 	Equal func(unsafe.Pointer, unsafe.Pointer) bool
 	// GCData stores the GC type data for the garbage collector.
-	// If the KindGCProg bit is set in kind, GCData is a GC program.
-	// Otherwise it is a ptrmask bitmap. See mbitmap.go for details.
+	// Normally, GCData points to a bitmask that describes the
+	// ptr/nonptr fields of the type. The bitmask will have at
+	// least PtrBytes/ptrSize bits.
+	// If the TFlagGCMaskOnDemand bit is set, GCData is instead a
+	// **byte and the pointer to the bitmask is one dereference away.
+	// The runtime will build the bitmask if needed.
+	// (See runtime/type.go:getGCMask.)
+	// Note: multiple types may have the same value of GCData,
+	// including when TFlagGCMaskOnDemand is set. The types will, of course,
+	// have the same pointer layout (but not necessarily the same size).
 	GCData    *byte
 	Str       NameOff // string form
 	PtrToThis TypeOff // type for pointer to this type, may be zero
@@ -38,7 +47,7 @@ type Type struct {
 
 // A Kind represents the specific kind of type that a Type represents.
 // The zero Kind is not a valid kind.
-type Kind uint
+type Kind uint8
 
 const (
 	Invalid Kind = iota
@@ -68,13 +77,6 @@ const (
 	String
 	Struct
 	UnsafePointer
-)
-
-const (
-	// TODO (khr, drchase) why aren't these in TFlag?  Investigate, fix if possible.
-	KindDirectIface = 1 << 5
-	KindGCProg      = 1 << 6 // Type.gc points to GC program
-	KindMask        = (1 << 5) - 1
 )
 
 // TFlag is used by a Type to signal what extra type information is
@@ -111,6 +113,22 @@ const (
 	// TFlagRegularMemory means that equal and hash functions can treat
 	// this type as a single region of t.size bytes.
 	TFlagRegularMemory TFlag = 1 << 3
+
+	// TFlagGCMaskOnDemand means that the GC pointer bitmask will be
+	// computed on demand at runtime instead of being precomputed at
+	// compile time. If this flag is set, the GCData field effectively
+	// has type **byte instead of *byte. The runtime will store a
+	// pointer to the GC pointer bitmask in *GCData.
+	TFlagGCMaskOnDemand TFlag = 1 << 4
+
+	// TFlagDirectIface means that a value of this type is stored directly
+	// in the data field of an interface, instead of indirectly.
+	// This flag is just a cached computation of Size_ == PtrBytes == goarch.PtrSize.
+	TFlagDirectIface TFlag = 1 << 5
+
+	// Leaving this breadcrumb behind for dlv. It should not be used, and no
+	// Kind should be big enough to set this bit.
+	KindDirectIface Kind = 1 << 5
 )
 
 // NameOff is the offset to a name from moduledata.types.  See resolveNameOff in runtime.
@@ -160,25 +178,40 @@ var kindNames = []string{
 	UnsafePointer: "unsafe.Pointer",
 }
 
-func (t *Type) Kind() Kind { return Kind(t.Kind_ & KindMask) }
+// TypeOf returns the abi.Type of some value.
+func TypeOf(a any) *Type {
+	eface := *(*EmptyInterface)(unsafe.Pointer(&a))
+	// Types are either static (for compiler-created types) or
+	// heap-allocated but always reachable (for reflection-created
+	// types, held in the central map). So there is no need to
+	// escape types. noescape here help avoid unnecessary escape
+	// of v.
+	return (*Type)(NoEscape(unsafe.Pointer(eface.Type)))
+}
+
+// TypeFor returns the abi.Type for a type parameter.
+func TypeFor[T any]() *Type {
+	return (*PtrType)(unsafe.Pointer(TypeOf((*T)(nil)))).Elem
+}
+
+func (t *Type) Kind() Kind { return t.Kind_ }
 
 func (t *Type) HasName() bool {
 	return t.TFlag&TFlagNamed != 0
 }
 
+// Pointers reports whether t contains pointers.
 func (t *Type) Pointers() bool { return t.PtrBytes != 0 }
 
-// IfaceIndir reports whether t is stored indirectly in an interface value.
-func (t *Type) IfaceIndir() bool {
-	return t.Kind_&KindDirectIface == 0
-}
-
-// isDirectIface reports whether t is stored directly in an interface value.
+// IsDirectIface reports whether t is stored directly in an interface value.
 func (t *Type) IsDirectIface() bool {
-	return t.Kind_&KindDirectIface != 0
+	return t.TFlag&TFlagDirectIface != 0
 }
 
 func (t *Type) GcSlice(begin, end uintptr) []byte {
+	if t.TFlag&TFlagGCMaskOnDemand != 0 {
+		panic("GcSlice can't handle on-demand gcdata types")
+	}
 	return unsafe.Slice(t.GCData, int(end))[begin:]
 }
 
@@ -380,12 +413,36 @@ func (t *Type) MapType() *MapType {
 	return (*MapType)(unsafe.Pointer(t))
 }
 
+// PointerType returns t cast to a *PtrType, or nil if its tag does not match.
+func (t *Type) PointerType() *PtrType {
+	if t.Kind() != Pointer {
+		return nil
+	}
+	return (*PtrType)(unsafe.Pointer(t))
+}
+
+// SliceType returns t cast to a *SliceType, or nil if its tag does not match.
+func (t *Type) SliceType() *SliceType {
+	if t.Kind() != Slice {
+		return nil
+	}
+	return (*SliceType)(unsafe.Pointer(t))
+}
+
 // ArrayType returns t cast to a *ArrayType, or nil if its tag does not match.
 func (t *Type) ArrayType() *ArrayType {
 	if t.Kind() != Array {
 		return nil
 	}
 	return (*ArrayType)(unsafe.Pointer(t))
+}
+
+// ChanType returns t cast to a *ChanType, or nil if its tag does not match.
+func (t *Type) ChanType() *ChanType {
+	if t.Kind() != Chan {
+		return nil
+	}
+	return (*ChanType)(unsafe.Pointer(t))
 }
 
 // FuncType returns t cast to a *FuncType, or nil if its tag does not match.
@@ -437,37 +494,6 @@ func (t *Type) NumMethod() int {
 // NumMethod returns the number of interface methods in the type's method set.
 func (t *InterfaceType) NumMethod() int { return len(t.Methods) }
 
-type MapType struct {
-	Type
-	Key    *Type
-	Elem   *Type
-	Bucket *Type // internal type representing a hash bucket
-	// function for hashing keys (ptr to key, seed) -> hash
-	Hasher     func(unsafe.Pointer, uintptr) uintptr
-	KeySize    uint8  // size of key slot
-	ValueSize  uint8  // size of elem slot
-	BucketSize uint16 // size of bucket
-	Flags      uint32
-}
-
-// Note: flag values must match those used in the TMAP case
-// in ../cmd/compile/internal/reflectdata/reflect.go:writeType.
-func (mt *MapType) IndirectKey() bool { // store ptr to key instead of key itself
-	return mt.Flags&1 != 0
-}
-func (mt *MapType) IndirectElem() bool { // store ptr to elem instead of elem itself
-	return mt.Flags&2 != 0
-}
-func (mt *MapType) ReflexiveKey() bool { // true if k==k for all keys
-	return mt.Flags&4 != 0
-}
-func (mt *MapType) NeedKeyUpdate() bool { // true if we need to update key on an overwrite
-	return mt.Flags&8 != 0
-}
-func (mt *MapType) HashMightPanic() bool { // true if hash function might panic
-	return mt.Flags&16 != 0
-}
-
 func (t *Type) Key() *Type {
 	if t.Kind() == Map {
 		return (*MapType)(unsafe.Pointer(t)).Key
@@ -480,7 +506,7 @@ type SliceType struct {
 	Elem *Type // slice element type
 }
 
-// funcType represents a function type.
+// FuncType represents a function type.
 //
 // A *Type for each in and out parameter is stored in an array that
 // directly follows the funcType (and possibly its uncommonType). So
@@ -654,7 +680,7 @@ func writeVarint(buf []byte, n int) int {
 	}
 }
 
-// Name returns the tag string for n, or empty if there is none.
+// Name returns the name of n, or empty if it does not actually have a name.
 func (n Name) Name() string {
 	if n.Bytes == nil {
 		return ""
@@ -710,3 +736,151 @@ func NewName(n, tag string, exported, embedded bool) Name {
 
 	return Name{Bytes: &b[0]}
 }
+
+// DescriptorSize returns the contiguous size taken in memory by the
+// type descriptor. This is the size of the Type struct,
+// plus other fields used by some type kinds, plus the UncommonType
+// struct if present, plus other optional information.
+// This is just the size of the bytes that appear contiguously in memory.
+// It does not include the size of things like type strings
+// and field names that appear elsewhere.
+//
+// This code must match the data structures build by
+// cmd/compile/internal/reflectdata/reflect.go:writeType.
+func (t *Type) DescriptorSize() int {
+	var baseSize, addSize int
+	switch t.Kind_ {
+	case Array:
+		baseSize, addSize = t.ArrayType().descriptorSizes()
+	case Chan:
+		baseSize, addSize = t.ChanType().descriptorSizes()
+	case Func:
+		baseSize, addSize = t.FuncType().descriptorSizes()
+	case Interface:
+		baseSize, addSize = t.InterfaceType().descriptorSizes()
+	case Map:
+		baseSize, addSize = t.MapType().descriptorSizes()
+	case Pointer:
+		baseSize, addSize = t.PointerType().descriptorSizes()
+	case Slice:
+		baseSize, addSize = t.SliceType().descriptorSizes()
+	case Struct:
+		baseSize, addSize = t.StructType().descriptorSizes()
+	case Bool,
+		Int, Int8, Int16, Int32, Int64,
+		Uint, Uint8, Uint16, Uint32, Uint64, Uintptr,
+		Float32, Float64, Complex64, Complex128,
+		String, UnsafePointer:
+
+		baseSize = int(unsafe.Sizeof(*t))
+		addSize = 0
+
+	default:
+		panic("DescriptorSize: invalid type descriptor")
+	}
+
+	// For clarity, we add the sizes together in the order
+	// they appear in memory.
+
+	ret := baseSize
+
+	mcount := 0
+	ut := t.Uncommon()
+	if ut != nil {
+		ret += int(unsafe.Sizeof(*ut))
+		mcount = int(ut.Mcount)
+	}
+
+	ret += addSize
+
+	ret += mcount * int(unsafe.Sizeof(Method{}))
+
+	return ret
+}
+
+func (at *ArrayType) descriptorSizes() (base, add int) {
+	return int(unsafe.Sizeof(*at)), 0
+}
+
+func (ct *ChanType) descriptorSizes() (base, add int) {
+	return int(unsafe.Sizeof(*ct)), 0
+}
+
+func (ft *FuncType) descriptorSizes() (base, add int) {
+	base = int(unsafe.Sizeof(*ft))
+	add = (ft.NumIn() + ft.NumOut()) * goarch.PtrSize
+	return base, add
+}
+
+func (it *InterfaceType) descriptorSizes() (base, add int) {
+	base = int(unsafe.Sizeof(*it))
+	add = len(it.Methods) * int(unsafe.Sizeof(Imethod{}))
+	return base, add
+}
+
+func (mt *MapType) descriptorSizes() (base, add int) {
+	return int(unsafe.Sizeof(*mt)), 0
+}
+
+func (pt *PtrType) descriptorSizes() (base, add int) {
+	return int(unsafe.Sizeof(*pt)), 0
+}
+
+func (st *SliceType) descriptorSizes() (base, add int) {
+	return int(unsafe.Sizeof(*st)), 0
+}
+
+func (st *StructType) descriptorSizes() (base, add int) {
+	base = int(unsafe.Sizeof(*st))
+	add = len(st.Fields) * int(unsafe.Sizeof(StructField{}))
+	return base, add
+}
+
+const (
+	TraceArgsLimit    = 10 // print no more than 10 args/components
+	TraceArgsMaxDepth = 5  // no more than 5 layers of nesting
+
+	// maxLen is a (conservative) upper bound of the byte stream length. For
+	// each arg/component, it has no more than 2 bytes of data (size, offset),
+	// and no more than one {, }, ... at each level (it cannot have both the
+	// data and ... unless it is the last one, just be conservative). Plus 1
+	// for _endSeq.
+	TraceArgsMaxLen = (TraceArgsMaxDepth*3+2)*TraceArgsLimit + 1
+)
+
+// Populate the data.
+// The data is a stream of bytes, which contains the offsets and sizes of the
+// non-aggregate arguments or non-aggregate fields/elements of aggregate-typed
+// arguments, along with special "operators". Specifically,
+//   - for each non-aggregate arg/field/element, its offset from FP (1 byte) and
+//     size (1 byte)
+//   - special operators:
+//   - 0xff - end of sequence
+//   - 0xfe - print { (at the start of an aggregate-typed argument)
+//   - 0xfd - print } (at the end of an aggregate-typed argument)
+//   - 0xfc - print ... (more args/fields/elements)
+//   - 0xfb - print _ (offset too large)
+const (
+	TraceArgsEndSeq         = 0xff
+	TraceArgsStartAgg       = 0xfe
+	TraceArgsEndAgg         = 0xfd
+	TraceArgsDotdotdot      = 0xfc
+	TraceArgsOffsetTooLarge = 0xfb
+	TraceArgsSpecial        = 0xf0 // above this are operators, below this are ordinary offsets
+)
+
+// MaxPtrmaskBytes is the maximum length of a GC ptrmask bitmap,
+// which holds 1-bit entries describing where pointers are in a given type.
+// Above this length, the runtime computes the GC ptrmask bitmap as needed.
+// The information is used by the runtime to initialize the heap bitmap.
+//
+// There is a bit of overhead to computing the GC ptrmask bitmap
+// the first time. On the other hand building GC ptrmask bitmaps
+// for all types at compile time takes space in the binary for
+// large types that have a lot of pointers, such as large array types.
+// Using 16 means that types that keep their pointers in the first
+// 512 (on 32-bit) or 1024 (on 64-bit) bytes are computed at compile time,
+// and types with more pointers are computed at run time.
+// This tradeoff sounds reasonable, and 16 was the cutoff back when
+// we used GC programs, but this has not been benchmarked.
+const MaxPtrmaskBytes = 16

@@ -14,12 +14,13 @@ package runtime
 import (
 	"internal/abi"
 	"internal/goarch"
+	"internal/runtime/gc"
 	"unsafe"
 )
 
 //go:linkname runtime_debug_WriteHeapDump runtime/debug.WriteHeapDump
 func runtime_debug_WriteHeapDump(fd uintptr) {
-	stopTheWorld(stwWriteHeapDump)
+	stw := stopTheWorld(stwWriteHeapDump)
 
 	// Keep m on this G's stack instead of the system stack.
 	// Both readmemstats_m and writeheapdump_m have pretty large
@@ -36,7 +37,7 @@ func runtime_debug_WriteHeapDump(fd uintptr) {
 		writeheapdump_m(fd, &m)
 	})
 
-	startTheWorld()
+	startTheWorld(stw)
 }
 
 const (
@@ -205,7 +206,7 @@ func dumptype(t *_type) {
 		dwritebyte('.')
 		dwrite(unsafe.Pointer(unsafe.StringData(name)), uintptr(len(name)))
 	}
-	dumpbool(t.Kind_&kindDirectIface == 0 || t.PtrBytes != 0)
+	dumpbool(!t.IsDirectIface() || t.Pointers())
 }
 
 // dump an object.
@@ -398,7 +399,7 @@ func dumpgoroutine(gp *g) {
 		dumpint(uint64(uintptr(unsafe.Pointer(gp))))
 		eface := efaceOf(&p.arg)
 		dumpint(uint64(uintptr(unsafe.Pointer(eface._type))))
-		dumpint(uint64(uintptr(unsafe.Pointer(eface.data))))
+		dumpint(uint64(uintptr(eface.data)))
 		dumpint(0) // was p->defer, no longer recorded
 		dumpint(uint64(uintptr(unsafe.Pointer(p.link))))
 	}
@@ -411,10 +412,18 @@ func dumpgs() {
 	forEachG(func(gp *g) {
 		status := readgstatus(gp) // The world is stopped so gp will not be in a scan state.
 		switch status {
+		case _Grunning:
+			// Dump goroutine if it's _Grunning only during a syscall. This is safe
+			// because the goroutine will just park without mutating its stack, since
+			// the world is stopped.
+			if gp.syscallsp != 0 {
+				dumpgoroutine(gp)
+			}
+			fallthrough
 		default:
 			print("runtime: unexpected G.status ", hex(status), "\n")
 			throw("dumpgs in STW - bad status")
-		case _Gdead:
+		case _Gdead, _Gdeadextra:
 			// ok
 		case _Grunnable,
 			_Gsyscall,
@@ -459,7 +468,7 @@ func dumproots() {
 					continue
 				}
 				spf := (*specialfinalizer)(unsafe.Pointer(sp))
-				p := unsafe.Pointer(s.base() + uintptr(spf.special.offset))
+				p := unsafe.Pointer(s.base() + spf.special.offset)
 				dumpfinalizer(p, spf.fn, spf.fint, spf.ot)
 			}
 		}
@@ -471,7 +480,7 @@ func dumproots() {
 
 // Bit vector of free marks.
 // Needs to be as big as the largest number of objects per span.
-var freemark [_PageSize / 8]bool
+var freemark [gc.MaxObjsPerSpan]bool
 
 func dumpobjs() {
 	// To protect mheap_.allspans.
@@ -483,13 +492,13 @@ func dumpobjs() {
 		}
 		p := s.base()
 		size := s.elemsize
-		n := (s.npages << _PageShift) / size
+		n := (s.npages << gc.PageShift) / size
 		if n > uintptr(len(freemark)) {
 			throw("freemark array doesn't have enough entries")
 		}
 
-		for freeIndex := uintptr(0); freeIndex < s.nelems; freeIndex++ {
-			if s.isFree(freeIndex) {
+		for freeIndex := uint16(0); freeIndex < s.nelems; freeIndex++ {
+			if s.isFree(uintptr(freeIndex)) {
 				freemark[freeIndex] = true
 			}
 		}
@@ -535,11 +544,11 @@ func dumpparams() {
 	dumpint(uint64(arenaEnd))
 	dumpstr(goarch.GOARCH)
 	dumpstr(buildVersion)
-	dumpint(uint64(ncpu))
+	dumpint(uint64(numCPUStartup))
 }
 
 func itab_callback(tab *itab) {
-	t := tab._type
+	t := tab.Type
 	dumptype(t)
 	dumpint(tagItab)
 	dumpint(uint64(uintptr(unsafe.Pointer(tab))))
@@ -658,7 +667,7 @@ func dumpmemprof() {
 				continue
 			}
 			spp := (*specialprofile)(unsafe.Pointer(sp))
-			p := s.base() + uintptr(spp.special.offset)
+			p := s.base() + spp.special.offset
 			dumpint(tagAllocSample)
 			dumpint(uint64(p))
 			dumpint(uint64(uintptr(unsafe.Pointer(spp.b))))
@@ -727,22 +736,19 @@ func makeheapobjbv(p uintptr, size uintptr) bitvector {
 			sysFree(unsafe.Pointer(&tmpbuf[0]), uintptr(len(tmpbuf)), &memstats.other_sys)
 		}
 		n := nptr/8 + 1
-		p := sysAlloc(n, &memstats.other_sys)
+		p := sysAlloc(n, &memstats.other_sys, "heapdump")
 		if p == nil {
 			throw("heapdump: out of memory")
 		}
 		tmpbuf = (*[1 << 30]byte)(p)[:n]
 	}
 	// Convert heap bitmap to pointer bitmap.
-	for i := uintptr(0); i < nptr/8+1; i++ {
-		tmpbuf[i] = 0
-	}
-
-	hbits := heapBitsForAddr(p, size)
+	clear(tmpbuf[:nptr/8+1])
+	s := spanOf(p)
+	tp := s.typePointersOf(p, size)
 	for {
 		var addr uintptr
-		hbits, addr = hbits.next()
-		if addr == 0 {
+		if tp, addr = tp.next(p + size); addr == 0 {
 			break
 		}
 		i := (addr - p) / goarch.PtrSize

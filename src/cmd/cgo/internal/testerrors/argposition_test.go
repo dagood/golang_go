@@ -41,16 +41,16 @@ func (v *Visitor) Visit(node ast.Node) ast.Visitor {
 			var errorMessage strings.Builder
 			for caseIndex, expectedPos := range expectedPositions {
 				actualPosition := v.fset.PositionFor(ident.Pos(), true)
-				errorOccured := false
+				errorOccurred := false
 				if expectedPos.Line != actualPosition.Line {
 					fmt.Fprintf(&errorMessage, "wrong line number for ident %s: expected: %d got: %d\n", ident.Name, expectedPos.Line, actualPosition.Line)
-					errorOccured = true
+					errorOccurred = true
 				}
 				if expectedPos.Column != actualPosition.Column {
 					fmt.Fprintf(&errorMessage, "wrong column number for ident %s: expected: %d got: %d\n", ident.Name, expectedPos.Column, actualPosition.Column)
-					errorOccured = true
+					errorOccurred = true
 				}
-				if errorOccured {
+				if errorOccurred {
 					continue
 				}
 				gotMatch = true
@@ -58,7 +58,7 @@ func (v *Visitor) Visit(node ast.Node) ast.Visitor {
 			}
 
 			if !gotMatch {
-				v.t.Errorf(errorMessage.String())
+				v.t.Error(errorMessage.String())
 			}
 		}
 	}
@@ -81,7 +81,7 @@ func TestArgumentsPositions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command("go", "tool", "cgo",
+	cmd := exec.Command(testenv.GoToolPath(t), "tool", "cgo",
 		"-srcdir", testdata,
 		"-objdir", dir,
 		"issue42580.go")
@@ -96,7 +96,7 @@ func TestArgumentsPositions(t *testing.T) {
 		t.Fatal(err)
 	}
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "", mainProcessed, parser.AllErrors)
+	f, err := parser.ParseFile(fset, "", mainProcessed, parser.AllErrors|parser.SkipObjectResolution)
 	if err != nil {
 		fmt.Println(err)
 		return

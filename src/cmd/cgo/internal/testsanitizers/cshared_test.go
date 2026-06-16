@@ -11,6 +11,7 @@ import (
 	"internal/platform"
 	"internal/testenv"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -53,7 +54,6 @@ func TestShared(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		name := strings.TrimSuffix(tc.src, ".go")
 		//The memory sanitizer tests require support for the -msan option.
 		if tc.sanitizer == "memory" && !platform.MSanSupported(GOOS, GOARCH) {
@@ -82,7 +82,7 @@ func TestShared(t *testing.T) {
 			}
 
 			dstBin := dir.Join(name)
-			cmd, err := cc(config.cFlags...)
+			cmd, err := cc(t.Context(), config.cFlags...)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -90,7 +90,23 @@ func TestShared(t *testing.T) {
 			cmd.Args = append(cmd.Args, "-o", dstBin, cSrc, lib)
 			mustRun(t, cmd)
 
-			cmd = hangProneCmd(dstBin)
+			cmdArgs := []string{dstBin}
+			if tc.sanitizer == "thread" && GOOS == "linux" {
+				// Disable ASLR for TSAN. See https://go.dev/issue/59418.
+				out, err := exec.Command("uname", "-m").Output()
+				if err != nil {
+					t.Fatalf("failed to run `uname -m`: %v", err)
+				}
+				arch := strings.TrimSpace(string(out))
+				if _, err := exec.Command("setarch", arch, "-R", "true").Output(); err != nil {
+					// Some systems don't have permission to run `setarch`.
+					// See https://go.dev/issue/70463.
+					t.Logf("failed to run `setarch %s -R true`: %v", arch, err)
+				} else {
+					cmdArgs = []string{"setarch", arch, "-R", dstBin}
+				}
+			}
+			cmd = hangProneCmd(cmdArgs[0], cmdArgs[1:]...)
 			replaceEnv(cmd, "LD_LIBRARY_PATH", ".")
 			mustRun(t, cmd)
 		})

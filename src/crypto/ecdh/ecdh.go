@@ -9,18 +9,18 @@ package ecdh
 import (
 	"crypto"
 	"crypto/internal/boring"
+	"crypto/internal/fips140/ecdh"
 	"crypto/subtle"
 	"errors"
 	"io"
-	"sync"
 )
 
 type Curve interface {
 	// GenerateKey generates a random PrivateKey.
 	//
-	// Most applications should use [crypto/rand.Reader] as rand. Note that the
-	// returned key does not depend deterministically on the bytes read from rand,
-	// and may change between calls and/or between versions.
+	// Since Go 1.26, a secure source of random bytes is always used, and rand
+	// is ignored unless GODEBUG=cryptocustomrand=1 is set. This setting will be
+	// removed in a future Go release. Instead, use [testing/cryptotest.SetGlobalRandom].
 	GenerateKey(rand io.Reader) (*PrivateKey, error)
 
 	// NewPrivateKey checks that key is valid and returns a PrivateKey.
@@ -44,20 +44,12 @@ type Curve interface {
 	// selected public keys can cause ECDH to return an error.
 	NewPublicKey(key []byte) (*PublicKey, error)
 
-	// ecdh performs a ECDH exchange and returns the shared secret. It's exposed
+	// ecdh performs an ECDH exchange and returns the shared secret. It's exposed
 	// as the PrivateKey.ECDH method.
 	//
 	// The private method also allow us to expand the ECDH interface with more
 	// methods in the future without breaking backwards compatibility.
 	ecdh(local *PrivateKey, remote *PublicKey) ([]byte, error)
-
-	// privateKeyToPublicKey converts a PrivateKey to a PublicKey. It's exposed
-	// as the PrivateKey.PublicKey method.
-	//
-	// This method always succeeds: for X25519, the zero key can't be
-	// constructed due to clamping; for NIST curves, it is rejected by
-	// NewPrivateKey.
-	privateKeyToPublicKey(*PrivateKey) *PublicKey
 }
 
 // PublicKey is an ECDH public key, usually a peer's ECDH share sent over the wire.
@@ -69,6 +61,7 @@ type PublicKey struct {
 	curve     Curve
 	publicKey []byte
 	boring    *boring.PublicKeyECDH
+	fips      *ecdh.PublicKey
 }
 
 // Bytes returns a copy of the encoding of the public key.
@@ -99,6 +92,18 @@ func (k *PublicKey) Curve() Curve {
 	return k.curve
 }
 
+// KeyExchanger is an interface for an opaque private key that can be used for
+// key exchange operations. For example, an ECDH key kept in a hardware module.
+//
+// It is implemented by [PrivateKey].
+type KeyExchanger interface {
+	PublicKey() *PublicKey
+	Curve() Curve
+	ECDH(*PublicKey) ([]byte, error)
+}
+
+var _ KeyExchanger = (*PrivateKey)(nil)
+
 // PrivateKey is an ECDH private key, usually kept secret.
 //
 // These keys can be parsed with [crypto/x509.ParsePKCS8PrivateKey] and encoded
@@ -107,21 +112,21 @@ func (k *PublicKey) Curve() Curve {
 type PrivateKey struct {
 	curve      Curve
 	privateKey []byte
+	publicKey  *PublicKey
 	boring     *boring.PrivateKeyECDH
-	// publicKey is set under publicKeyOnce, to allow loading private keys with
-	// NewPrivateKey without having to perform a scalar multiplication.
-	publicKey     *PublicKey
-	publicKeyOnce sync.Once
+	fips       *ecdh.PrivateKey
 }
 
-// ECDH performs a ECDH exchange and returns the shared secret. The PrivateKey
-// and PublicKey must use the same curve.
+// ECDH performs an ECDH exchange and returns the shared secret. The [PrivateKey]
+// and [PublicKey] must use the same curve.
 //
 // For NIST curves, this performs ECDH as specified in SEC 1, Version 2.0,
 // Section 3.3.1, and returns the x-coordinate encoded according to SEC 1,
 // Version 2.0, Section 2.3.5. The result is never the point at infinity.
+// This is also known as the Shared Secret Computation of the Ephemeral Unified
+// Model scheme specified in NIST SP 800-56A Rev. 3, Section 6.1.2.2.
 //
-// For X25519, this performs ECDH as specified in RFC 7748, Section 6.1. If
+// For [X25519], this performs ECDH as specified in RFC 7748, Section 6.1. If
 // the result is the all-zero value, ECDH returns an error.
 func (k *PrivateKey) ECDH(remote *PublicKey) ([]byte, error) {
 	if k.curve != remote.curve {
@@ -141,7 +146,7 @@ func (k *PrivateKey) Bytes() []byte {
 // Equal returns whether x represents the same private key as k.
 //
 // Note that there can be equivalent private keys with different encodings which
-// would return false from this check but behave the same way as inputs to ECDH.
+// would return false from this check but behave the same way as inputs to [ECDH].
 //
 // This check is performed in constant time as long as the key types and their
 // curve match.
@@ -159,30 +164,11 @@ func (k *PrivateKey) Curve() Curve {
 }
 
 func (k *PrivateKey) PublicKey() *PublicKey {
-	k.publicKeyOnce.Do(func() {
-		if k.boring != nil {
-			// Because we already checked in NewPrivateKey that the key is valid,
-			// there should not be any possible errors from BoringCrypto,
-			// so we turn the error into a panic.
-			// (We can't return it anyhow.)
-			kpub, err := k.boring.PublicKey()
-			if err != nil {
-				panic("boringcrypto: " + err.Error())
-			}
-			k.publicKey = &PublicKey{
-				curve:     k.curve,
-				publicKey: kpub.Bytes(),
-				boring:    kpub,
-			}
-		} else {
-			k.publicKey = k.curve.privateKeyToPublicKey(k)
-		}
-	})
 	return k.publicKey
 }
 
 // Public implements the implicit interface of all standard library private
-// keys. See the docs of crypto.PrivateKey.
+// keys. See the docs of [crypto.PrivateKey].
 func (k *PrivateKey) Public() crypto.PublicKey {
 	return k.PublicKey()
 }

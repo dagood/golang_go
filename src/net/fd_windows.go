@@ -23,6 +23,10 @@ const (
 	writeMsgSyscallName = "wsasendmsg"
 )
 
+func init() {
+	poll.InitWSA()
+}
+
 // canUseConnectEx reports whether we can use the ConnectEx Windows API call
 // for the given network type.
 func canUseConnectEx(net string) bool {
@@ -34,8 +38,8 @@ func canUseConnectEx(net string) bool {
 	return false
 }
 
-func newFD(sysfd syscall.Handle, family, sotype int, net string) (*netFD, error) {
-	ret := &netFD{
+func newFD(sysfd syscall.Handle, family, sotype int, net string) *netFD {
+	return &netFD{
 		pfd: poll.FD{
 			Sysfd:         sysfd,
 			IsStream:      sotype == syscall.SOCK_STREAM,
@@ -45,15 +49,34 @@ func newFD(sysfd syscall.Handle, family, sotype int, net string) (*netFD, error)
 		sotype: sotype,
 		net:    net,
 	}
-	return ret, nil
 }
 
 func (fd *netFD) init() error {
-	errcall, err := fd.pfd.Init(fd.net, true)
-	if errcall != "" {
-		err = wrapSyscallError(errcall, err)
+	if err := fd.pfd.Init(fd.net, true); err != nil {
+		return err
 	}
-	return err
+	switch fd.net {
+	case "udp", "udp4", "udp6":
+		// Disable reporting of PORT_UNREACHABLE errors.
+		// See https://go.dev/issue/5834.
+		ret := uint32(0)
+		flag := uint32(0)
+		size := uint32(unsafe.Sizeof(flag))
+		err := syscall.WSAIoctl(fd.pfd.Sysfd, syscall.SIO_UDP_CONNRESET, (*byte)(unsafe.Pointer(&flag)), size, nil, 0, &ret, nil, 0)
+		if err != nil {
+			return wrapSyscallError("wsaioctl", err)
+		}
+		// Disable reporting of NET_UNREACHABLE errors.
+		// See https://go.dev/issue/68614.
+		ret = 0
+		flag = 0
+		size = uint32(unsafe.Sizeof(flag))
+		err = syscall.WSAIoctl(fd.pfd.Sysfd, windows.SIO_UDP_NETRESET, (*byte)(unsafe.Pointer(&flag)), size, nil, 0, &ret, nil, 0)
+		if err != nil {
+			return wrapSyscallError("wsaioctl", err)
+		}
+	}
+	return nil
 }
 
 // Always returns nil for connected peer address result.
@@ -64,10 +87,38 @@ func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (syscall.
 	if err := fd.init(); err != nil {
 		return nil, err
 	}
-	if deadline, ok := ctx.Deadline(); ok && !deadline.IsZero() {
-		fd.pfd.SetWriteDeadline(deadline)
+
+	if ctx.Done() != nil {
+		// Propagate the Context's deadline and cancellation.
+		// If the context is already done, or if it has a nonzero deadline,
+		// ensure that that is applied before the call to ConnectEx begins
+		// so that we don't return spurious connections.
 		defer fd.pfd.SetWriteDeadline(noDeadline)
+
+		if ctx.Err() != nil {
+			fd.pfd.SetWriteDeadline(aLongTimeAgo)
+		} else {
+			if deadline, ok := ctx.Deadline(); ok && !deadline.IsZero() {
+				fd.pfd.SetWriteDeadline(deadline)
+			}
+
+			done := make(chan struct{})
+			stop := context.AfterFunc(ctx, func() {
+				// Force the runtime's poller to immediately give
+				// up waiting for writability.
+				fd.pfd.SetWriteDeadline(aLongTimeAgo)
+				close(done)
+			})
+			defer func() {
+				if !stop() {
+					// Wait for the call to SetWriteDeadline to complete so that we can
+					// reset the deadline if everything else succeeded.
+					<-done
+				}
+			}()
+		}
 	}
+
 	if !canUseConnectEx(fd.net) {
 		err := connectFunc(fd.pfd.Sysfd, ra)
 		return nil, os.NewSyscallError("connect", err)
@@ -103,7 +154,7 @@ func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (syscall.
 			Rtt:                   windows.TCP_INITIAL_RTO_UNSPECIFIED_RTT, // use the default or overridden by the Administrator
 			MaxSynRetransmissions: 1,                                       // minimum possible value before Windows 10.0.16299
 		}
-		if windows.Support_TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS() {
+		if windows.SupportTCPInitialRTONoSYNRetransmissions() {
 			// In Windows 10.0.16299 TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS makes ConnectEx() fails instantly.
 			params.MaxSynRetransmissions = windows.TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS
 		}
@@ -112,22 +163,6 @@ func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (syscall.
 		// If it fails reliably, we expect TestDialClosedPortFailFast to detect it.
 		_ = fd.pfd.WSAIoctl(windows.SIO_TCP_INITIAL_RTO, (*byte)(unsafe.Pointer(&params)), uint32(unsafe.Sizeof(params)), nil, 0, &out, nil, 0)
 	}
-
-	// Wait for the goroutine converting context.Done into a write timeout
-	// to exist, otherwise our caller might cancel the context and
-	// cause fd.setWriteDeadline(aLongTimeAgo) to cancel a successful dial.
-	done := make(chan bool) // must be unbuffered
-	defer func() { done <- true }()
-	go func() {
-		select {
-		case <-ctx.Done():
-			// Force the runtime's poller to immediately give
-			// up waiting for writability.
-			fd.pfd.SetWriteDeadline(aLongTimeAgo)
-			<-done
-		case <-done:
-		}
-	}()
 
 	// Call ConnectEx API.
 	if err := fd.pfd.ConnectEx(ra); err != nil {
@@ -175,13 +210,9 @@ func (fd *netFD) accept() (*netFD, error) {
 	}
 
 	// Associate our new socket with IOCP.
-	netfd, err := newFD(s, fd.family, fd.sotype, fd.net)
-	if err != nil {
-		poll.CloseFunc(s)
-		return nil, err
-	}
+	netfd := newFD(s, fd.family, fd.sotype, fd.net)
 	if err := netfd.init(); err != nil {
-		fd.Close()
+		netfd.Close()
 		return nil, err
 	}
 
@@ -197,9 +228,29 @@ func (fd *netFD) accept() (*netFD, error) {
 	return netfd, nil
 }
 
-// Unimplemented functions.
+// Defined in os package.
+func newWindowsFile(h syscall.Handle, name string) *os.File
 
 func (fd *netFD) dup() (*os.File, error) {
-	// TODO: Implement this
-	return nil, syscall.EWINDOWS
+	// Disassociate the IOCP from the socket,
+	// it is not safe to share a duplicated handle
+	// that is associated with IOCP.
+	if err := fd.pfd.DisassociateIOCP(); err != nil {
+		return nil, err
+	}
+	var h syscall.Handle
+	var syserr error
+	err := fd.pfd.RawControl(func(fd uintptr) {
+		h, syserr = dupSocket(syscall.Handle(fd))
+	})
+	if err == nil {
+		err = syserr
+	}
+	if err != nil {
+		return nil, err
+	}
+	// All WSASocket calls must be match with a syscall.Closesocket call,
+	// but os.NewFile calls syscall.CloseHandle instead. We need to use
+	// a hidden function so that the returned file is aware of this fact.
+	return newWindowsFile(h, fd.name()), nil
 }

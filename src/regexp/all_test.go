@@ -5,8 +5,10 @@
 package regexp
 
 import (
+	"bytes"
 	"reflect"
 	"regexp/syntax"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -78,6 +80,9 @@ func TestBadCompile(t *testing.T) {
 }
 
 func matchTest(t *testing.T, test *FindTest) {
+	if test.max == 0 {
+		return
+	}
 	re := compileTest(t, test.pat, "")
 	if re == nil {
 		return
@@ -519,13 +524,13 @@ func TestSplit(t *testing.T) {
 		}
 
 		split := re.Split(test.s, test.n)
-		if !reflect.DeepEqual(split, test.out) {
+		if !slices.Equal(split, test.out) {
 			t.Errorf("#%d: %q: got %q; want %q", i, test.r, split, test.out)
 		}
 
 		if QuoteMeta(test.r) == test.r {
 			strsplit := strings.SplitN(test.s, test.r, test.n)
-			if !reflect.DeepEqual(split, strsplit) {
+			if !slices.Equal(split, strsplit) {
 				t.Errorf("#%d: Split(%q, %q, %d): regexp vs strings mismatch\nregexp=%q\nstrings=%q", i, test.s, test.r, test.n, split, strsplit)
 			}
 		}
@@ -608,6 +613,19 @@ func BenchmarkFindAllNoMatches(b *testing.B) {
 		all := re.FindAll(s, -1)
 		if all != nil {
 			b.Fatalf("FindAll(%q) = %q; want nil", s, all)
+		}
+	}
+}
+
+func BenchmarkFindAllTenMatches(b *testing.B) {
+	re := MustCompile("a+b+")
+	s := bytes.Repeat([]byte("acddeeabbax"), 10)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		all := re.FindAll(s, -1)
+		if len(all) != 10 {
+			b.Fatalf("FindAll(%q) = %q; want 10 matches", s, all)
 		}
 	}
 }
@@ -958,6 +976,21 @@ func TestUnmarshalText(t *testing.T) {
 			continue
 		}
 		if err := unmarshaled.UnmarshalText(marshaled); err != nil {
+			t.Errorf("regexp %#q failed to unmarshal: %s", re, err)
+			continue
+		}
+		if unmarshaled.String() != goodRe[i] {
+			t.Errorf("UnmarshalText returned unexpected value: %s", unmarshaled.String())
+		}
+
+		buf := make([]byte, 4, 32)
+		marshalAppend, err := re.AppendText(buf)
+		if err != nil {
+			t.Errorf("regexp %#q failed to marshal: %s", re, err)
+			continue
+		}
+		marshalAppend = marshalAppend[4:]
+		if err := unmarshaled.UnmarshalText(marshalAppend); err != nil {
 			t.Errorf("regexp %#q failed to unmarshal: %s", re, err)
 			continue
 		}

@@ -34,16 +34,20 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
-	"go/importer"
+	"go/build"
+	"go/build/constraint"
 	"go/parser"
 	"go/scanner"
 	"go/token"
+	"internal/buildcfg"
 	"internal/testenv"
 	"internal/types/errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -124,8 +128,9 @@ func parseFlags(src []byte, flags *flag.FlagSet) error {
 // compares the resulting errors with the ERROR annotations in the source.
 //
 // The srcs slice contains the file content for the files named in the
-// filenames slice. The manual parameter specifies whether this is a 'manual'
-// test.
+// filenames slice. The colDelta parameter specifies the tolerance for position
+// mismatch when comparing errors. The manual parameter specifies whether this
+// is a 'manual' test.
 //
 // If provided, opts may be used to mutate the Config before type-checking.
 func testFiles(t *testing.T, filenames []string, srcs [][]byte, manual bool, opts ...func(*Config)) {
@@ -133,21 +138,12 @@ func testFiles(t *testing.T, filenames []string, srcs [][]byte, manual bool, opt
 		t.Fatal("no source files")
 	}
 
-	var conf Config
-	flags := flag.NewFlagSet("", flag.PanicOnError)
-	flags.StringVar(&conf.GoVersion, "lang", "", "")
-	flags.BoolVar(&conf.FakeImportC, "fakeImportC", false, "")
-	if err := parseFlags(srcs[0], flags); err != nil {
-		t.Fatal(err)
-	}
-
-	files, errlist := parseFiles(t, filenames, srcs, parser.AllErrors)
-
+	// parse files
+	files, errlist := parseFiles(t, filenames, srcs, parser.AllErrors|parser.SkipObjectResolution)
 	pkgName := "<no package>"
 	if len(files) > 0 {
 		pkgName = files[0].Name.Name
 	}
-
 	listErrors := manual && !*verifyErrors
 	if listErrors && len(errlist) > 0 {
 		t.Errorf("--- %s:", pkgName)
@@ -156,9 +152,10 @@ func testFiles(t *testing.T, filenames []string, srcs [][]byte, manual bool, opt
 		}
 	}
 
-	// typecheck and collect typechecker errors
+	// set up typechecker
+	var conf Config
 	*boolFieldAddr(&conf, "_Trace") = manual && testing.Verbose()
-	conf.Importer = importer.Default()
+	conf.Importer = defaultImporter(fset)
 	conf.Error = func(err error) {
 		if *haltOnError {
 			defer panic(err)
@@ -174,22 +171,40 @@ func testFiles(t *testing.T, filenames []string, srcs [][]byte, manual bool, opt
 		}
 	}
 
+	// apply custom configuration
 	for _, opt := range opts {
 		opt(&conf)
 	}
 
+	// apply flag setting (overrides custom configuration)
+	var goexperiment string
+	flags := flag.NewFlagSet("", flag.PanicOnError)
+	flags.StringVar(&conf.GoVersion, "lang", "", "")
+	flags.StringVar(&goexperiment, "goexperiment", "", "")
+	flags.BoolVar(&conf.FakeImportC, "fakeImportC", false, "")
+	if err := parseFlags(srcs[0], flags); err != nil {
+		t.Fatal(err)
+	}
+
+	if goexperiment != "" {
+		revert := setGOEXPERIMENT(goexperiment)
+		defer revert()
+	}
+
 	// Provide Config.Info with all maps so that info recording is tested.
 	info := Info{
-		Types:      make(map[ast.Expr]TypeAndValue),
-		Instances:  make(map[*ast.Ident]Instance),
-		Defs:       make(map[*ast.Ident]Object),
-		Uses:       make(map[*ast.Ident]Object),
-		Implicits:  make(map[ast.Node]Object),
-		Selections: make(map[*ast.SelectorExpr]*Selection),
-		Scopes:     make(map[ast.Node]*Scope),
+		Types:        make(map[ast.Expr]TypeAndValue),
+		Instances:    make(map[*ast.Ident]Instance),
+		Defs:         make(map[*ast.Ident]Object),
+		Uses:         make(map[*ast.Ident]Object),
+		Implicits:    make(map[ast.Node]Object),
+		Selections:   make(map[*ast.SelectorExpr]*Selection),
+		Scopes:       make(map[ast.Node]*Scope),
+		FileVersions: make(map[*ast.File]string),
 	}
-	conf.Check(pkgName, fset, files, &info)
 
+	// typecheck
+	conf.Check(pkgName, fset, files, &info)
 	if listErrors {
 		return
 	}
@@ -227,17 +242,17 @@ func testFiles(t *testing.T, filenames []string, srcs [][]byte, manual bool, opt
 					panic("unreachable")
 				}
 			}
-			pattern, err := strconv.Unquote(strings.TrimSpace(pattern))
+			unquoted, err := strconv.Unquote(strings.TrimSpace(pattern))
 			if err != nil {
-				t.Errorf("%s:%d:%d: %v", filename, line, want.col, err)
+				t.Errorf("%s:%d:%d: invalid ERROR pattern (cannot unquote %s)", filename, line, want.col, pattern)
 				continue
 			}
 			if substr {
-				if !strings.Contains(gotMsg, pattern) {
+				if !strings.Contains(gotMsg, unquoted) {
 					continue
 				}
 			} else {
-				rx, err := regexp.Compile(pattern)
+				rx, err := regexp.Compile(unquoted)
 				if err != nil {
 					t.Errorf("%s:%d:%d: %v", filename, line, want.col, err)
 					continue
@@ -315,6 +330,20 @@ func boolFieldAddr(conf *Config, name string) *bool {
 func stringFieldAddr(conf *Config, name string) *string {
 	v := reflect.Indirect(reflect.ValueOf(conf))
 	return (*string)(v.FieldByName(name).Addr().UnsafePointer())
+}
+
+// setGOEXPERIMENT overwrites the existing buildcfg.Experiment with a new one
+// based on the provided goexperiment string. Calling the result function
+// (typically via defer), reverts buildcfg.Experiment to the prior value.
+// For testing use, only.
+func setGOEXPERIMENT(goexperiment string) func() {
+	exp, err := buildcfg.ParseGOEXPERIMENT(runtime.GOOS, runtime.GOARCH, goexperiment)
+	if err != nil {
+		panic(err)
+	}
+	old := buildcfg.Experiment
+	buildcfg.Experiment = *exp
+	return func() { buildcfg.Experiment = old }
 }
 
 // TestManual is for manual testing of a package - either provided
@@ -435,13 +464,42 @@ func testDir(t *testing.T, dir string, manual bool) {
 }
 
 func testPkg(t *testing.T, filenames []string, manual bool) {
-	srcs := make([][]byte, len(filenames))
-	for i, filename := range filenames {
+	fs := filenames[:0]
+	srcs := make([][]byte, 0, len(filenames))
+	for _, filename := range filenames {
 		src, err := os.ReadFile(filename)
 		if err != nil {
 			t.Fatalf("could not read %s: %v", filename, err)
 		}
-		srcs[i] = src
+		if !shouldTest(src) {
+			continue
+		}
+		fs = append(fs, filename)
+		srcs = append(srcs, src)
 	}
-	testFiles(t, filenames, srcs, manual)
+	if len(fs) == 0 {
+		t.Skip("all files skipped by build tags")
+	}
+	testFiles(t, fs, srcs, manual)
+}
+
+// shouldTest checks build tags in src and returns whether the file
+// should be tested according to the tags.
+func shouldTest(src []byte) bool {
+	match := func(tag string) bool {
+		// We only care GOOS, GOARCH, and go version tags.
+		if slices.Contains(build.Default.ReleaseTags, tag) {
+			return true
+		}
+		return tag == runtime.GOOS || tag == runtime.GOARCH
+	}
+	for line := range strings.SplitSeq(string(src), "\n") {
+		if strings.HasPrefix(line, "package ") {
+			break
+		}
+		if expr, err := constraint.Parse(line); err == nil {
+			return expr.Eval(match)
+		}
+	}
+	return true
 }

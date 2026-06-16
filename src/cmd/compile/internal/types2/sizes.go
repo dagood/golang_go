@@ -54,7 +54,7 @@ func (s *StdSizes) Alignof(T Type) (result int64) {
 
 	// For arrays and structs, alignment is defined in terms
 	// of alignment of the elements and fields, respectively.
-	switch t := under(T).(type) {
+	switch t := T.Underlying().(type) {
 	case *Array:
 		// spec: "For a variable x of array type: unsafe.Alignof(x)
 		// is the same as unsafe.Alignof(x[0]), but at least 1."
@@ -94,7 +94,7 @@ func (s *StdSizes) Alignof(T Type) (result int64) {
 			return s.WordSize
 		}
 	case *TypeParam, *Union:
-		unreachable()
+		panic("unreachable")
 	}
 	a := s.Sizeof(T) // may be 0 or negative
 	// spec: "For a variable x of any type: unsafe.Alignof(x) is at least 1."
@@ -112,15 +112,15 @@ func (s *StdSizes) Alignof(T Type) (result int64) {
 }
 
 func IsSyncAtomicAlign64(T Type) bool {
-	named, ok := T.(*Named)
-	if !ok {
+	named := asNamed(T)
+	if named == nil {
 		return false
 	}
 	obj := named.Obj()
 	return obj.Name() == "align64" &&
 		obj.Pkg() != nil &&
 		(obj.Pkg().Path() == "sync/atomic" ||
-			obj.Pkg().Path() == "runtime/internal/atomic")
+			obj.Pkg().Path() == "internal/runtime/atomic")
 }
 
 func (s *StdSizes) Offsetsof(fields []*Var) []int64 {
@@ -162,7 +162,7 @@ var basicSizes = [...]byte{
 }
 
 func (s *StdSizes) Sizeof(T Type) int64 {
-	switch t := under(T).(type) {
+	switch t := T.Underlying().(type) {
 	case *Basic:
 		assert(isTyped(T))
 		k := t.kind
@@ -221,7 +221,7 @@ func (s *StdSizes) Sizeof(T Type) int64 {
 		assert(!isTypeParam(T))
 		return s.WordSize * 2
 	case *TypeParam, *Union:
-		unreachable()
+		panic("unreachable")
 	}
 	return s.WordSize // catch-all
 }
@@ -257,10 +257,12 @@ var gcArchSizes = map[string]*gcSizes{
 func SizesFor(compiler, arch string) Sizes {
 	switch compiler {
 	case "gc":
-		return gcSizesFor(compiler, arch)
+		if s := gcSizesFor(compiler, arch); s != nil {
+			return Sizes(s)
+		}
 	case "gccgo":
 		if s, ok := gccgoArchSizes[arch]; ok {
-			return s
+			return Sizes(s)
 		}
 	}
 	return nil
@@ -305,7 +307,7 @@ func (conf *Config) offsetsof(T *Struct) []int64 {
 func (conf *Config) offsetof(T Type, index []int) int64 {
 	var offs int64
 	for _, i := range index {
-		s := under(T).(*Struct)
+		s := T.Underlying().(*Struct)
 		d := conf.offsetsof(s)[i]
 		if d < 0 {
 			return -1

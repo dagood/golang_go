@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash"
 	"hash/crc32"
 	"internal/godebug"
@@ -16,7 +17,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -48,21 +49,20 @@ type Reader struct {
 	fileList     []fileListEntry
 }
 
-// A ReadCloser is a Reader that must be closed when no longer needed.
+// A ReadCloser is a [Reader] that must be closed when no longer needed.
 type ReadCloser struct {
 	f *os.File
 	Reader
 }
 
 // A File is a single file in a ZIP archive.
-// The file information is in the embedded FileHeader.
-// The file content can be accessed by calling Open.
+// The file information is in the embedded [FileHeader].
+// The file content can be accessed by calling [File.Open].
 type File struct {
 	FileHeader
 	zip          *Reader
 	zipr         io.ReaderAt
 	headerOffset int64 // includes overall ZIP archive baseOffset
-	zip64        bool  // zip64 extended information extra field presence
 }
 
 // OpenReader will open the Zip file specified by name and return a ReadCloser.
@@ -93,16 +93,16 @@ func OpenReader(name string) (*ReadCloser, error) {
 	return r, err
 }
 
-// NewReader returns a new Reader reading from r, which is assumed to
+// NewReader returns a new [Reader] reading from r, which is assumed to
 // have the given size in bytes.
 //
 // If any file inside the archive uses a non-local name
 // (as defined by [filepath.IsLocal]) or a name containing backslashes
 // and the GODEBUG environment variable contains `zipinsecurepath=0`,
-// NewReader returns the reader with an ErrInsecurePath error.
+// NewReader returns the reader with an [ErrInsecurePath] error.
 // A future version of Go may introduce this behavior by default.
 // Programs that want to accept non-local names can ignore
-// the ErrInsecurePath error and use the returned reader.
+// the [ErrInsecurePath] error and use the returned reader.
 func NewReader(r io.ReaderAt, size int64) (*Reader, error) {
 	if size < 0 {
 		return nil, errors.New("zip: size cannot be negative")
@@ -178,7 +178,7 @@ func (r *Reader) init(rdr io.ReaderAt, size int64) error {
 
 // RegisterDecompressor registers or overrides a custom decompressor for a
 // specific method ID. If a decompressor for a given method is not found,
-// Reader will default to looking up the decompressor at the package level.
+// [Reader] will default to looking up the decompressor at the package level.
 func (r *Reader) RegisterDecompressor(method uint16, dcomp Decompressor) {
 	if r.decompressors == nil {
 		r.decompressors = make(map[uint16]Decompressor)
@@ -202,7 +202,7 @@ func (rc *ReadCloser) Close() error {
 // DataOffset returns the offset of the file's possibly-compressed
 // data, relative to the beginning of the zip file.
 //
-// Most callers should instead use Open, which transparently
+// Most callers should instead use [File.Open], which transparently
 // decompresses data and verifies checksums.
 func (f *File) DataOffset() (offset int64, err error) {
 	bodyOffset, err := f.findBodyOffset()
@@ -212,7 +212,7 @@ func (f *File) DataOffset() (offset int64, err error) {
 	return f.headerOffset + bodyOffset, nil
 }
 
-// Open returns a ReadCloser that provides access to the File's contents.
+// Open returns a [ReadCloser] that provides access to the [File]'s contents.
 // Multiple files may be read concurrently.
 func (f *File) Open() (io.ReadCloser, error) {
 	bodyOffset, err := f.findBodyOffset()
@@ -255,7 +255,7 @@ func (f *File) Open() (io.ReadCloser, error) {
 	return rc, nil
 }
 
-// OpenRaw returns a Reader that provides access to the File's contents without
+// OpenRaw returns a [Reader] that provides access to the [File]'s contents without
 // decompression.
 func (f *File) OpenRaw() (io.Reader, error) {
 	bodyOffset, err := f.findBodyOffset()
@@ -405,10 +405,6 @@ func readDirectoryHeader(f *File, r io.Reader) error {
 		f.NonUTF8 = f.Flags&0x800 == 0
 	}
 
-	needUSize := f.UncompressedSize == ^uint32(0)
-	needCSize := f.CompressedSize == ^uint32(0)
-	needHeaderOffset := f.headerOffset == int64(^uint32(0))
-
 	// Best effort to find what we need.
 	// Other zip authors might not even follow the basic format,
 	// and we'll just ignore the Extra content in that case.
@@ -424,28 +420,23 @@ parseExtras:
 
 		switch fieldTag {
 		case zip64ExtraID:
-			f.zip64 = true
-
 			// update directory values from the zip64 extra block.
 			// They should only be consulted if the sizes read earlier
 			// are maxed out.
-			// See golang.org/issue/13367.
-			if needUSize {
-				needUSize = false
+			// See go.dev/issue/13367 and go.dev/issue/31692.
+			if f.UncompressedSize == ^uint32(0) {
 				if len(fieldBuf) < 8 {
 					return ErrFormat
 				}
 				f.UncompressedSize64 = fieldBuf.uint64()
 			}
-			if needCSize {
-				needCSize = false
+			if f.CompressedSize == ^uint32(0) {
 				if len(fieldBuf) < 8 {
 					return ErrFormat
 				}
 				f.CompressedSize64 = fieldBuf.uint64()
 			}
-			if needHeaderOffset {
-				needHeaderOffset = false
+			if f.headerOffset == int64(^uint32(0)) {
 				if len(fieldBuf) < 8 {
 					return ErrFormat
 				}
@@ -469,8 +460,8 @@ parseExtras:
 
 				const ticksPerSecond = 1e7    // Windows timestamp resolution
 				ts := int64(attrBuf.uint64()) // ModTime since Windows epoch
-				secs := int64(ts / ticksPerSecond)
-				nsecs := (1e9 / ticksPerSecond) * int64(ts%ticksPerSecond)
+				secs := ts / ticksPerSecond
+				nsecs := (1e9 / ticksPerSecond) * (ts % ticksPerSecond)
 				epoch := time.Date(1601, time.January, 1, 0, 0, 0, 0, time.UTC)
 				modified = time.Unix(epoch.Unix()+secs, nsecs)
 			}
@@ -506,20 +497,6 @@ parseExtras:
 		if f.ModifiedTime != 0 || f.ModifiedDate != 0 {
 			f.Modified = modified.In(timeZone(msdosModified.Sub(modified)))
 		}
-	}
-
-	// Assume that uncompressed size 2³²-1 could plausibly happen in
-	// an old zip32 file that was sharding inputs into the largest chunks
-	// possible (or is just malicious; search the web for 42.zip).
-	// If needUSize is true still, it means we didn't see a zip64 extension.
-	// As long as the compressed size is not also 2³²-1 (implausible)
-	// and the header is not also 2³²-1 (equally implausible),
-	// accept the uncompressed size 2³²-1 as valid.
-	// If nothing else, this keeps archive/zip working with 42.zip.
-	_ = needUSize
-
-	if needCSize || needHeaderOffset {
-		return ErrFormat
 	}
 
 	return nil
@@ -604,7 +581,7 @@ func readDirectoryEnd(r io.ReaderAt, size int64) (dir *directoryEnd, baseOffset 
 	d.comment = string(b[:l])
 
 	// These values mean that the file can be a zip64 file
-	if d.directoryRecords == 0xffff || d.directorySize == 0xffff || d.directoryOffset == 0xffffffff {
+	if d.directoryRecords == 0xffff || d.directorySize == 0xffffffff || d.directoryOffset == 0xffffffff {
 		p, err := findDirectory64End(r, directoryEndOffset)
 		if err == nil && p >= 0 {
 			directoryEndOffset = p
@@ -699,9 +676,13 @@ func findSignatureInBlock(b []byte) int {
 		if b[i] == 'P' && b[i+1] == 'K' && b[i+2] == 0x05 && b[i+3] == 0x06 {
 			// n is length of comment
 			n := int(b[i+directoryEndLen-2]) | int(b[i+directoryEndLen-1])<<8
-			if n+directoryEndLen+i <= len(b) {
-				return i
+			if n+directoryEndLen+i > len(b) {
+				// Truncated comment.
+				// Some parsers (such as Info-ZIP) ignore the truncated comment
+				// rather than treating it as a hard error.
+				return -1
 			}
+			return i
 		}
 	}
 	return -1
@@ -800,6 +781,9 @@ func toValidName(name string) string {
 
 func (r *Reader) initFileList() {
 	r.fileListOnce.Do(func() {
+		// Preallocate the minimum size of the index.
+		// We may also synthesize additional directory entries.
+		r.fileList = make([]fileListEntry, 0, len(r.File))
 		// files and knownDirs map from a file/directory name
 		// to an index into the r.fileList entry that we are
 		// building. They are used to mark duplicate entries.
@@ -826,7 +810,16 @@ func (r *Reader) initFileList() {
 				continue
 			}
 
-			for dir := path.Dir(name); dir != "."; dir = path.Dir(dir) {
+			dir := name
+			for {
+				if idx := strings.LastIndex(dir, "/"); idx < 0 {
+					break
+				} else {
+					dir = dir[:idx]
+				}
+				if dirs[dir] {
+					break
+				}
 				dirs[dir] = true
 			}
 
@@ -858,14 +851,19 @@ func (r *Reader) initFileList() {
 			}
 		}
 
-		sort.Slice(r.fileList, func(i, j int) bool { return fileEntryLess(r.fileList[i].name, r.fileList[j].name) })
+		slices.SortFunc(r.fileList, func(a, b fileListEntry) int {
+			return fileEntryCompare(a.name, b.name)
+		})
 	})
 }
 
-func fileEntryLess(x, y string) bool {
+func fileEntryCompare(x, y string) int {
 	xdir, xelem, _ := split(x)
 	ydir, yelem, _ := split(y)
-	return xdir < ydir || xdir == ydir && xelem < yelem
+	if xdir != ydir {
+		return strings.Compare(xdir, ydir)
+	}
+	return strings.Compare(xelem, yelem)
 }
 
 // Open opens the named file in the ZIP archive,
@@ -893,14 +891,8 @@ func (r *Reader) Open(name string) (fs.File, error) {
 }
 
 func split(name string) (dir, elem string, isDir bool) {
-	if len(name) > 0 && name[len(name)-1] == '/' {
-		isDir = true
-		name = name[:len(name)-1]
-	}
-	i := len(name) - 1
-	for i >= 0 && name[i] != '/' {
-		i--
-	}
+	name, isDir = strings.CutSuffix(name, "/")
+	i := strings.LastIndexByte(name, '/')
 	if i < 0 {
 		return ".", name, isDir
 	}
@@ -916,9 +908,12 @@ func (r *Reader) openLookup(name string) *fileListEntry {
 
 	dir, elem, _ := split(name)
 	files := r.fileList
-	i := sort.Search(len(files), func(i int) bool {
-		idir, ielem, _ := split(files[i].name)
-		return idir > dir || idir == dir && ielem >= elem
+	i, _ := slices.BinarySearchFunc(files, dir, func(a fileListEntry, dir string) (ret int) {
+		idir, ielem, _ := split(a.name)
+		if dir != idir {
+			return strings.Compare(idir, dir)
+		}
+		return strings.Compare(ielem, elem)
 	})
 	if i < len(files) {
 		fname := files[i].name
@@ -931,13 +926,21 @@ func (r *Reader) openLookup(name string) *fileListEntry {
 
 func (r *Reader) openReadDir(dir string) []fileListEntry {
 	files := r.fileList
-	i := sort.Search(len(files), func(i int) bool {
-		idir, _, _ := split(files[i].name)
-		return idir >= dir
+	i, _ := slices.BinarySearchFunc(files, dir, func(a fileListEntry, dir string) int {
+		idir, _, _ := split(a.name)
+		if dir != idir {
+			return strings.Compare(idir, dir)
+		}
+		// find the first entry with dir
+		return +1
 	})
-	j := sort.Search(len(files), func(j int) bool {
-		jdir, _, _ := split(files[j].name)
-		return jdir > dir
+	j, _ := slices.BinarySearchFunc(files, dir, func(a fileListEntry, dir string) int {
+		jdir, _, _ := split(a.name)
+		if dir != jdir {
+			return strings.Compare(jdir, dir)
+		}
+		// find the last entry with dir
+		return -1
 	})
 	return files[i:j]
 }
@@ -971,6 +974,12 @@ func (d *openDir) ReadDir(count int) ([]fs.DirEntry, error) {
 		s, err := d.files[d.offset+i].stat()
 		if err != nil {
 			return nil, err
+		} else if s.Name() == "." || !fs.ValidPath(s.Name()) {
+			return nil, &fs.PathError{
+				Op:   "readdir",
+				Path: d.e.name,
+				Err:  fmt.Errorf("invalid file name: %v", d.files[d.offset+i].name),
+			}
 		}
 		list[i] = s
 	}

@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !goexperiment.jsonv2
+
 package json
 
 import (
@@ -36,7 +38,7 @@ func appendFoldedName(out, in []byte) []byte {
 	return out
 }
 
-// foldRune is returns the smallest rune for all runes in the same fold set.
+// foldRune returns the smallest rune for all runes in the same fold set.
 func foldRune(r rune) rune {
 	for {
 		r2 := unicode.SimpleFold(r)

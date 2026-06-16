@@ -19,7 +19,7 @@ import (
 	"io/fs"
 	"log"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -143,8 +143,8 @@ func main() {
 		}
 	}
 	// Sort for deterministic output.
-	sort.Slice(concreteNodes, func(i, j int) bool {
-		return concreteNodes[i].Name.Name < concreteNodes[j].Name.Name
+	slices.SortFunc(concreteNodes, func(a, b *ast.TypeSpec) int {
+		return strings.Compare(a.Name.Name, b.Name.Name)
 	})
 	// Generate code for each concrete type.
 	for _, t := range concreteNodes {
@@ -255,8 +255,10 @@ func processType(t *ast.TypeSpec) {
 	// Process fields.
 	var copyBody strings.Builder
 	var doChildrenBody strings.Builder
+	var doChildrenWithHiddenBody strings.Builder
 	var editChildrenBody strings.Builder
 	var editChildrenWithHiddenBody strings.Builder
+	var hasHidden bool
 	for _, f := range fields {
 		names := f.Names
 		ft := f.Type
@@ -297,13 +299,18 @@ func processType(t *ast.TypeSpec) {
 				ptr = "*"
 			}
 			if isSlice {
+				fmt.Fprintf(&doChildrenWithHiddenBody,
+					"if do%ss(n.%s, do) {\nreturn true\n}\n", ft, name)
 				fmt.Fprintf(&editChildrenWithHiddenBody,
 					"edit%ss(n.%s, edit)\n", ft, name)
 			} else {
+				fmt.Fprintf(&doChildrenWithHiddenBody,
+					"if n.%s != nil && do(n.%s) {\nreturn true\n}\n", name, name)
 				fmt.Fprintf(&editChildrenWithHiddenBody,
 					"if n.%s != nil {\nn.%s = edit(n.%s).(%s%s)\n}\n", name, name, name, ptr, ft)
 			}
 			if hidden {
+				hasHidden = true
 				continue
 			}
 			if isSlice {
@@ -322,16 +329,27 @@ func processType(t *ast.TypeSpec) {
 	}
 	fmt.Fprintf(&buf, "func (n *%s) copy() Node {\nc := *n\n", name)
 	buf.WriteString(copyBody.String())
-	fmt.Fprintf(&buf, "return &c\n}\n")
+	buf.WriteString("return &c\n}\n")
 	fmt.Fprintf(&buf, "func (n *%s) doChildren(do func(Node) bool) bool {\n", name)
 	buf.WriteString(doChildrenBody.String())
-	fmt.Fprintf(&buf, "return false\n}\n")
+	buf.WriteString("return false\n}\n")
+	fmt.Fprintf(&buf, "func (n *%s) doChildrenWithHidden(do func(Node) bool) bool {\n", name)
+	if hasHidden {
+		buf.WriteString(doChildrenWithHiddenBody.String())
+		buf.WriteString("return false\n}\n")
+	} else {
+		buf.WriteString("return n.doChildren(do)\n}\n")
+	}
 	fmt.Fprintf(&buf, "func (n *%s) editChildren(edit func(Node) Node) {\n", name)
 	buf.WriteString(editChildrenBody.String())
-	fmt.Fprintf(&buf, "}\n")
+	buf.WriteString("}\n")
 	fmt.Fprintf(&buf, "func (n *%s) editChildrenWithHidden(edit func(Node) Node) {\n", name)
-	buf.WriteString(editChildrenWithHiddenBody.String())
-	fmt.Fprintf(&buf, "}\n")
+	if hasHidden {
+		buf.WriteString(editChildrenWithHiddenBody.String())
+	} else {
+		buf.WriteString("n.editChildren(edit)\n")
+	}
+	buf.WriteString("}\n")
 }
 
 func generateHelpers() {

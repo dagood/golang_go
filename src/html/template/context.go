@@ -6,6 +6,7 @@ package template
 
 import (
 	"fmt"
+	"slices"
 	"text/template/parse"
 )
 
@@ -21,10 +22,15 @@ type context struct {
 	delim   delim
 	urlPart urlPart
 	jsCtx   jsCtx
-	attr    attr
-	element element
-	n       parse.Node // for range break/continue
-	err     *Error
+	// jsBraceDepth contains the current depth, for each JS template literal
+	// string interpolation expression, of braces we've seen. This is used to
+	// determine if the next } will close a JS template literal string
+	// interpolation expression or not.
+	jsBraceDepth []int
+	attr         attr
+	element      element
+	n            parse.Node // for range break/continue
+	err          *Error
 }
 
 func (c context) String() string {
@@ -32,7 +38,7 @@ func (c context) String() string {
 	if c.err != nil {
 		err = c.err
 	}
-	return fmt.Sprintf("{%v %v %v %v %v %v %v}", c.state, c.delim, c.urlPart, c.jsCtx, c.attr, c.element, err)
+	return fmt.Sprintf("{%v %v %v %v %v %v %v %v}", c.state, c.delim, c.urlPart, c.jsCtx, c.jsBraceDepth, c.attr, c.element, err)
 }
 
 // eq reports whether two contexts are equal.
@@ -41,6 +47,7 @@ func (c context) eq(d context) bool {
 		c.delim == d.delim &&
 		c.urlPart == d.urlPart &&
 		c.jsCtx == d.jsCtx &&
+		slices.Equal(c.jsBraceDepth, d.jsBraceDepth) &&
 		c.attr == d.attr &&
 		c.element == d.element &&
 		c.err == d.err
@@ -63,6 +70,9 @@ func (c context) mangle(templateName string) string {
 	if c.jsCtx != jsCtxRegexp {
 		s += "_" + c.jsCtx.String()
 	}
+	if c.jsBraceDepth != nil {
+		s += fmt.Sprintf("_jsBraceDepth(%v)", c.jsBraceDepth)
+	}
 	if c.attr != attrNone {
 		s += "_" + c.attr.String()
 	}
@@ -70,6 +80,13 @@ func (c context) mangle(templateName string) string {
 		s += "_" + c.element.String()
 	}
 	return s
+}
+
+// clone returns a copy of c with the same field values.
+func (c context) clone() context {
+	clone := c
+	clone.jsBraceDepth = slices.Clone(c.jsBraceDepth)
+	return clone
 }
 
 // state describes a high-level HTML parser state.
@@ -120,14 +137,18 @@ const (
 	stateJSDqStr
 	// stateJSSqStr occurs inside a JavaScript single quoted string.
 	stateJSSqStr
-	// stateJSBqStr occurs inside a JavaScript back quoted string.
-	stateJSBqStr
+	// stateJSTmplLit occurs inside a JavaScript back quoted string.
+	stateJSTmplLit
 	// stateJSRegexp occurs inside a JavaScript regexp literal.
 	stateJSRegexp
 	// stateJSBlockCmt occurs inside a JavaScript /* block comment */.
 	stateJSBlockCmt
 	// stateJSLineCmt occurs inside a JavaScript // line comment.
 	stateJSLineCmt
+	// stateJSHTMLOpenCmt occurs inside a JavaScript <!-- HTML-like comment.
+	stateJSHTMLOpenCmt
+	// stateJSHTMLCloseCmt occurs inside a JavaScript --> HTML-like comment.
+	stateJSHTMLCloseCmt
 	// stateCSS occurs inside a <style> element or style attribute.
 	stateCSS
 	// stateCSSDqStr occurs inside a CSS double quoted string.
@@ -147,6 +168,10 @@ const (
 	// stateError is an infectious error state outside any valid
 	// HTML/CSS/JS construct.
 	stateError
+	// stateMetaContent occurs inside a HTML meta element content attribute.
+	stateMetaContent
+	// stateMetaContentURL occurs inside a "url=" tag in a HTML meta element content attribute.
+	stateMetaContentURL
 	// stateDead marks unreachable code after a {{break}} or {{continue}}.
 	stateDead
 )
@@ -155,7 +180,7 @@ const (
 // authors & maintainers, not for end-users or machines.
 func isComment(s state) bool {
 	switch s {
-	case stateHTMLCmt, stateJSBlockCmt, stateJSLineCmt, stateCSSBlockCmt, stateCSSLineCmt:
+	case stateHTMLCmt, stateJSBlockCmt, stateJSLineCmt, stateJSHTMLOpenCmt, stateJSHTMLCloseCmt, stateCSSBlockCmt, stateCSSLineCmt:
 		return true
 	}
 	return false
@@ -165,6 +190,20 @@ func isComment(s state) bool {
 func isInTag(s state) bool {
 	switch s {
 	case stateTag, stateAttrName, stateAfterName, stateBeforeValue, stateAttr:
+		return true
+	}
+	return false
+}
+
+// isInScriptLiteral returns true if s is one of the literal states within a
+// <script> tag, and as such occurrences of "<!--", "<script", and "</script"
+// need to be treated specially.
+func isInScriptLiteral(s state) bool {
+	// Ignore the comment states (stateJSBlockCmt, stateJSLineCmt,
+	// stateJSHTMLOpenCmt, stateJSHTMLCloseCmt) because their content is already
+	// omitted from the output.
+	switch s {
+	case stateJSDqStr, stateJSSqStr, stateJSTmplLit, stateJSRegexp:
 		return true
 	}
 	return false
@@ -244,6 +283,8 @@ const (
 	elementTextarea
 	// elementTitle corresponds to the RCDATA <title> element.
 	elementTitle
+	// elementMeta corresponds to the HTML <meta> element.
+	elementMeta
 )
 
 //go:generate stringer -type attr
@@ -265,4 +306,6 @@ const (
 	attrURL
 	// attrSrcset corresponds to a srcset attribute.
 	attrSrcset
+	// attrMetaContent corresponds to the content attribute in meta HTML element.
+	attrMetaContent
 )

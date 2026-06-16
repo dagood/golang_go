@@ -145,14 +145,14 @@ func (r *CovDataReader) Visit() error {
 	return nil
 }
 
-func (r *CovDataReader) verb(vlevel int, s string, a ...interface{}) {
+func (r *CovDataReader) verb(vlevel int, s string, a ...any) {
 	if r.verbosityLevel >= vlevel {
 		fmt.Fprintf(os.Stderr, s, a...)
 		fmt.Fprintf(os.Stderr, "\n")
 	}
 }
 
-func (r *CovDataReader) warn(s string, a ...interface{}) {
+func (r *CovDataReader) warn(s string, a ...any) {
 	fmt.Fprintf(os.Stderr, "warning: ")
 	fmt.Fprintf(os.Stderr, s, a...)
 	fmt.Fprintf(os.Stderr, "\n")
@@ -161,7 +161,7 @@ func (r *CovDataReader) warn(s string, a ...interface{}) {
 	}
 }
 
-func (r *CovDataReader) fatal(s string, a ...interface{}) error {
+func (r *CovDataReader) fatal(s string, a ...any) error {
 	if r.err != nil {
 		return nil
 	}
@@ -204,15 +204,12 @@ func (r *CovDataReader) visitPod(p pods.Pod) error {
 	}
 	r.vis.VisitMetaDataFile(p.MetaFile, mfr)
 
-	// Read counter data files.
-	for k, cdf := range p.CounterDataFiles {
+	processCounterDataFile := func(cdf string, k int) error {
 		cf, err := os.Open(cdf)
 		if err != nil {
 			return r.fatal("opening counter data file %s: %s", cdf, err)
 		}
-		defer func(f *os.File) {
-			f.Close()
-		}(cf)
+		defer cf.Close()
 		var mr *MReader
 		mr, err = NewMreader(cf)
 		if err != nil {
@@ -236,6 +233,14 @@ func (r *CovDataReader) visitPod(p pods.Pod) error {
 			r.vis.VisitFuncCounterData(data)
 		}
 		r.vis.EndCounterDataFile(cdf, cdr, p.Origins[k])
+		return nil
+	}
+
+	// Read counter data files.
+	for k, cdf := range p.CounterDataFiles {
+		if err := processCounterDataFile(cdf, k); err != nil {
+			return err
+		}
 	}
 	r.vis.EndCounters()
 

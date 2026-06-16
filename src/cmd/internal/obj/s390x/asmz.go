@@ -35,7 +35,7 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"sort"
+	"slices"
 )
 
 // ctxtz holds state while assembling a single function.
@@ -347,6 +347,9 @@ var optab = []Optab{
 	// KDSA
 	{i: 125, as: AKDSA, a1: C_REG, a6: C_REG},
 
+	// KMA
+	{i: 126, as: AKMA, a1: C_REG, a2: C_REG, a6: C_REG},
+
 	// vector instructions
 
 	// VRX store
@@ -438,6 +441,11 @@ var optab = []Optab{
 	{i: 119, as: AVERLLVG, a1: C_VREG, a2: C_VREG, a6: C_VREG},
 	{i: 119, as: AVERLLVG, a1: C_VREG, a6: C_VREG},
 
+	// VRR-c floating point min/max
+	{i: 128, as: AVFMAXDB, a1: C_SCON, a2: C_VREG, a3: C_VREG, a6: C_VREG},
+	{i: 128, as: AWFMAXDB, a1: C_SCON, a2: C_VREG, a3: C_VREG, a6: C_VREG},
+	{i: 128, as: AWFMAXDB, a1: C_SCON, a2: C_FREG, a3: C_FREG, a6: C_FREG},
+
 	// VRR-d
 	{i: 120, as: AVACQ, a1: C_VREG, a2: C_VREG, a3: C_VREG, a6: C_VREG},
 
@@ -446,6 +454,14 @@ var optab = []Optab{
 
 	// VRR-f
 	{i: 122, as: AVLVGP, a1: C_REG, a2: C_REG, a6: C_VREG},
+
+	// MVC storage and storage
+	{i: 127, as: AMVCLE, a1: C_LOREG, a2: C_REG, a6: C_REG},
+	{i: 127, as: AMVCLE, a1: C_SCON, a2: C_REG, a6: C_REG},
+
+	// VSI store rightmost with length
+	{i: 129, as: AVSTRL, a1: C_VREG, a3: C_SCON, a6: C_SOREG},
+	{i: 129, as: AVSTRL, a1: C_VREG, a3: C_SCON, a6: C_SAUTO},
 }
 
 var oprange [ALAST & obj.AMask][]Optab
@@ -688,7 +704,7 @@ func (c *ctxtz) aclass(a *obj.Addr) int {
 			if c.instoffset <= 0xffff {
 				return C_ANDCON
 			}
-			if c.instoffset&0xffff == 0 && isuint32(uint64(c.instoffset)) { /* && (instoffset & (1<<31)) == 0) */
+			if c.instoffset&0xffff == 0 && isuint32(uint64(c.instoffset)) { /* && ((instoffset & (1<<31)) == 0) */
 				return C_UCON
 			}
 			if isint32(c.instoffset) || isuint32(uint64(c.instoffset)) {
@@ -850,40 +866,23 @@ func cmp(a int, b int) bool {
 	return false
 }
 
-type ocmp []Optab
-
-func (x ocmp) Len() int {
-	return len(x)
-}
-
-func (x ocmp) Swap(i, j int) {
-	x[i], x[j] = x[j], x[i]
-}
-
-func (x ocmp) Less(i, j int) bool {
-	p1 := &x[i]
-	p2 := &x[j]
-	n := int(p1.as) - int(p2.as)
-	if n != 0 {
-		return n < 0
+func ocmp(p1, p2 Optab) int {
+	if p1.as != p2.as {
+		return int(p1.as) - int(p2.as)
 	}
-	n = int(p1.a1) - int(p2.a1)
-	if n != 0 {
-		return n < 0
+	if p1.a1 != p2.a1 {
+		return int(p1.a1) - int(p2.a1)
 	}
-	n = int(p1.a2) - int(p2.a2)
-	if n != 0 {
-		return n < 0
+	if p1.a2 != p2.a2 {
+		return int(p1.a2) - int(p2.a2)
 	}
-	n = int(p1.a3) - int(p2.a3)
-	if n != 0 {
-		return n < 0
+	if p1.a3 != p2.a3 {
+		return int(p1.a3) - int(p2.a3)
 	}
-	n = int(p1.a4) - int(p2.a4)
-	if n != 0 {
-		return n < 0
+	if p1.a4 != p2.a4 {
+		return int(p1.a4) - int(p2.a4)
 	}
-	return false
+	return 0
 }
 func opset(a, b obj.As) {
 	oprange[a&obj.AMask] = oprange[b&obj.AMask]
@@ -904,7 +903,7 @@ func buildop(ctxt *obj.Link) {
 			}
 		}
 	}
-	sort.Sort(ocmp(optab))
+	slices.SortFunc(optab, ocmp)
 	for i := 0; i < len(optab); i++ {
 		r := optab[i].as
 		start := i
@@ -983,6 +982,7 @@ func buildop(ctxt *obj.Link) {
 			opset(ALNDFR, r)
 			opset(AFNEG, r)
 			opset(AFNEGS, r)
+			opset(ALCDBR, r)
 			opset(ALEDBR, r)
 			opset(ALDEBR, r)
 			opset(AFSQRT, r)
@@ -1464,6 +1464,7 @@ func buildop(ctxt *obj.Link) {
 			opset(AVMALOB, r)
 			opset(AVMALOH, r)
 			opset(AVMALOF, r)
+			opset(AVSTRC, r)
 			opset(AVSTRCB, r)
 			opset(AVSTRCH, r)
 			opset(AVSTRCF, r)
@@ -1488,10 +1489,20 @@ func buildop(ctxt *obj.Link) {
 			opset(AVFMSDB, r)
 			opset(AWFMSDB, r)
 			opset(AVPERM, r)
+		case AVFMAXDB:
+			opset(AVFMAXSB, r)
+			opset(AVFMINDB, r)
+			opset(AVFMINSB, r)
+		case AWFMAXDB:
+			opset(AWFMAXSB, r)
+			opset(AWFMINDB, r)
+			opset(AWFMINSB, r)
 		case AKM:
 			opset(AKMC, r)
 			opset(AKLMD, r)
 			opset(AKIMD, r)
+		case AKMA:
+			opset(AKMCTR, r)
 		}
 	}
 }
@@ -1896,6 +1907,7 @@ const (
 	op_KM      uint32 = 0xB92E // FORMAT_RRE        CIPHER MESSAGE
 	op_KMAC    uint32 = 0xB91E // FORMAT_RRE        COMPUTE MESSAGE AUTHENTICATION CODE
 	op_KMC     uint32 = 0xB92F // FORMAT_RRE        CIPHER MESSAGE WITH CHAINING
+	op_KMA     uint32 = 0xB929 // FORMAT_RRF2       CIPHER MESSAGE WITH AUTHENTICATION
 	op_KMCTR   uint32 = 0xB92D // FORMAT_RRF2       CIPHER MESSAGE WITH COUNTER
 	op_KMF     uint32 = 0xB92A // FORMAT_RRE        CIPHER MESSAGE WITH CFB
 	op_KMO     uint32 = 0xB92B // FORMAT_RRE        CIPHER MESSAGE WITH OFB
@@ -2626,6 +2638,7 @@ const (
 	op_VSTEG  uint32 = 0xE70A // 	VRX	VECTOR STORE ELEMENT (64)
 	op_VSTEB  uint32 = 0xE708 // 	VRX	VECTOR STORE ELEMENT (8)
 	op_VSTM   uint32 = 0xE73E // 	VRS-a	VECTOR STORE MULTIPLE
+	op_VSTRL  uint32 = 0xE63D // 	VSI	VECTOR STORE RIGHTMOST WITH LENGTH
 	op_VSTL   uint32 = 0xE73F // 	VRS-b	VECTOR STORE WITH LENGTH
 	op_VSTRC  uint32 = 0xE78A // 	VRR-d	VECTOR STRING RANGE COMPARE
 	op_VS     uint32 = 0xE7F7 // 	VRR-c	VECTOR SUBTRACT
@@ -2641,6 +2654,8 @@ const (
 	op_VUPLL  uint32 = 0xE7D4 // 	VRR-a	VECTOR UNPACK LOGICAL LOW
 	op_VUPL   uint32 = 0xE7D6 // 	VRR-a	VECTOR UNPACK LOW
 	op_VMSL   uint32 = 0xE7B8 // 	VRR-d	VECTOR MULTIPLY SUM LOGICAL
+	op_VFMAX  uint32 = 0xE7EF // 	VRR-c	VECTOR FP MAXIMUM
+	op_VFMIN  uint32 = 0xE7EE // 	VRR-c	VECTOR FP MINIMUM
 
 	// added in z15
 	op_KDSA uint32 = 0xB93A // FORMAT_RRE        COMPUTE DIGITAL SIGNATURE AUTHENTICATION (KDSA)
@@ -2653,48 +2668,34 @@ func oclass(a *obj.Addr) int {
 
 // Add a relocation for the immediate in a RIL style instruction.
 // The addend will be adjusted as required.
-func (c *ctxtz) addrilreloc(sym *obj.LSym, add int64) *obj.Reloc {
+func (c *ctxtz) addrilreloc(sym *obj.LSym, add int64) {
 	if sym == nil {
 		c.ctxt.Diag("require symbol to apply relocation")
 	}
 	offset := int64(2) // relocation offset from start of instruction
-	rel := obj.Addrel(c.cursym)
-	rel.Off = int32(c.pc + offset)
-	rel.Siz = 4
-	rel.Sym = sym
-	rel.Add = add + offset + int64(rel.Siz)
-	rel.Type = objabi.R_PCRELDBL
-	return rel
-}
-
-func (c *ctxtz) addrilrelocoffset(sym *obj.LSym, add, offset int64) *obj.Reloc {
-	if sym == nil {
-		c.ctxt.Diag("require symbol to apply relocation")
-	}
-	offset += int64(2) // relocation offset from start of instruction
-	rel := obj.Addrel(c.cursym)
-	rel.Off = int32(c.pc + offset)
-	rel.Siz = 4
-	rel.Sym = sym
-	rel.Add = add + offset + int64(rel.Siz)
-	rel.Type = objabi.R_PCRELDBL
-	return rel
+	c.cursym.AddRel(c.ctxt, obj.Reloc{
+		Type: objabi.R_PCRELDBL,
+		Off:  int32(c.pc + offset),
+		Siz:  4,
+		Sym:  sym,
+		Add:  add + offset + 4,
+	})
 }
 
 // Add a CALL relocation for the immediate in a RIL style instruction.
 // The addend will be adjusted as required.
-func (c *ctxtz) addcallreloc(sym *obj.LSym, add int64) *obj.Reloc {
+func (c *ctxtz) addcallreloc(sym *obj.LSym, add int64) {
 	if sym == nil {
 		c.ctxt.Diag("require symbol to apply relocation")
 	}
 	offset := int64(2) // relocation offset from start of instruction
-	rel := obj.Addrel(c.cursym)
-	rel.Off = int32(c.pc + offset)
-	rel.Siz = 4
-	rel.Sym = sym
-	rel.Add = add + offset + int64(rel.Siz)
-	rel.Type = objabi.R_CALL
-	return rel
+	c.cursym.AddRel(c.ctxt, obj.Reloc{
+		Type: objabi.R_CALL,
+		Off:  int32(c.pc + offset),
+		Siz:  4,
+		Sym:  sym,
+		Add:  add + offset + int64(4),
+	})
 }
 
 func (c *ctxtz) branchMask(p *obj.Prog) CCMask {
@@ -3134,7 +3135,7 @@ func (c *ctxtz) asmout(p *obj.Prog, asm *[]byte) {
 		case ARISBLG, ARISBLGZ:
 			opcode = op_RISBLG
 		}
-		zRIE(_f, uint32(opcode), uint32(r1), uint32(r2), 0, uint32(i3), uint32(i4), 0, uint32(i5), asm)
+		zRIE(_f, opcode, uint32(r1), uint32(r2), 0, uint32(i3), uint32(i4), 0, uint32(i5), asm)
 
 	case 15: // br/bl (reg)
 		r := p.To.Reg
@@ -3187,8 +3188,8 @@ func (c *ctxtz) asmout(p *obj.Prog, asm *[]byte) {
 		}
 		switch p.As {
 		case ASUB:
-			zRIL(_a, op_LGFI, uint32(regtmp(p)), uint32(v), asm)
-			zRRF(op_SLGRK, uint32(regtmp(p)), 0, uint32(p.To.Reg), uint32(r), asm)
+			zRIL(_a, op_LGFI, regtmp(p), uint32(v), asm)
+			zRRF(op_SLGRK, regtmp(p), 0, uint32(p.To.Reg), uint32(r), asm)
 		case ASUBC:
 			if r != p.To.Reg {
 				zRRE(op_LGR, uint32(p.To.Reg), uint32(r), asm)
@@ -3383,6 +3384,8 @@ func (c *ctxtz) asmout(p *obj.Prog, asm *[]byte) {
 			opcode = op_LCDFR
 		case AFNEGS:
 			opcode = op_LCEBR
+		case ALCDBR:
+			opcode = op_LCDBR
 		case ALEDBR:
 			opcode = op_LEDBR
 		case ALDEBR:
@@ -3605,7 +3608,7 @@ func (c *ctxtz) asmout(p *obj.Prog, asm *[]byte) {
 				if opcode == op_MVI {
 					opcode = op_MVIY
 				} else {
-					zRXY(op_LAY, uint32(regtmp(p)), 0, uint32(r), uint32(d), asm)
+					zRXY(op_LAY, regtmp(p), 0, uint32(r), uint32(d), asm)
 					r = int16(regtmp(p))
 					d = 0
 				}
@@ -4018,24 +4021,25 @@ func (c *ctxtz) asmout(p *obj.Prog, asm *[]byte) {
 			c.ctxt.Diag("invalid offset against GOT slot %v", p)
 		}
 		zRIL(_b, op_LGRL, uint32(p.To.Reg), 0, asm)
-		rel := obj.Addrel(c.cursym)
-		rel.Off = int32(c.pc + 2)
-		rel.Siz = 4
-		rel.Sym = p.From.Sym
-		rel.Type = objabi.R_GOTPCREL
-		rel.Add = 2 + int64(rel.Siz)
+		c.cursym.AddRel(c.ctxt, obj.Reloc{
+			Type: objabi.R_GOTPCREL,
+			Off:  int32(c.pc + 2),
+			Siz:  4,
+			Sym:  p.From.Sym,
+			Add:  2 + 4,
+		})
 
 	case 94: // TLS local exec model
 		zRIL(_b, op_LARL, regtmp(p), (sizeRIL+sizeRXY+sizeRI)>>1, asm)
 		zRXY(op_LG, uint32(p.To.Reg), regtmp(p), 0, 0, asm)
 		zRI(op_BRC, 0xF, (sizeRI+8)>>1, asm)
 		*asm = append(*asm, 0, 0, 0, 0, 0, 0, 0, 0)
-		rel := obj.Addrel(c.cursym)
-		rel.Off = int32(c.pc + sizeRIL + sizeRXY + sizeRI)
-		rel.Siz = 8
-		rel.Sym = p.From.Sym
-		rel.Type = objabi.R_TLS_LE
-		rel.Add = 0
+		c.cursym.AddRel(c.ctxt, obj.Reloc{
+			Type: objabi.R_TLS_LE,
+			Off:  int32(c.pc + sizeRIL + sizeRXY + sizeRI),
+			Siz:  8,
+			Sym:  p.From.Sym,
+		})
 
 	case 95: // TLS initial exec model
 		// Assembly                   | Relocation symbol    | Done Here?
@@ -4050,12 +4054,13 @@ func (c *ctxtz) asmout(p *obj.Prog, asm *[]byte) {
 
 		// R_390_TLS_IEENT
 		zRIL(_b, op_LARL, regtmp(p), 0, asm)
-		ieent := obj.Addrel(c.cursym)
-		ieent.Off = int32(c.pc + 2)
-		ieent.Siz = 4
-		ieent.Sym = p.From.Sym
-		ieent.Type = objabi.R_TLS_IE
-		ieent.Add = 2 + int64(ieent.Siz)
+		c.cursym.AddRel(c.ctxt, obj.Reloc{
+			Type: objabi.R_TLS_IE,
+			Off:  int32(c.pc + 2),
+			Siz:  4,
+			Sym:  p.From.Sym,
+			Add:  2 + 4,
+		})
 
 		// R_390_TLS_LOAD
 		zRXY(op_LGF, uint32(p.To.Reg), regtmp(p), 0, 0, asm)
@@ -4357,8 +4362,7 @@ func (c *ctxtz) asmout(p *obj.Prog, asm *[]byte) {
 		zVRRc(op, uint32(p.To.Reg), uint32(v2), uint32(p.From.Reg), m6, m5, m4, asm)
 
 	case 120: // VRR-d
-		op, m6, _ := vop(p.As)
-		m5 := singleElementMask(p.As)
+		op, m6, m5 := vop(p.As)
 		v1 := uint32(p.To.Reg)
 		v2 := uint32(p.From.Reg)
 		v3 := uint32(p.Reg)
@@ -4428,6 +4432,72 @@ func (c *ctxtz) asmout(p *obj.Prog, asm *[]byte) {
 		}
 		zRRE(op_KDSA, uint32(p.From.Reg), uint32(p.To.Reg), asm)
 
+	case 126: // KMA and KMCTR - CIPHER MESSAGE WITH AUTHENTICATION; CIPHER MESSAGE WITH COUNTER
+		var opcode uint32
+		switch p.As {
+		default:
+			c.ctxt.Diag("unexpected opcode %v", p.As)
+		case AKMA, AKMCTR:
+			if p.From.Reg == REG_R0 {
+				c.ctxt.Diag("input argument must not be R0 in %v", p)
+			}
+			if p.From.Reg&1 != 0 {
+				c.ctxt.Diag("input argument must be even register in %v", p)
+			}
+			if p.To.Reg == REG_R0 {
+				c.ctxt.Diag("output argument must not be R0 in %v", p)
+			}
+			if p.To.Reg&1 != 0 {
+				c.ctxt.Diag("output argument must be an even register in %v", p)
+			}
+			if p.Reg == REG_R0 {
+				c.ctxt.Diag("third argument must not be R0 in %v", p)
+			}
+			if p.Reg&1 != 0 {
+				c.ctxt.Diag("third argument must be even register in %v", p)
+			}
+			if p.As == AKMA {
+				opcode = op_KMA
+			} else if p.As == AKMCTR {
+				opcode = op_KMCTR
+			}
+		}
+		zRRF(opcode, uint32(p.Reg), 0, uint32(p.From.Reg), uint32(p.To.Reg), asm)
+
+	case 127: // RS-a Move Long Extended
+		// NOTE: Mapping MVCLE operands is as follows:
+		// Instruction Format: MVCLE R1,R3,D2(B2)
+		// R1 - prog.To (for Destination)
+		// R3 - prog.Reg (for Source)
+		// B2 - prog.From (for Padding Byte)
+		d2 := c.regoff(&p.From)
+		if p.To.Reg&1 != 0 {
+			c.ctxt.Diag("output argument must be even register in %v", p)
+		}
+		if p.Reg&1 != 0 {
+			c.ctxt.Diag("input argument must be an even register in %v", p)
+		}
+		if (p.From.Reg == p.To.Reg) || (p.From.Reg == p.Reg) {
+			c.ctxt.Diag("padding byte register cannot be same as input or output register %v", p)
+		}
+		zRS(op_MVCLE, uint32(p.To.Reg), uint32(p.Reg), uint32(p.From.Reg), uint32(d2), asm)
+
+	case 128: // VRR-c floating point max/min
+		op, m4, _ := vop(p.As)
+		m5 := singleElementMask(p.As)
+		m6 := uint32(c.vregoff(&p.From))
+		zVRRc(op, uint32(p.To.Reg), uint32(p.Reg), uint32(p.GetFrom3().Reg), m6, m5, m4, asm)
+
+	case 129: // VSI Vector Store Rightmost with Length
+		op, _, _ := vop(p.As)
+		v1 := p.From.Reg
+		b2 := p.To.Reg
+		if b2 == 0 {
+			b2 = REGSP
+		}
+		d2 := uint32(c.vregoff(&p.To))
+		i3 := uint32(c.vregoff(p.GetFrom3()))
+		zVSI(op, uint32(v1), uint32(b2), d2, i3, asm)
 	}
 }
 
@@ -4493,7 +4563,7 @@ func (c *ctxtz) zopload(a obj.As) uint32 {
 		return op_LRVH
 	}
 
-	c.ctxt.Diag("unknown store opcode %v", a)
+	c.ctxt.Diag("unknown zopload opcode %v", a)
 	return 0
 }
 
@@ -4677,16 +4747,6 @@ func zI(op, i1 uint32, asm *[]byte) {
 	*asm = append(*asm, uint8(op>>8), uint8(i1))
 }
 
-func zMII(op, m1, ri2, ri3 uint32, asm *[]byte) {
-	*asm = append(*asm,
-		uint8(op>>8),
-		(uint8(m1)<<4)|uint8((ri2>>8)&0x0F),
-		uint8(ri2),
-		uint8(ri3>>16),
-		uint8(ri3>>8),
-		uint8(ri3))
-}
-
 func zRI(op, r1_m1, i2_ri2 uint32, asm *[]byte) {
 	*asm = append(*asm,
 		uint8(op>>8),
@@ -4739,16 +4799,6 @@ func zRIL(f form, op, r1_m1, i2_ri2 uint32, asm *[]byte) {
 		uint8(i2_ri2))
 }
 
-func zRIS(op, r1, m3, b4, d4, i2 uint32, asm *[]byte) {
-	*asm = append(*asm,
-		uint8(op>>8),
-		(uint8(r1)<<4)|uint8(m3&0x0F),
-		(uint8(b4)<<4)|(uint8(d4>>8)&0x0F),
-		uint8(d4),
-		uint8(i2),
-		uint8(op))
-}
-
 func zRR(op, r1, r2 uint32, asm *[]byte) {
 	*asm = append(*asm, uint8(op>>8), (uint8(r1)<<4)|uint8(r2&0x0F))
 }
@@ -4777,39 +4827,12 @@ func zRRF(op, r3_m3, m4, r1, r2 uint32, asm *[]byte) {
 		(uint8(r1)<<4)|uint8(r2&0x0F))
 }
 
-func zRRS(op, r1, r2, b4, d4, m3 uint32, asm *[]byte) {
-	*asm = append(*asm,
-		uint8(op>>8),
-		(uint8(r1)<<4)|uint8(r2&0x0F),
-		(uint8(b4)<<4)|uint8((d4>>8)&0x0F),
-		uint8(d4),
-		uint8(m3)<<4,
-		uint8(op))
-}
-
 func zRS(op, r1, r3_m3, b2, d2 uint32, asm *[]byte) {
 	*asm = append(*asm,
 		uint8(op>>8),
 		(uint8(r1)<<4)|uint8(r3_m3&0x0F),
 		(uint8(b2)<<4)|uint8((d2>>8)&0x0F),
 		uint8(d2))
-}
-
-func zRSI(op, r1, r3, ri2 uint32, asm *[]byte) {
-	*asm = append(*asm,
-		uint8(op>>8),
-		(uint8(r1)<<4)|uint8(r3&0x0F),
-		uint8(ri2>>8),
-		uint8(ri2))
-}
-
-func zRSL(op, l1, b2, d2 uint32, asm *[]byte) {
-	*asm = append(*asm,
-		uint8(op>>8),
-		uint8(l1),
-		(uint8(b2)<<4)|uint8((d2>>8)&0x0F),
-		uint8(d2),
-		uint8(op))
 }
 
 func zRSY(op, r1, r3_m3, b2, d2 uint32, asm *[]byte) {
@@ -4838,16 +4861,6 @@ func zRXE(op, r1, x2, b2, d2, m3 uint32, asm *[]byte) {
 		(uint8(b2)<<4)|uint8((d2>>8)&0x0F),
 		uint8(d2),
 		uint8(m3)<<4,
-		uint8(op))
-}
-
-func zRXF(op, r3, x2, b2, d2, m1 uint32, asm *[]byte) {
-	*asm = append(*asm,
-		uint8(op>>8),
-		(uint8(r3)<<4)|uint8(x2&0x0F),
-		(uint8(b2)<<4)|uint8((d2>>8)&0x0F),
-		uint8(d2),
-		uint8(m1)<<4,
 		uint8(op))
 }
 
@@ -4899,16 +4912,6 @@ func zSIY(op, i2, b1, d1 uint32, asm *[]byte) {
 		uint8(op))
 }
 
-func zSMI(op, m1, b3, d3, ri2 uint32, asm *[]byte) {
-	*asm = append(*asm,
-		uint8(op>>8),
-		uint8(m1)<<4,
-		(uint8(b3)<<4)|uint8((d3>>8)&0x0F),
-		uint8(d3),
-		uint8(ri2>>8),
-		uint8(ri2))
-}
-
 // Expected argument values for the instruction formats.
 //
 // Format    a1  a2  a3  a4  a5  a6
@@ -4936,26 +4939,6 @@ func zSS(f form, op, l1_r1, l2_i3_r3, b1_b2, d1_d2, b2_b4, d2_d4 uint32, asm *[]
 		uint8(d1_d2),
 		(uint8(b2_b4)<<4)|uint8((d2_d4>>8)&0x0F),
 		uint8(d2_d4))
-}
-
-func zSSE(op, b1, d1, b2, d2 uint32, asm *[]byte) {
-	*asm = append(*asm,
-		uint8(op>>8),
-		uint8(op),
-		(uint8(b1)<<4)|uint8((d1>>8)&0x0F),
-		uint8(d1),
-		(uint8(b2)<<4)|uint8((d2>>8)&0x0F),
-		uint8(d2))
-}
-
-func zSSF(op, r3, b1, d1, b2, d2 uint32, asm *[]byte) {
-	*asm = append(*asm,
-		uint8(op>>8),
-		(uint8(r3)<<4)|(uint8(op)&0x0F),
-		(uint8(b1)<<4)|uint8((d1>>8)&0x0F),
-		uint8(d1),
-		(uint8(b2)<<4)|uint8((d2>>8)&0x0F),
-		uint8(d2))
 }
 
 func rxb(va, vb, vc, vd uint32) uint8 {
@@ -5112,5 +5095,15 @@ func zVRIe(op, v1, v2, i3, m5, m4 uint32, asm *[]byte) {
 		uint8(i3>>4),
 		(uint8(i3)<<4)|(uint8(m5)&0xf),
 		(uint8(m4)<<4)|rxb(v1, v2, 0, 0),
+		uint8(op))
+}
+
+func zVSI(op, v1, b2, d2, i3 uint32, asm *[]byte) {
+	*asm = append(*asm,
+		uint8(op>>8),
+		uint8(i3),
+		(uint8(b2)<<4)|(uint8(d2>>8)&0xf),
+		uint8(d2),
+		(uint8(v1)<<4)|rxb(v1, 0, 0, 0),
 		uint8(op))
 }

@@ -228,6 +228,18 @@ TEXT runtime·nanotime1(SB),NOSPLIT,$16-8
 	// due to stack probes inserted to avoid stack/heap collisions.
 	// See issue #20427.
 
+#ifdef GOEXPERIMENT_runtimesecret
+	// The kernel might spill our secrets onto g0
+	// erase our registers here.
+	// TODO(dmo): what is the ABI guarantee here? we use
+	// R14 later, but the function is ABI0
+	CMPL	g_secret(R14), $0
+	JEQ	nosecret
+	CALL	·secretEraseRegisters(SB)
+
+nosecret:
+#endif
+
 	MOVQ	SP, R12	// Save old SP; R12 unchanged by C code.
 
 	MOVQ	g_m(R14), BX // BX unchanged by C code.
@@ -468,7 +480,13 @@ sigtrampnog:
 // the name. The gdb source code is:
 // https://sourceware.org/git/?p=binutils-gdb.git;a=blob;f=gdb/amd64-linux-tdep.c;h=cbbac1a0c64e1deb8181b9d0ff6404e328e2979d#l178
 TEXT runtime·sigreturn__sigaction(SB),NOSPLIT,$0
-	MOVQ	$SYS_rt_sigreturn, AX
+	// The 7-byte sign-extended "48 c7 c0 0f 00 00 00" form of
+	// "MOVQ $SYS_rt_sigreturn, AX" is required: gdb and libgcc match
+	// these exact bytes to recognize the signal trampoline. The Go
+	// assembler now emits the 5-byte zero-extended "b8 0f 00 00 00"
+	// form for positive imm32, so write the bytes by hand.
+	BYTE $0x48; BYTE $0xc7; BYTE $0xc0
+	BYTE $0x0f; BYTE $0x00; BYTE $0x00; BYTE $0x00
 	SYSCALL
 	INT $3	// not reached
 
@@ -703,4 +721,37 @@ TEXT runtime·sbrk0(SB),NOSPLIT,$0-8
 	MOVL	$SYS_brk, AX
 	SYSCALL
 	MOVQ	AX, ret+0(FP)
+	RET
+
+// func vgetrandom1(buf *byte, length uintptr, flags uint32, state uintptr, stateSize uintptr) int
+TEXT runtime·vgetrandom1<ABIInternal>(SB),NOSPLIT,$16-48
+	MOVQ	SI, R8 // stateSize
+	MOVL	CX, DX // flags
+	MOVQ	DI, CX // state
+	MOVQ	BX, SI // length
+	MOVQ	AX, DI // buf
+
+	MOVQ	SP, R12
+
+	MOVQ	runtime·vdsoGetrandomSym(SB), AX
+	MOVQ	g_m(R14), BX
+
+	MOVQ	m_vdsoPC(BX), R9
+	MOVQ	R9, 0(SP)
+	MOVQ	m_vdsoSP(BX), R9
+	MOVQ	R9, 8(SP)
+	LEAQ	buf+0(FP), R9
+	MOVQ	R9, m_vdsoSP(BX)
+	MOVQ	-8(R9), R9
+	MOVQ	R9, m_vdsoPC(BX)
+
+	ANDQ	$~15, SP
+
+	CALL	AX
+
+	MOVQ	R12, SP
+	MOVQ	8(SP), R9
+	MOVQ	R9, m_vdsoSP(BX)
+	MOVQ	0(SP), R9
+	MOVQ	R9, m_vdsoPC(BX)
 	RET

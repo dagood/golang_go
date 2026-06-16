@@ -8,6 +8,7 @@
 package ld
 
 import (
+	"bytes"
 	"cmd/internal/objabi"
 	"cmd/internal/sys"
 	"cmd/link/internal/loader"
@@ -16,6 +17,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"internal/buildcfg"
+	"math"
+	"os"
+	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -146,9 +151,139 @@ const (
 	IMAGE_REL_BASED_DIR64   = 10
 )
 
+// IMAGE_LOAD_CONFIG_DIRECTORY64.GuardFlags and IMAGE_LOAD_CONFIG_DIRECTORY32.GuardFlags
+// values. These can be combined together.
 const (
-	PeMinimumTargetMajorVersion = 6
-	PeMinimumTargetMinorVersion = 1
+	IMAGE_GUARD_CF_INSTRUMENTED                    = 0x00000100 // Module performs control flow integrity checks using system-supplied support
+	IMAGE_GUARD_CFW_INSTRUMENTED                   = 0x00000200 // Module performs control flow and write integrity checks
+	IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT          = 0x00000400 // Module contains valid control flow target metadata
+	IMAGE_GUARD_SECURITY_COOKIE_UNUSED             = 0x00000800 // Module does not make use of the /GS security cookie
+	IMAGE_GUARD_PROTECT_DELAYLOAD_IAT              = 0x00001000 // Module supports read only delay load IAT
+	IMAGE_GUARD_DELAYLOAD_IAT_IN_ITS_OWN_SECTION   = 0x00002000 // Delayload import table in its own .didat section (with nothing else in it) that can be freely reprotected
+	IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT = 0x00004000 // Module contains suppressed export information
+	IMAGE_GUARD_CF_ENABLE_EXPORT_SUPPRESSION       = 0x00008000 // Module enables suppression of exports
+	IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT          = 0x00010000 // Module contains longjmp target information
+	IMAGE_GUARD_RF_INSTRUMENTED                    = 0x00020000 // Module contains return flow instrumentation and metadata
+	IMAGE_GUARD_RF_ENABLE                          = 0x00040000 // Module requests that the OS enable return flow protection
+	IMAGE_GUARD_RF_STRICT                          = 0x00080000 // Module requests that the OS enable return flow protection in strict mode
+	IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_MASK        = 0xF0000000 // Stride of Guard CF function table encoded in these bits (additional count of bytes per element)
+	IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_SHIFT       = 28         // Shift to right-justify Guard CF function table stride
+)
+
+type IMAGE_LOAD_CONFIG_CODE_INTEGRITY struct {
+	Flags         uint16
+	Catalog       uint16
+	CatalogOffset uint32
+	Reserved      uint32
+}
+
+type IMAGE_LOAD_CONFIG_DIRECTORY32 struct {
+	Size                                     uint32
+	TimeDateStamp                            uint32
+	MajorVersion                             uint16
+	MinorVersion                             uint16
+	GlobalFlagsClear                         uint32
+	GlobalFlagsSet                           uint32
+	CriticalSectionDefaultTimeout            uint32
+	DeCommitFreeBlockThreshold               uint32
+	DeCommitTotalFreeThreshold               uint32
+	LockPrefixTable                          uint32
+	MaximumAllocationSize                    uint32
+	VirtualMemoryThreshold                   uint32
+	ProcessHeapFlags                         uint32
+	ProcessAffinityMask                      uint32
+	CSDVersion                               uint16
+	DependentLoadFlags                       uint16
+	EditList                                 uint32
+	SecurityCookie                           uint32
+	SEHandlerTable                           uint32
+	SEHandlerCount                           uint32
+	GuardCFCheckFunctionPointer              uint32
+	GuardCFDispatchFunctionPointer           uint32
+	GuardCFFunctionTable                     uint32
+	GuardCFFunctionCount                     uint32
+	GuardFlags                               uint32
+	CodeIntegrity                            IMAGE_LOAD_CONFIG_CODE_INTEGRITY
+	GuardAddressTakenIatEntryTable           uint32
+	GuardAddressTakenIatEntryCount           uint32
+	GuardLongJumpTargetTable                 uint32
+	GuardLongJumpTargetCount                 uint32
+	DynamicValueRelocTable                   uint32
+	CHPEMetadataPointer                      uint32
+	GuardRFFailureRoutine                    uint32
+	GuardRFFailureRoutineFunctionPointer     uint32
+	DynamicValueRelocTableOffset             uint32
+	DynamicValueRelocTableSection            uint16
+	Reserved2                                uint16
+	GuardRFVerifyStackPointerFunctionPointer uint32
+	HotPatchTableOffset                      uint32
+	Reserved3                                uint32
+	EnclaveConfigurationPointer              uint32
+	VolatileMetadataPointer                  uint32
+	GuardEHContinuationTable                 uint32
+	GuardEHContinuationCount                 uint32
+	GuardXFGCheckFunctionPointer             uint32
+	GuardXFGDispatchFunctionPointer          uint32
+	GuardXFGTableDispatchFunctionPointer     uint32
+	CastGuardOsDeterminedFailureMode         uint32
+	GuardMemcpyFunctionPointer               uint32
+}
+
+type IMAGE_LOAD_CONFIG_DIRECTORY64 struct {
+	Size                                     uint32
+	TimeDateStamp                            uint32
+	MajorVersion                             uint16
+	MinorVersion                             uint16
+	GlobalFlagsClear                         uint32
+	GlobalFlagsSet                           uint32
+	CriticalSectionDefaultTimeout            uint32
+	DeCommitFreeBlockThreshold               uint64
+	DeCommitTotalFreeThreshold               uint64
+	LockPrefixTable                          uint64
+	MaximumAllocationSize                    uint64
+	VirtualMemoryThreshold                   uint64
+	ProcessAffinityMask                      uint64
+	ProcessHeapFlags                         uint32
+	CSDVersion                               uint16
+	DependentLoadFlags                       uint16
+	EditList                                 uint64
+	SecurityCookie                           uint64
+	SEHandlerTable                           uint64
+	SEHandlerCount                           uint64
+	GuardCFCheckFunctionPointer              uint64
+	GuardCFDispatchFunctionPointer           uint64
+	GuardCFFunctionTable                     uint64
+	GuardCFFunctionCount                     uint64
+	GuardFlags                               uint32
+	CodeIntegrity                            IMAGE_LOAD_CONFIG_CODE_INTEGRITY
+	GuardAddressTakenIatEntryTable           uint64
+	GuardAddressTakenIatEntryCount           uint64
+	GuardLongJumpTargetTable                 uint64
+	GuardLongJumpTargetCount                 uint64
+	DynamicValueRelocTable                   uint64
+	CHPEMetadataPointer                      uint64
+	GuardRFFailureRoutine                    uint64
+	GuardRFFailureRoutineFunctionPointer     uint64
+	DynamicValueRelocTableOffset             uint32
+	DynamicValueRelocTableSection            uint16
+	Reserved2                                uint16
+	GuardRFVerifyStackPointerFunctionPointer uint64
+	HotPatchTableOffset                      uint32
+	Reserved3                                uint32
+	EnclaveConfigurationPointer              uint64
+	VolatileMetadataPointer                  uint64
+	GuardEHContinuationTable                 uint64
+	GuardEHContinuationCount                 uint64
+	GuardXFGCheckFunctionPointer             uint64
+	GuardXFGDispatchFunctionPointer          uint64
+	GuardXFGTableDispatchFunctionPointer     uint64
+	CastGuardOsDeterminedFailureMode         uint64
+	GuardMemcpyFunctionPointer               uint64
+}
+
+const (
+	PeMinimumTargetMajorVersion = 10
+	PeMinimumTargetMinorVersion = 0
 )
 
 // DOS stub that prints out
@@ -304,10 +439,10 @@ var (
 	rsrcsyms    []loader.Sym
 	PESECTHEADR int32
 	PEFILEHEADR int32
-	pe64        int
+	pe64        bool
 	dr          *Dll
 
-	dexport = make([]loader.Sym, 0, 1024)
+	dexport []loader.Sym
 )
 
 // peStringTable is a COFF string table.
@@ -356,7 +491,7 @@ type peSection struct {
 // checkOffset verifies COFF section sect offset in the file.
 func (sect *peSection) checkOffset(off int64) {
 	if off != int64(sect.pointerToRawData) {
-		Errorf(nil, "%s.PointerToRawData = %#x, want %#x", sect.name, uint64(int64(sect.pointerToRawData)), uint64(off))
+		Errorf("%s.PointerToRawData = %#x, want %#x", sect.name, uint64(int64(sect.pointerToRawData)), uint64(off))
 		errorexit()
 	}
 }
@@ -365,11 +500,11 @@ func (sect *peSection) checkOffset(off int64) {
 // and file offset provided in segment seg.
 func (sect *peSection) checkSegment(seg *sym.Segment) {
 	if seg.Vaddr-uint64(PEBASE) != uint64(sect.virtualAddress) {
-		Errorf(nil, "%s.VirtualAddress = %#x, want %#x", sect.name, uint64(int64(sect.virtualAddress)), uint64(int64(seg.Vaddr-uint64(PEBASE))))
+		Errorf("%s.VirtualAddress = %#x, want %#x", sect.name, uint64(int64(sect.virtualAddress)), uint64(int64(seg.Vaddr-uint64(PEBASE))))
 		errorexit()
 	}
 	if seg.Fileoff != uint64(sect.pointerToRawData) {
-		Errorf(nil, "%s.PointerToRawData = %#x, want %#x", sect.name, uint64(int64(sect.pointerToRawData)), uint64(int64(seg.Fileoff)))
+		Errorf("%s.PointerToRawData = %#x, want %#x", sect.name, uint64(int64(sect.pointerToRawData)), uint64(int64(seg.Fileoff)))
 		errorexit()
 	}
 }
@@ -485,9 +620,6 @@ func (f *peFile) addDWARFSection(name string, size int) *peSection {
 
 // addDWARF adds DWARF information to the COFF file f.
 func (f *peFile) addDWARF() {
-	if *FlagS { // disable symbol table
-		return
-	}
 	if *FlagW { // disable dwarf
 		return
 	}
@@ -539,15 +671,12 @@ func (f *peFile) addInitArray(ctxt *Link) *peSection {
 	// that this will need to grow in the future.
 	var size int
 	var alignment uint32
-	switch buildcfg.GOARCH {
-	default:
-		Exitf("peFile.addInitArray: unsupported GOARCH=%q\n", buildcfg.GOARCH)
-	case "386", "arm":
-		size = 4
-		alignment = IMAGE_SCN_ALIGN_4BYTES
-	case "amd64", "arm64":
+	if pe64 {
 		size = 8
 		alignment = IMAGE_SCN_ALIGN_8BYTES
+	} else {
+		size = 4
+		alignment = IMAGE_SCN_ALIGN_4BYTES
 	}
 	sect := f.addSection(".ctors", size, size)
 	sect.characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | alignment
@@ -557,11 +686,10 @@ func (f *peFile) addInitArray(ctxt *Link) *peSection {
 
 	init_entry := ctxt.loader.Lookup(*flagEntrySymbol, 0)
 	addr := uint64(ctxt.loader.SymValue(init_entry)) - ctxt.loader.SymSect(init_entry).Vaddr
-	switch buildcfg.GOARCH {
-	case "386", "arm":
-		ctxt.Out.Write32(uint32(addr))
-	case "amd64", "arm64":
+	if pe64 {
 		ctxt.Out.Write64(addr)
+	} else {
+		ctxt.Out.Write32(uint32(addr))
 	}
 	return sect
 }
@@ -635,11 +763,11 @@ func (f *peFile) emitRelocations(ctxt *Link) {
 		{f.rdataSect, &Segrodata, ctxt.datap},
 		{f.dataSect, &Segdata, ctxt.datap},
 	}
-	if sehp.pdata != 0 {
-		sects = append(sects, relsect{f.pdataSect, &Segpdata, []loader.Sym{sehp.pdata}})
+	if len(sehp.pdata) != 0 {
+		sects = append(sects, relsect{f.pdataSect, &Segpdata, sehp.pdata})
 	}
-	if sehp.xdata != 0 {
-		sects = append(sects, relsect{f.xdataSect, &Segxdata, []loader.Sym{sehp.xdata}})
+	if len(sehp.xdata) != 0 {
+		sects = append(sects, relsect{f.xdataSect, &Segxdata, sehp.xdata})
 	}
 	for _, s := range sects {
 		s.peSect.emitRelocations(ctxt.Out, func() int {
@@ -655,7 +783,7 @@ dwarfLoop:
 	for i := 0; i < len(Segdwarf.Sections); i++ {
 		sect := Segdwarf.Sections[i]
 		si := dwarfp[i]
-		if si.secSym() != loader.Sym(sect.Sym) ||
+		if si.secSym() != sect.Sym ||
 			ldr.SymSect(si.secSym()) != sect {
 			panic("inconsistency between dwarfp and Segdwarf")
 		}
@@ -667,7 +795,7 @@ dwarfLoop:
 				continue dwarfLoop
 			}
 		}
-		Errorf(nil, "emitRelocations: could not find %q section", sect.Name)
+		Errorf("emitRelocations: could not find %q section", sect.Name)
 	}
 
 	if f.ctorsSect == nil {
@@ -734,7 +862,7 @@ func (f *peFile) mapToPESection(ldr *loader.Loader, s loader.Sym, linkmode LinkM
 	if linkmode != LinkExternal {
 		return f.dataSect.index, int64(v), nil
 	}
-	if ldr.SymType(s) == sym.SDATA {
+	if ldr.SymType(s).IsDATA() {
 		return f.dataSect.index, int64(v), nil
 	}
 	// Note: although address of runtime.edata (type sym.SDATA) is at the start of .bss section
@@ -777,7 +905,7 @@ func (f *peFile) writeSymbols(ctxt *Link) {
 				// so the external linker see them as Forwarder RVA exports. See:
 				//
 				//  - https://docs.microsoft.com/en-us/windows/win32/debug/pe-format#export-address-table
-				//  - https://sourceware.org/git/?p=binutils-gdb.git;a=blob;f=ld/pe-dll.c;h=e7b82ba6ffadf74dc1b9ee71dc13d48336941e51;hb=HEAD#l972)
+				//  - https://sourceware.org/git/?p=binutils-gdb.git;a=blob;f=ld/pe-dll.c;h=e7b82ba6ffadf74dc1b9ee71dc13d48336941e51;hb=HEAD#l972
 				//
 				// CL 317917 changes "." to ":" in symbols name, so these symbols can not be
 				// found by external linker anymore. So a hacky way is adding the
@@ -791,8 +919,8 @@ func (f *peFile) writeSymbols(ctxt *Link) {
 		name = mangleABIName(ctxt, ldr, s, name)
 
 		var peSymType uint16 = IMAGE_SYM_TYPE_NULL
-		switch t {
-		case sym.STEXT, sym.SDYNIMPORT, sym.SHOSTOBJ, sym.SUNDEFEXT:
+		switch {
+		case t.IsText(), t == sym.SDYNIMPORT, t == sym.SHOSTOBJ, t == sym.SUNDEFEXT:
 			// Microsoft's PE documentation is contradictory. It says that the symbol's complex type
 			// is stored in the pesym.Type most significant byte, but MSVC, LLVM, and mingw store it
 			// in the 4 high bits of the less significant byte. Also, the PE documentation says that
@@ -809,7 +937,8 @@ func (f *peFile) writeSymbols(ctxt *Link) {
 			}
 		}
 		class := IMAGE_SYM_CLASS_EXTERNAL
-		if ldr.IsFileLocal(s) || ldr.AttrVisibilityHidden(s) || ldr.AttrLocal(s) {
+		if ldr.IsFileLocal(s) || ldr.AttrVisibilityHidden(s) || ldr.AttrLocal(s) ||
+			(ldr.IsContentHashed(s) && ldr.SymType(s).IsText()) {
 			class = IMAGE_SYM_CLASS_STATIC
 		}
 		f.writeSymbol(ctxt.Out, ldr, s, name, value, sect, peSymType, uint8(class))
@@ -826,11 +955,11 @@ func (f *peFile) writeSymbols(ctxt *Link) {
 
 	// Add special runtime.text and runtime.etext symbols.
 	s := ldr.Lookup("runtime.text", 0)
-	if ldr.SymType(s) == sym.STEXT {
+	if ldr.SymType(s).IsText() {
 		addsym(s)
 	}
 	s = ldr.Lookup("runtime.etext", 0)
-	if ldr.SymType(s) == sym.STEXT {
+	if ldr.SymType(s).IsText() {
 		addsym(s)
 	}
 
@@ -856,7 +985,7 @@ func (f *peFile) writeSymbols(ctxt *Link) {
 			continue
 		}
 		t := ldr.SymType(s)
-		if t >= sym.SELFRXSECT && t < sym.SXREF { // data sections handled in dodata
+		if t >= sym.SELFRXSECT && t < sym.SFirstUnallocated { // data sections handled in dodata
 			if t == sym.STLSBSS {
 				continue
 			}
@@ -915,8 +1044,6 @@ func (f *peFile) writeFileHeader(ctxt *Link) {
 		fh.Machine = pe.IMAGE_FILE_MACHINE_AMD64
 	case sys.I386:
 		fh.Machine = pe.IMAGE_FILE_MACHINE_I386
-	case sys.ARM:
-		fh.Machine = pe.IMAGE_FILE_MACHINE_ARMNT
 	case sys.ARM64:
 		fh.Machine = pe.IMAGE_FILE_MACHINE_ARM64
 	}
@@ -936,7 +1063,7 @@ func (f *peFile) writeFileHeader(ctxt *Link) {
 			}
 		}
 	}
-	if pe64 != 0 {
+	if pe64 {
 		var oh64 pe.OptionalHeader64
 		fh.SizeOfOptionalHeader = uint16(binary.Size(&oh64))
 		fh.Characteristics |= pe.IMAGE_FILE_LARGE_ADDRESS_AWARE
@@ -957,7 +1084,7 @@ func (f *peFile) writeOptionalHeader(ctxt *Link) {
 	var oh pe.OptionalHeader32
 	var oh64 pe.OptionalHeader64
 
-	if pe64 != 0 {
+	if pe64 {
 		oh64.Magic = 0x20b // PE32+
 	} else {
 		oh.Magic = 0x10b // PE32
@@ -1078,13 +1205,13 @@ func (f *peFile) writeOptionalHeader(ctxt *Link) {
 	oh64.NumberOfRvaAndSizes = 16
 	oh.NumberOfRvaAndSizes = 16
 
-	if pe64 != 0 {
+	if pe64 {
 		oh64.DataDirectory = f.dataDirectory
 	} else {
 		oh.DataDirectory = f.dataDirectory
 	}
 
-	if pe64 != 0 {
+	if pe64 {
 		binary.Write(ctxt.Out, binary.LittleEndian, &oh64)
 	} else {
 		binary.Write(ctxt.Out, binary.LittleEndian, &oh)
@@ -1098,19 +1225,11 @@ func Peinit(ctxt *Link) {
 
 	if ctxt.Arch.PtrSize == 8 {
 		// 64-bit architectures
-		pe64 = 1
-		PEBASE = 1 << 32
-		if ctxt.Arch.Family == sys.AMD64 {
-			// TODO(rsc): For cgo we currently use 32-bit relocations
-			// that fail when PEBASE is too large.
-			// We need to fix this, but for now, use a smaller PEBASE.
-			PEBASE = 1 << 22
-		}
+		pe64 = true
 		var oh64 pe.OptionalHeader64
 		l = binary.Size(&oh64)
 	} else {
 		// 32-bit architectures
-		PEBASE = 1 << 22
 		var oh pe.OptionalHeader32
 		l = binary.Size(&oh)
 	}
@@ -1124,6 +1243,13 @@ func Peinit(ctxt *Link) {
 		PEFILEALIGN = 0
 		// We are creating an object file. The absolute address is irrelevant.
 		PEBASE = 0
+	} else {
+		// Use the same base image address as MSVC and LLVM.
+		if pe64 {
+			PEBASE = 0x140000000
+		} else {
+			PEBASE = 0x400000
+		}
 	}
 
 	var sh [16]pe.SectionHeader32
@@ -1146,14 +1272,37 @@ func Peinit(ctxt *Link) {
 			ctxt.loader.SetAttrSpecial(sb.Sym(), true)
 			ctxt.loader.SetAttrLocal(sb.Sym(), true)
 		}
+
+		// The _load_config_used symbol is required to be present on modern
+		// Windows. We later wire this up to the PE data directory.
+		sb := ctxt.loader.CreateSymForUpdate("_load_config_used", 0)
+		sb.SetType(sym.SRODATA)
+		sb.SetAlign(int32(ctxt.Arch.PtrSize))
+		var buf bytes.Buffer
+		if pe64 {
+			lc := IMAGE_LOAD_CONFIG_DIRECTORY64{
+				Size:       uint32(binary.Size(&IMAGE_LOAD_CONFIG_DIRECTORY64{})),
+				GuardFlags: IMAGE_GUARD_SECURITY_COOKIE_UNUSED,
+			}
+			binary.Write(&buf, binary.LittleEndian, &lc)
+		} else {
+			lc := IMAGE_LOAD_CONFIG_DIRECTORY32{
+				Size:       uint32(binary.Size(&IMAGE_LOAD_CONFIG_DIRECTORY32{})),
+				GuardFlags: IMAGE_GUARD_SECURITY_COOKIE_UNUSED,
+			}
+			binary.Write(&buf, binary.LittleEndian, &lc)
+		}
+		sb.SetData(buf.Bytes())
+		sb.SetSize(int64(buf.Len()))
+		ctxt.loader.SetAttrReachable(sb.Sym(), true)
 	}
 
 	HEADR = PEFILEHEADR
-	if *FlagTextAddr == -1 {
-		*FlagTextAddr = PEBASE + int64(PESECTHEADR)
-	}
 	if *FlagRound == -1 {
-		*FlagRound = int(PESECTALIGN)
+		*FlagRound = PESECTALIGN
+	}
+	if *FlagTextAddr == -1 {
+		*FlagTextAddr = Rnd(PEBASE, *FlagRound) + int64(PESECTHEADR)
 	}
 }
 
@@ -1314,14 +1463,14 @@ func addimports(ctxt *Link, datsect *peSection) {
 	for d := dr; d != nil; d = d.next {
 		d.thunkoff = uint64(ctxt.Out.Offset()) - n
 		for m := d.ms; m != nil; m = m.next {
-			if pe64 != 0 {
+			if pe64 {
 				ctxt.Out.Write64(m.off)
 			} else {
 				ctxt.Out.Write32(uint32(m.off))
 			}
 		}
 
-		if pe64 != 0 {
+		if pe64 {
 			ctxt.Out.Write64(0)
 		} else {
 			ctxt.Out.Write32(0)
@@ -1343,14 +1492,14 @@ func addimports(ctxt *Link, datsect *peSection) {
 	ctxt.Out.SeekSet(int64(uint64(datsect.pointerToRawData) + ftbase))
 	for d := dr; d != nil; d = d.next {
 		for m := d.ms; m != nil; m = m.next {
-			if pe64 != 0 {
+			if pe64 {
 				ctxt.Out.Write64(m.off)
 			} else {
 				ctxt.Out.Write32(uint32(m.off))
 			}
 		}
 
-		if pe64 != 0 {
+		if pe64 {
 			ctxt.Out.Write64(0)
 		} else {
 			ctxt.Out.Write32(0)
@@ -1390,7 +1539,7 @@ func initdynexport(ctxt *Link) {
 		if !ldr.AttrReachable(s) || !ldr.AttrCgoExportDynamic(s) {
 			continue
 		}
-		if len(dexport)+1 > cap(dexport) {
+		if len(dexport) >= math.MaxUint16 {
 			ctxt.Errorf(s, "pe dynexport table is full")
 			errorexit()
 		}
@@ -1489,10 +1638,6 @@ type peBaseRelocBlock struct {
 // it can be sorted.
 type pePages []uint32
 
-func (p pePages) Len() int           { return len(p) }
-func (p pePages) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
-func (p pePages) Less(i, j int) bool { return p[i] < p[j] }
-
 // A PE base relocation table is a list of blocks, where each block
 // contains relocation information for a single page. The blocks
 // must be emitted in order of page virtual address.
@@ -1515,7 +1660,7 @@ func (rt *peBaseRelocTable) addentry(ldr *loader.Loader, s loader.Sym, r *loader
 	const pageSize = 0x1000
 	const pageMask = pageSize - 1
 
-	addr := ldr.SymValue(s) + int64(r.Off()) - int64(PEBASE)
+	addr := ldr.SymValue(s) + int64(r.Off()) - PEBASE
 	page := uint32(addr &^ pageMask)
 	off := uint32(addr & pageMask)
 
@@ -1546,10 +1691,23 @@ func (rt *peBaseRelocTable) write(ctxt *Link) {
 	out := ctxt.Out
 
 	// sort the pages array
-	sort.Sort(rt.pages)
+	slices.Sort(rt.pages)
+
+	// .reloc section must be 32-bit aligned
+	if out.Offset()&3 != 0 {
+		Errorf("internal error, start of .reloc not 32-bit aligned")
+	}
 
 	for _, p := range rt.pages {
 		b := rt.blocks[p]
+
+		// Add a dummy entry at the end of the list if we have an
+		// odd number of entries, so as to ensure that the next
+		// block starts on a 32-bit boundary (see issue 68260).
+		if len(b.entries)&1 != 0 {
+			b.entries = append(b.entries, peBaseRelocEntry{})
+		}
+
 		const sizeOfPEbaseRelocBlock = 8 // 2 * sizeof(uint32)
 		blockSize := uint32(sizeOfPEbaseRelocBlock + len(b.entries)*2)
 		out.Write32(p)
@@ -1569,9 +1727,6 @@ func addPEBaseRelocSym(ldr *loader.Loader, s loader.Sym, rt *peBaseRelocTable) {
 			continue
 		}
 		if r.Siz() == 0 { // informational relocation
-			continue
-		}
-		if r.Type() == objabi.R_DWARFFILEREF {
 			continue
 		}
 		rs := r.Sym()
@@ -1634,12 +1789,11 @@ func addPEBaseReloc(ctxt *Link) {
 func (ctxt *Link) dope() {
 	initdynimport(ctxt)
 	initdynexport(ctxt)
-	writeSEH(ctxt)
 }
 
 func setpersrc(ctxt *Link, syms []loader.Sym) {
 	if len(rsrcsyms) != 0 {
-		Errorf(nil, "too many .rsrc sections")
+		Errorf("too many .rsrc sections")
 	}
 	rsrcsyms = syms
 }
@@ -1711,6 +1865,14 @@ func asmbPe(ctxt *Link) {
 	ro.checkSegment(&Segrodata)
 	pefile.rdataSect = ro
 
+	// This should have been added in Peinit and by now is part of the
+	// just-written .rdata section.
+	s := ctxt.loader.Lookup("_load_config_used", 0)
+	if s != 0 {
+		pefile.dataDirectory[pe.IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress = uint32(ctxt.loader.SymValue(s) - PEBASE)
+		pefile.dataDirectory[pe.IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].Size = uint32(ctxt.loader.SymSize(s))
+	}
+
 	var d *peSection
 	if ctxt.LinkMode != LinkExternal {
 		d = pefile.addSection(".data", int(Segdata.Length), int(Segdata.Filelen))
@@ -1749,4 +1911,47 @@ func asmbPe(ctxt *Link) {
 	}
 
 	pewrite(ctxt)
+}
+
+// peCreateExportFile creates a file with exported symbols for Windows .def files.
+// ld will export all symbols, even those not marked for export, unless a .def file is provided.
+func peCreateExportFile(ctxt *Link, libName string) (fname string) {
+	fname = filepath.Join(*flagTmpdir, "export_file.def")
+	var buf bytes.Buffer
+
+	if ctxt.BuildMode == BuildModeCShared {
+		fmt.Fprintf(&buf, "LIBRARY %s\n", libName)
+	}
+	buf.WriteString("EXPORTS\n")
+
+	ldr := ctxt.loader
+	var exports []string
+	for s := range ldr.ForAllCgoExportStatic() {
+		extname := ldr.SymExtname(s)
+		if !strings.HasPrefix(extname, "_cgoexp_") {
+			continue
+		}
+		if ldr.IsFileLocal(s) {
+			continue // Only export non-static symbols
+		}
+		// Retrieve the name of the initial symbol
+		// exported by cgo.
+		// The corresponding Go symbol is:
+		// _cgoexp_hashcode_symname.
+		name := strings.SplitN(extname, "_", 4)[3]
+		exports = append(exports, name)
+	}
+	if len(exports) == 0 {
+		// See runtime/cgo/windows.go for details.
+		exports = append(exports, "_cgo_stub_export")
+	}
+	sort.Strings(exports)
+	buf.WriteString(strings.Join(exports, "\n"))
+
+	err := os.WriteFile(fname, buf.Bytes(), 0666)
+	if err != nil {
+		Errorf("WriteFile %s failed: %v", fname, err)
+	}
+
+	return fname
 }

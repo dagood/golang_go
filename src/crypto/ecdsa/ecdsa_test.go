@@ -2,25 +2,34 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package ecdsa
+package ecdsa_test
 
 import (
 	"bufio"
 	"bytes"
 	"compress/bzip2"
+	"crypto"
+	. "crypto/ecdsa"
 	"crypto/elliptic"
-	"crypto/internal/bigmod"
+	"crypto/internal/cryptotest"
+	"crypto/internal/fips140/ecdsa"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
+	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"hash"
 	"io"
 	"math/big"
 	"os"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/cryptobyte"
+	"golang.org/x/crypto/cryptobyte/asn1"
 )
 
 func testAllCurves(t *testing.T, f func(*testing.T, elliptic.Curve)) {
@@ -39,9 +48,11 @@ func testAllCurves(t *testing.T, f func(*testing.T, elliptic.Curve)) {
 	}
 	for _, test := range tests {
 		curve := test.curve
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			f(t, curve)
+		cryptotest.TestAllImplementations(t, "ecdsa", func(t *testing.T) {
+			t.Run(test.name, func(t *testing.T) {
+				t.Parallel()
+				f(t, curve)
+			})
 		})
 	}
 }
@@ -97,6 +108,81 @@ func TestSignAndVerifyASN1(t *testing.T) {
 	testAllCurves(t, testSignAndVerifyASN1)
 }
 
+func TestEmptyHashRejection(t *testing.T) {
+	testAllCurves(t, testEmptyHashRejection)
+}
+
+func testEmptyHashRejection(t *testing.T, c elliptic.Curve) {
+	priv, err := GenerateKey(c, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("SignASN1", func(t *testing.T) {
+		_, err := SignASN1(rand.Reader, priv, nil)
+		if err == nil {
+			t.Fatal("SignASN1 with nil hash should fail")
+		}
+		if !strings.Contains(err.Error(), "cannot be empty") {
+			t.Errorf("unexpected error: %v", err)
+		}
+
+		_, err = SignASN1(rand.Reader, priv, []byte{})
+		if err == nil {
+			t.Fatal("SignASN1 with empty hash should fail")
+		}
+		if !strings.Contains(err.Error(), "cannot be empty") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("Sign", func(t *testing.T) {
+		_, err := priv.Sign(rand.Reader, nil, nil)
+		if err == nil {
+			t.Fatal("Sign with nil hash should fail")
+		}
+		if !strings.Contains(err.Error(), "cannot be empty") {
+			t.Errorf("unexpected error: %v", err)
+		}
+
+		_, err = priv.Sign(rand.Reader, []byte{}, nil)
+		if err == nil {
+			t.Fatal("Sign with empty hash should fail")
+		}
+		if !strings.Contains(err.Error(), "cannot be empty") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("SignDeterministic", func(t *testing.T) {
+		if _, err := priv.Sign(nil, nil, nil); err == nil {
+			t.Error("deterministic Sign with nil hash should fail")
+		}
+		if _, err := priv.Sign(nil, []byte{}, nil); err == nil {
+			t.Error("deterministic Sign with empty hash should fail")
+		}
+	})
+
+	t.Run("VerifyASN1", func(t *testing.T) {
+		// Create a valid signature first
+		hash := []byte("test hash")
+		sig, err := SignASN1(rand.Reader, priv, hash)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Verify with nil hash should return false
+		if VerifyASN1(&priv.PublicKey, nil, sig) {
+			t.Error("VerifyASN1 with nil hash should return false")
+		}
+
+		// Verify with empty hash should return false
+		if VerifyASN1(&priv.PublicKey, []byte{}, sig) {
+			t.Error("VerifyASN1 with empty hash should return false")
+		}
+	})
+}
+
 func testSignAndVerifyASN1(t *testing.T, c elliptic.Curve) {
 	priv, _ := GenerateKey(c, rand.Reader)
 
@@ -114,6 +200,40 @@ func testSignAndVerifyASN1(t *testing.T, c elliptic.Curve) {
 	hashed[0] ^= 0xff
 	if VerifyASN1(&priv.PublicKey, hashed, sig) {
 		t.Errorf("VerifyASN1 always works!")
+	}
+}
+
+func TestSignHashLength(t *testing.T) {
+	testAllCurves(t, testSignHashLength)
+}
+
+func testSignHashLength(t *testing.T, c elliptic.Curve) {
+	priv, err := GenerateKey(c, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	digest := sha256.Sum256([]byte("message"))
+
+	// opts == nil is allowed and skips the length check.
+	if _, err := priv.Sign(rand.Reader, digest[:], nil); err != nil {
+		t.Errorf("Sign with nil opts: %v", err)
+	}
+
+	// opts != nil with matching hash length succeeds.
+	if _, err := priv.Sign(rand.Reader, digest[:], crypto.SHA256); err != nil {
+		t.Errorf("Sign with matching hash: %v", err)
+	}
+
+	// opts != nil with mismatched hash length fails.
+	if _, err := priv.Sign(rand.Reader, digest[:], crypto.SHA384); err == nil {
+		t.Error("Sign with mismatched hash length should fail")
+	}
+	if _, err := priv.Sign(rand.Reader, digest[:len(digest)-1], crypto.SHA256); err == nil {
+		t.Error("Sign with short digest should fail")
+	}
+	if _, err := priv.Sign(rand.Reader, nil, crypto.SHA256); err == nil {
+		t.Error("Sign with empty digest should fail")
 	}
 }
 
@@ -147,6 +267,15 @@ func testNonceSafety(t *testing.T, c elliptic.Curve) {
 		t.Errorf("the nonce used for two different messages was the same")
 	}
 }
+
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(b []byte) (int, error) { return f(b) }
+
+var zeroReader = readerFunc(func(b []byte) (int, error) {
+	clear(b)
+	return len(b), nil
+})
 
 func TestINDCCA(t *testing.T) {
 	testAllCurves(t, testINDCCA)
@@ -186,6 +315,10 @@ func fromHex(s string) *big.Int {
 }
 
 func TestVectors(t *testing.T) {
+	cryptotest.TestAllImplementations(t, "ecdsa", testVectors)
+}
+
+func testVectors(t *testing.T) {
 	// This test runs the full set of NIST test vectors from
 	// https://csrc.nist.gov/groups/STM/cavp/documents/dss/186-3ecdsatestvectors.zip
 	//
@@ -339,80 +472,6 @@ func testZeroHashSignature(t *testing.T, curve elliptic.Curve) {
 	}
 }
 
-func TestRandomPoint(t *testing.T) {
-	t.Run("P-224", func(t *testing.T) { testRandomPoint(t, p224()) })
-	t.Run("P-256", func(t *testing.T) { testRandomPoint(t, p256()) })
-	t.Run("P-384", func(t *testing.T) { testRandomPoint(t, p384()) })
-	t.Run("P-521", func(t *testing.T) { testRandomPoint(t, p521()) })
-}
-
-func testRandomPoint[Point nistPoint[Point]](t *testing.T, c *nistCurve[Point]) {
-	t.Cleanup(func() { testingOnlyRejectionSamplingLooped = nil })
-	var loopCount int
-	testingOnlyRejectionSamplingLooped = func() { loopCount++ }
-
-	// A sequence of all ones will generate 2^N-1, which should be rejected.
-	// (Unless, for example, we are masking too many bits.)
-	r := io.MultiReader(bytes.NewReader(bytes.Repeat([]byte{0xff}, 100)), rand.Reader)
-	if k, p, err := randomPoint(c, r); err != nil {
-		t.Fatal(err)
-	} else if k.IsZero() == 1 {
-		t.Error("k is zero")
-	} else if p.Bytes()[0] != 4 {
-		t.Error("p is infinity")
-	}
-	if loopCount == 0 {
-		t.Error("overflow was not rejected")
-	}
-	loopCount = 0
-
-	// A sequence of all zeroes will generate zero, which should be rejected.
-	r = io.MultiReader(bytes.NewReader(bytes.Repeat([]byte{0}, 100)), rand.Reader)
-	if k, p, err := randomPoint(c, r); err != nil {
-		t.Fatal(err)
-	} else if k.IsZero() == 1 {
-		t.Error("k is zero")
-	} else if p.Bytes()[0] != 4 {
-		t.Error("p is infinity")
-	}
-	if loopCount == 0 {
-		t.Error("zero was not rejected")
-	}
-	loopCount = 0
-
-	// P-256 has a 2⁻³² chance or randomly hitting a rejection. For P-224 it's
-	// 2⁻¹¹², for P-384 it's 2⁻¹⁹⁴, and for P-521 it's 2⁻²⁶², so if we hit in
-	// tests, something is horribly wrong. (For example, we are masking the
-	// wrong bits.)
-	if c.curve == elliptic.P256() {
-		return
-	}
-	if k, p, err := randomPoint(c, rand.Reader); err != nil {
-		t.Fatal(err)
-	} else if k.IsZero() == 1 {
-		t.Error("k is zero")
-	} else if p.Bytes()[0] != 4 {
-		t.Error("p is infinity")
-	}
-	if loopCount > 0 {
-		t.Error("unexpected rejection")
-	}
-}
-
-func TestHashToNat(t *testing.T) {
-	t.Run("P-224", func(t *testing.T) { testHashToNat(t, p224()) })
-	t.Run("P-256", func(t *testing.T) { testHashToNat(t, p256()) })
-	t.Run("P-384", func(t *testing.T) { testHashToNat(t, p384()) })
-	t.Run("P-521", func(t *testing.T) { testHashToNat(t, p521()) })
-}
-
-func testHashToNat[Point nistPoint[Point]](t *testing.T, c *nistCurve[Point]) {
-	for l := 0; l < 600; l++ {
-		h := bytes.Repeat([]byte{0xff}, l)
-		hashToNat(c, bigmod.NewNat(), h)
-	}
-}
-
 func TestZeroSignature(t *testing.T) {
 	testAllCurves(t, testZeroSignature)
 }
@@ -428,7 +487,7 @@ func testZeroSignature(t *testing.T, curve elliptic.Curve) {
 	}
 }
 
-func TestNegtativeSignature(t *testing.T) {
+func TestNegativeSignature(t *testing.T) {
 	testAllCurves(t, testNegativeSignature)
 }
 
@@ -494,23 +553,371 @@ func testRMinusNSignature(t *testing.T, curve elliptic.Curve) {
 	}
 }
 
-func randomPointForCurve(curve elliptic.Curve, rand io.Reader) error {
-	switch curve.Params() {
-	case elliptic.P224().Params():
-		_, _, err := randomPoint(p224(), rand)
-		return err
-	case elliptic.P256().Params():
-		_, _, err := randomPoint(p256(), rand)
-		return err
-	case elliptic.P384().Params():
-		_, _, err := randomPoint(p384(), rand)
-		return err
-	case elliptic.P521().Params():
-		_, _, err := randomPoint(p521(), rand)
-		return err
-	default:
-		panic("unknown curve")
+func TestRFC6979(t *testing.T) {
+	t.Run("P-224", func(t *testing.T) {
+		testRFC6979(t, elliptic.P224(),
+			"F220266E1105BFE3083E03EC7A3A654651F45E37167E88600BF257C1",
+			"00CF08DA5AD719E42707FA431292DEA11244D64FC51610D94B130D6C",
+			"EEAB6F3DEBE455E3DBF85416F7030CBD94F34F2D6F232C69F3C1385A",
+			"sample",
+			"61AA3DA010E8E8406C656BC477A7A7189895E7E840CDFE8FF42307BA",
+			"BC814050DAB5D23770879494F9E0A680DC1AF7161991BDE692B10101")
+		testRFC6979(t, elliptic.P224(),
+			"F220266E1105BFE3083E03EC7A3A654651F45E37167E88600BF257C1",
+			"00CF08DA5AD719E42707FA431292DEA11244D64FC51610D94B130D6C",
+			"EEAB6F3DEBE455E3DBF85416F7030CBD94F34F2D6F232C69F3C1385A",
+			"test",
+			"AD04DDE87B84747A243A631EA47A1BA6D1FAA059149AD2440DE6FBA6",
+			"178D49B1AE90E3D8B629BE3DB5683915F4E8C99FDF6E666CF37ADCFD")
+	})
+	t.Run("P-256", func(t *testing.T) {
+		// This vector was bruteforced to find a message that causes the
+		// generation of k to loop. It was checked against
+		// github.com/codahale/rfc6979 (https://go.dev/play/p/FK5-fmKf7eK),
+		// OpenSSL 3.2.0 (https://github.com/openssl/openssl/pull/23130),
+		// and python-ecdsa:
+		//
+		//    ecdsa.keys.SigningKey.from_secret_exponent(
+		//        0xC9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721,
+		//        ecdsa.curves.curve_by_name("NIST256p"), hashlib.sha256).sign_deterministic(
+		//        b"wv[vnX", hashlib.sha256, lambda r, s, order: print(hex(r), hex(s)))
+		//
+		testRFC6979(t, elliptic.P256(),
+			"C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721",
+			"60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6",
+			"7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299",
+			"wv[vnX",
+			"EFD9073B652E76DA1B5A019C0E4A2E3FA529B035A6ABB91EF67F0ED7A1F21234",
+			"3DB4706C9D9F4A4FE13BB5E08EF0FAB53A57DBAB2061C83A35FA411C68D2BA33")
+
+		// The remaining vectors are from RFC 6979.
+		testRFC6979(t, elliptic.P256(),
+			"C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721",
+			"60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6",
+			"7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299",
+			"sample",
+			"EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716",
+			"F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8")
+		testRFC6979(t, elliptic.P256(),
+			"C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721",
+			"60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6",
+			"7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299",
+			"test",
+			"F1ABB023518351CD71D881567B1EA663ED3EFCF6C5132B354F28D3B0B7D38367",
+			"019F4113742A2B14BD25926B49C649155F267E60D3814B4C0CC84250E46F0083")
+	})
+	t.Run("P-384", func(t *testing.T) {
+		testRFC6979(t, elliptic.P384(),
+			"6B9D3DAD2E1B8C1C05B19875B6659F4DE23C3B667BF297BA9AA47740787137D896D5724E4C70A825F872C9EA60D2EDF5",
+			"EC3A4E415B4E19A4568618029F427FA5DA9A8BC4AE92E02E06AAE5286B300C64DEF8F0EA9055866064A254515480BC13",
+			"8015D9B72D7D57244EA8EF9AC0C621896708A59367F9DFB9F54CA84B3F1C9DB1288B231C3AE0D4FE7344FD2533264720",
+			"sample",
+			"21B13D1E013C7FA1392D03C5F99AF8B30C570C6F98D4EA8E354B63A21D3DAA33BDE1E888E63355D92FA2B3C36D8FB2CD",
+			"F3AA443FB107745BF4BD77CB3891674632068A10CA67E3D45DB2266FA7D1FEEBEFDC63ECCD1AC42EC0CB8668A4FA0AB0")
+		testRFC6979(t, elliptic.P384(),
+			"6B9D3DAD2E1B8C1C05B19875B6659F4DE23C3B667BF297BA9AA47740787137D896D5724E4C70A825F872C9EA60D2EDF5",
+			"EC3A4E415B4E19A4568618029F427FA5DA9A8BC4AE92E02E06AAE5286B300C64DEF8F0EA9055866064A254515480BC13",
+			"8015D9B72D7D57244EA8EF9AC0C621896708A59367F9DFB9F54CA84B3F1C9DB1288B231C3AE0D4FE7344FD2533264720",
+			"test",
+			"6D6DEFAC9AB64DABAFE36C6BF510352A4CC27001263638E5B16D9BB51D451559F918EEDAF2293BE5B475CC8F0188636B",
+			"2D46F3BECBCC523D5F1A1256BF0C9B024D879BA9E838144C8BA6BAEB4B53B47D51AB373F9845C0514EEFB14024787265")
+	})
+	t.Run("P-521", func(t *testing.T) {
+		testRFC6979(t, elliptic.P521(),
+			"0FAD06DAA62BA3B25D2FB40133DA757205DE67F5BB0018FEE8C86E1B68C7E75CAA896EB32F1F47C70855836A6D16FCC1466F6D8FBEC67DB89EC0C08B0E996B83538",
+			"1894550D0785932E00EAA23B694F213F8C3121F86DC97A04E5A7167DB4E5BCD371123D46E45DB6B5D5370A7F20FB633155D38FFA16D2BD761DCAC474B9A2F5023A4",
+			"0493101C962CD4D2FDDF782285E64584139C2F91B47F87FF82354D6630F746A28A0DB25741B5B34A828008B22ACC23F924FAAFBD4D33F81EA66956DFEAA2BFDFCF5",
+			"sample",
+			"1511BB4D675114FE266FC4372B87682BAECC01D3CC62CF2303C92B3526012659D16876E25C7C1E57648F23B73564D67F61C6F14D527D54972810421E7D87589E1A7",
+			"04A171143A83163D6DF460AAF61522695F207A58B95C0644D87E52AA1A347916E4F7A72930B1BC06DBE22CE3F58264AFD23704CBB63B29B931F7DE6C9D949A7ECFC")
+		testRFC6979(t, elliptic.P521(),
+			"0FAD06DAA62BA3B25D2FB40133DA757205DE67F5BB0018FEE8C86E1B68C7E75CAA896EB32F1F47C70855836A6D16FCC1466F6D8FBEC67DB89EC0C08B0E996B83538",
+			"1894550D0785932E00EAA23B694F213F8C3121F86DC97A04E5A7167DB4E5BCD371123D46E45DB6B5D5370A7F20FB633155D38FFA16D2BD761DCAC474B9A2F5023A4",
+			"0493101C962CD4D2FDDF782285E64584139C2F91B47F87FF82354D6630F746A28A0DB25741B5B34A828008B22ACC23F924FAAFBD4D33F81EA66956DFEAA2BFDFCF5",
+			"test",
+			"00E871C4A14F993C6C7369501900C4BC1E9C7B0B4BA44E04868B30B41D8071042EB28C4C250411D0CE08CD197E4188EA4876F279F90B3D8D74A3C76E6F1E4656AA8",
+			"0CD52DBAA33B063C3A6CD8058A1FB0A46A4754B034FCC644766CA14DA8CA5CA9FDE00E88C1AD60CCBA759025299079D7A427EC3CC5B619BFBC828E7769BCD694E86")
+	})
+}
+
+func testRFC6979(t *testing.T, curve elliptic.Curve, D, X, Y, msg, r, s string) {
+	priv := &PrivateKey{
+		D: fromHex(D),
+		PublicKey: PublicKey{
+			Curve: curve,
+			X:     fromHex(X),
+			Y:     fromHex(Y),
+		},
 	}
+	h := sha256.Sum256([]byte(msg))
+	sig, err := priv.Sign(nil, h[:], crypto.SHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := encodeSignature(fromHex(r).Bytes(), fromHex(s).Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(sig, expected) {
+		t.Errorf("signature mismatch:\n got: %x\nwant: %x", sig, expected)
+	}
+}
+
+func encodeSignature(r, s []byte) ([]byte, error) {
+	var b cryptobyte.Builder
+	b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
+		addASN1IntBytes(b, r)
+		addASN1IntBytes(b, s)
+	})
+	return b.Bytes()
+}
+
+func addASN1IntBytes(b *cryptobyte.Builder, bytes []byte) {
+	for len(bytes) > 0 && bytes[0] == 0 {
+		bytes = bytes[1:]
+	}
+	b.AddASN1(asn1.INTEGER, func(c *cryptobyte.Builder) {
+		if bytes[0]&0x80 != 0 {
+			c.AddUint8(0)
+		}
+		c.AddBytes(bytes)
+	})
+}
+
+func TestParseAndBytesRoundTrip(t *testing.T) {
+	testAllCurves(t, testParseAndBytesRoundTrip)
+}
+
+func testParseAndBytesRoundTrip(t *testing.T, curve elliptic.Curve) {
+	if strings.HasSuffix(t.Name(), "/Generic") {
+		t.Skip("these methods don't support generic curves")
+	}
+	priv, _ := GenerateKey(curve, rand.Reader)
+
+	b, err := priv.PublicKey.Bytes()
+	if err != nil {
+		t.Fatalf("failed to serialize private key's public key: %v", err)
+	}
+	if b[0] != 4 {
+		t.Fatalf("public key bytes doesn't start with 0x04 (uncompressed format)")
+	}
+	p, err := ParseUncompressedPublicKey(curve, b)
+	if err != nil {
+		t.Fatalf("failed to parse private key's public key: %v", err)
+	}
+	if !priv.PublicKey.Equal(p) {
+		t.Errorf("parsed private key's public key doesn't match original")
+	}
+
+	bk, err := priv.Bytes()
+	if err != nil {
+		t.Fatalf("failed to serialize private key: %v", err)
+	}
+	k, err := ParseRawPrivateKey(curve, bk)
+	if err != nil {
+		t.Fatalf("failed to parse private key: %v", err)
+	}
+	if !priv.Equal(k) {
+		t.Errorf("parsed private key doesn't match original")
+	}
+
+	if curve != elliptic.P224() {
+		privECDH, err := priv.ECDH()
+		if err != nil {
+			t.Fatalf("failed to convert private key to ECDH: %v", err)
+		}
+
+		pp, err := privECDH.Curve().NewPublicKey(b)
+		if err != nil {
+			t.Fatalf("failed to parse with ECDH: %v", err)
+		}
+		if !privECDH.PublicKey().Equal(pp) {
+			t.Errorf("parsed ECDH public key doesn't match original")
+		}
+		if !bytes.Equal(b, pp.Bytes()) {
+			t.Errorf("encoded ECDH public key doesn't match Bytes")
+		}
+
+		kk, err := privECDH.Curve().NewPrivateKey(bk)
+		if err != nil {
+			t.Fatalf("failed to parse with ECDH: %v", err)
+		}
+		if !privECDH.Equal(kk) {
+			t.Errorf("parsed ECDH private key doesn't match original")
+		}
+		if !bytes.Equal(bk, kk.Bytes()) {
+			t.Errorf("encoded ECDH private key doesn't match Bytes")
+		}
+	}
+}
+
+func TestInvalidPublicKeys(t *testing.T) {
+	testAllCurves(t, testInvalidPublicKeys)
+}
+
+func testInvalidPublicKeys(t *testing.T, curve elliptic.Curve) {
+	t.Run("Infinity", func(t *testing.T) {
+		k := &PublicKey{Curve: curve, X: big.NewInt(0), Y: big.NewInt(0)}
+		if _, err := k.Bytes(); err == nil {
+			t.Errorf("PublicKey.Bytes accepted infinity")
+		}
+
+		b := []byte{0}
+		if _, err := ParseUncompressedPublicKey(curve, b); err == nil {
+			t.Errorf("ParseUncompressedPublicKey accepted infinity")
+		}
+		b = make([]byte, 1+2*(curve.Params().BitSize+7)/8)
+		b[0] = 4
+		if _, err := ParseUncompressedPublicKey(curve, b); err == nil {
+			t.Errorf("ParseUncompressedPublicKey accepted infinity")
+		}
+	})
+	t.Run("NotOnCurve", func(t *testing.T) {
+		k, _ := GenerateKey(curve, rand.Reader)
+		k.X = k.X.Add(k.X, big.NewInt(1))
+		if _, err := k.Bytes(); err == nil {
+			t.Errorf("PublicKey.Bytes accepted not on curve")
+		}
+
+		b := make([]byte, 1+2*(curve.Params().BitSize+7)/8)
+		b[0] = 4
+		k.X.FillBytes(b[1 : 1+len(b)/2])
+		k.Y.FillBytes(b[1+len(b)/2:])
+		if _, err := ParseUncompressedPublicKey(curve, b); err == nil {
+			t.Errorf("ParseUncompressedPublicKey accepted not on curve")
+		}
+	})
+	t.Run("Compressed", func(t *testing.T) {
+		k, _ := GenerateKey(curve, rand.Reader)
+		b := elliptic.MarshalCompressed(curve, k.X, k.Y)
+		if _, err := ParseUncompressedPublicKey(curve, b); err == nil {
+			t.Errorf("ParseUncompressedPublicKey accepted compressed key")
+		}
+	})
+}
+
+func TestInvalidPrivateKeys(t *testing.T) {
+	testAllCurves(t, testInvalidPrivateKeys)
+}
+
+func testInvalidPrivateKeys(t *testing.T, curve elliptic.Curve) {
+	t.Run("Zero", func(t *testing.T) {
+		k := &PrivateKey{PublicKey{curve, big.NewInt(0), big.NewInt(0)}, big.NewInt(0)}
+		if _, err := k.Bytes(); err == nil {
+			t.Errorf("PrivateKey.Bytes accepted zero key")
+		}
+
+		b := make([]byte, (curve.Params().BitSize+7)/8)
+		if _, err := ParseRawPrivateKey(curve, b); err == nil {
+			t.Errorf("ParseRawPrivateKey accepted zero key")
+		}
+	})
+	t.Run("Overflow", func(t *testing.T) {
+		d := new(big.Int).Add(curve.Params().N, big.NewInt(5))
+		x, y := curve.ScalarBaseMult(d.Bytes())
+		k := &PrivateKey{PublicKey{curve, x, y}, d}
+		if _, err := k.Bytes(); err == nil {
+			t.Errorf("PrivateKey.Bytes accepted overflow key")
+		}
+
+		b := make([]byte, (curve.Params().BitSize+7)/8)
+		k.D.FillBytes(b)
+		if _, err := ParseRawPrivateKey(curve, b); err == nil {
+			t.Errorf("ParseRawPrivateKey accepted overflow key")
+		}
+	})
+	t.Run("Length", func(t *testing.T) {
+		b := []byte{1, 2, 3}
+		if _, err := ParseRawPrivateKey(curve, b); err == nil {
+			t.Errorf("ParseRawPrivateKey accepted short key")
+		}
+
+		b = make([]byte, (curve.Params().BitSize+7)/8)
+		b = append(b, []byte{1, 2, 3}...)
+		if _, err := ParseRawPrivateKey(curve, b); err == nil {
+			t.Errorf("ParseRawPrivateKey accepted long key")
+		}
+	})
+}
+
+// TestKeyGenerationVectors tests GenerateKey with the deterministic keygen
+// vectors of c2sp.org/det-keygen by replacing the default random source with
+// the specified DRBG.
+func TestKeyGenerationVectors(t *testing.T) {
+	var vectors []struct {
+		Curve string
+		Seed  []byte
+		PKCS8 []byte `json:"private_key_pkcs8"`
+	}
+	f, err := os.Open("testdata/det-keygen.json")
+	if err != nil {
+		t.Fatalf("failed to open det-keygen.json: %v", err)
+	}
+	defer f.Close()
+	if err := json.NewDecoder(f).Decode(&vectors); err != nil {
+		t.Fatalf("failed to decode keygen.json: %v", err)
+	}
+	for i, v := range vectors {
+		t.Run(fmt.Sprintf("%s-%d", v.Curve, i), func(t *testing.T) {
+			t.Setenv("GODEBUG", "cryptocustomrand=1")
+			var pers []byte
+			var curve elliptic.Curve
+			switch v.Curve {
+			case "secp224r1":
+				curve = elliptic.P224()
+				pers = []byte("det ECDSA key gen P-224")
+			case "secp256r1":
+				curve = elliptic.P256()
+				pers = []byte("det ECDSA key gen P-256")
+			case "secp384r1":
+				curve = elliptic.P384()
+				pers = []byte("det ECDSA key gen P-384")
+			case "secp521r1":
+				curve = elliptic.P521()
+				pers = []byte("det ECDSA key gen P-521")
+			default:
+				t.Fatalf("unknown curve: %q", v.Curve)
+			}
+			drbg := ecdsa.TestingOnlyNewDRBG(sha256.New, v.Seed, nil, pers)
+			rng := &keyGenTestReader{next: func(p []byte) error {
+				drbg.Generate(p)
+				return nil
+			}}
+			priv, err := GenerateKey(curve, rng)
+			if err != nil {
+				t.Fatalf("GenerateKey: %v", err)
+			}
+			der, err := x509.MarshalPKCS8PrivateKey(priv)
+			if err != nil {
+				t.Fatalf("MarshalPKCS8PrivateKey: %v", err)
+			}
+			if !bytes.Equal(der, v.PKCS8) {
+				t.Errorf("PKCS8 mismatch:\n%s\nvs\n\n%s", hex.Dump(der), hex.Dump(v.PKCS8))
+			}
+		})
+	}
+}
+
+type keyGenTestReader struct {
+	next func([]byte) error
+}
+
+func (r *keyGenTestReader) Read(p []byte) (n int, err error) {
+	// Neutralize randutil.MaybeReadByte.
+	//
+	// DO NOT COPY this. We *will* break you. We can do this because we're
+	// in the standard library, and can update this along with the
+	// GenerateKey implementation if necessary.
+	//
+	// You have been warned.
+	if len(p) == 1 {
+		return 1, nil
+	}
+
+	if err := r.next(p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 func benchmarkAllCurves(b *testing.B, f func(*testing.B, elliptic.Curve)) {

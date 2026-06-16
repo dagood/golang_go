@@ -7,12 +7,14 @@ package sql
 import (
 	"database/sql/driver"
 	"fmt"
+	"internal/asan"
 	"reflect"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"uuid"
 )
 
 var someTime = time.Unix(123, 0)
@@ -37,6 +39,7 @@ type conversionTest struct {
 	wantf64    float64
 	wanttime   time.Time
 	wantbool   bool // used if d is of type *bool
+	wantuuid   uuid.UUID
 	wanterr    string
 	wantiface  any
 	wantptr    *int64 // if non-nil, *d's pointed value must be equal to *wantptr
@@ -57,6 +60,7 @@ var (
 	scanf32    float32
 	scanf64    float64
 	scantime   time.Time
+	scanuuid   uuid.UUID
 	scanptr    *int64
 	scaniface  any
 )
@@ -160,6 +164,15 @@ func conversionTests() []conversionTest {
 		{s: "1.5", d: &scanf32, wantf32: float32(1.5)},
 		{s: "1.5", d: &scanf64, wantf64: float64(1.5)},
 
+		// UUIDs
+		{s: "97b6a4e0-5323-43e9-82c8-88110d6686d6", d: &scanuuid, wantuuid: uuid.MustParse("97b6a4e0-5323-43e9-82c8-88110d6686d6")},
+		{s: "97B6A4E0-5323-43E9-82C8-88110D6686D6", d: &scanuuid, wantuuid: uuid.MustParse("97b6a4e0-5323-43e9-82c8-88110d6686d6")},
+		{s: "x", d: &scanuuid, wanterr: `converting driver.Value type string ("x") to a UUID: invalid uuid`},
+		{s: []byte("97b6a4e0-5323-43e9-82c8-88110d6686d6"), d: &scanuuid, wantuuid: uuid.MustParse("97b6a4e0-5323-43e9-82c8-88110d6686d6")},
+		{s: []byte("97B6A4E0-5323-43E9-82C8-88110D6686D6"), d: &scanuuid, wantuuid: uuid.MustParse("97b6a4e0-5323-43e9-82c8-88110d6686d6")},
+		{s: []byte{0x97, 0xb6, 0xa4, 0xe0, 0x53, 0x23, 0x43, 0xe9, 0x82, 0xc8, 0x88, 0x11, 0x0d, 0x66, 0x86, 0xd6}, d: &scanuuid, wantuuid: uuid.MustParse("97b6a4e0-5323-43e9-82c8-88110d6686d6")},
+		{s: []byte("x"), d: &scanuuid, wanterr: `converting driver.Value type []byte ("x") to a UUID: invalid uuid`},
+
 		// Pointers
 		{s: any(nil), d: &scanptr, wantnil: true},
 		{s: int64(42), d: &scanptr, wantptr: &answer},
@@ -209,6 +222,10 @@ func timeValue(ptr any) time.Time {
 	return *(ptr.(*time.Time))
 }
 
+func uuidValue(ptr any) uuid.UUID {
+	return *(ptr.(*uuid.UUID))
+}
+
 func TestConversions(t *testing.T) {
 	for n, ct := range conversionTests() {
 		err := convertAssign(ct.d, ct.s)
@@ -249,6 +266,9 @@ func TestConversions(t *testing.T) {
 		}
 		if !ct.wanttime.IsZero() && !ct.wanttime.Equal(timeValue(ct.d)) {
 			errf("want time %v, got %v", ct.wanttime, timeValue(ct.d))
+		}
+		if ct.wantuuid != (uuid.UUID{}) && ct.wantuuid != uuidValue(ct.d) {
+			errf("want uuid %v, got %v", ct.wantuuid, uuidValue(ct.d))
 		}
 		if ct.wantnil && *ct.d.(**int64) != nil {
 			errf("want nil, got %v", intPtrValue(ct.d))
@@ -353,10 +373,14 @@ func TestRawBytesAllocs(t *testing.T) {
 		{"bool", false, "false"},
 		{"time", time.Unix(2, 5).UTC(), "1970-01-01T00:00:02.000000005Z"},
 	}
+	if asan.Enabled {
+		t.Skip("test allocates more with -asan; see #70079")
+	}
 
-	buf := make(RawBytes, 10)
+	var buf RawBytes
+	rows := &Rows{}
 	test := func(name string, in any, want string) {
-		if err := convertAssign(&buf, in); err != nil {
+		if err := convertAssignRows(&buf, in, rows); err != nil {
 			t.Fatalf("%s: convertAssign = %v", name, err)
 		}
 		match := len(buf) == len(want)
@@ -375,6 +399,7 @@ func TestRawBytesAllocs(t *testing.T) {
 
 	n := testing.AllocsPerRun(100, func() {
 		for _, tt := range tests {
+			rows.raw = rows.raw[:0]
 			test(tt.name, tt.in, tt.want)
 		}
 	})
@@ -383,7 +408,11 @@ func TestRawBytesAllocs(t *testing.T) {
 	// and gc. With 32-bit words there are more convT2E allocs, and
 	// with gccgo, only pointers currently go in interface data.
 	// So only care on amd64 gc for now.
-	measureAllocs := runtime.GOARCH == "amd64" && runtime.Compiler == "gc"
+	measureAllocs := false
+	switch runtime.GOARCH {
+	case "amd64", "arm64":
+		measureAllocs = runtime.Compiler == "gc"
+	}
 
 	if n > 0.5 && measureAllocs {
 		t.Fatalf("allocs = %v; want 0", n)
@@ -593,5 +622,16 @@ func TestDecimal(t *testing.T) {
 				t.Fatalf("got %#v want %#v", out, item.out)
 			}
 		})
+	}
+}
+
+func TestConvertAssignNoContext(t *testing.T) {
+	const want = 42
+	var got int64
+	if err := ConvertAssign(driver.ScanContext{}, &got, want); err != nil {
+		t.Fatalf("ConvertAssign: %v", err)
+	}
+	if got != int64(want) {
+		t.Errorf("after ConvertAssign: got %v, want %v", got, want)
 	}
 }

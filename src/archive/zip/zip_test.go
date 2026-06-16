@@ -8,13 +8,14 @@ package zip
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"hash"
 	"internal/testenv"
 	"io"
-	"runtime"
-	"sort"
+	"math/bits"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -214,9 +215,8 @@ func (r *rleBuffer) ReadAt(p []byte, off int64) (n int, err error) {
 	if len(p) == 0 {
 		return
 	}
-	skipParts := sort.Search(len(r.buf), func(i int) bool {
-		part := &r.buf[i]
-		return part.off+part.n > off
+	skipParts, _ := slices.BinarySearchFunc(r.buf, off, func(rb repeatedByte, off int64) int {
+		return cmp.Compare(rb.off+rb.n, off)
 	})
 	parts := r.buf[skipParts:]
 	if len(parts) > 0 {
@@ -494,11 +494,14 @@ func suffixIsZip64(t *testing.T, zip sizedReaderAt) bool {
 
 // Zip64 is required if the total size of the records is uint32max.
 func TestZip64LargeDirectory(t *testing.T) {
-	if runtime.GOARCH == "wasm" {
-		t.Skip("too slow on wasm")
+	if testenv.CPUIsSlow() {
+		t.Skip("too slow")
 	}
 	if testing.Short() {
 		t.Skip("skipping in short mode")
+	}
+	if bits.UintSize == 32 {
+		t.Skip("skipping on 32-bit platforms")
 	}
 	t.Parallel()
 	// gen returns a func that writes a zip with a wantLen bytes
@@ -538,14 +541,29 @@ func TestZip64LargeDirectory(t *testing.T) {
 	}
 	t.Run("uint32max-1_NoZip64", func(t *testing.T) {
 		t.Parallel()
-		if generatesZip64(t, gen(uint32max-1)) {
+		buf := new(rleBuffer)
+		w := NewWriter(buf)
+		gen(uint32max - 1)(w)
+		if suffixIsZip64(t, buf) {
 			t.Error("unexpected zip64")
+		}
+		if _, err := NewReader(buf, buf.Size()); err != nil {
+			t.Errorf("NewReader: %v", err)
 		}
 	})
 	t.Run("uint32max_HasZip64", func(t *testing.T) {
 		t.Parallel()
-		if !generatesZip64(t, gen(uint32max)) {
+		buf := new(rleBuffer)
+		w := NewWriter(buf)
+		gen(uint32max)(w)
+		if !suffixIsZip64(t, buf) {
 			t.Error("expected zip64")
+		}
+		// Round-trip through NewReader. With CD size exactly 0xFFFFFFFF,
+		// records well below 0xFFFF, and dirOffset == 0, the only EOCD
+		// field that holds the placeholder is directorySize.
+		if _, err := NewReader(buf, buf.Size()); err != nil {
+			t.Errorf("NewReader: %v", err)
 		}
 	})
 }
@@ -590,7 +608,7 @@ func testZip64(t testing.TB, size int64) *rleBuffer {
 	}
 
 	// read back zip file and check that we get to the end of it
-	r, err := NewReader(buf, int64(buf.Size()))
+	r, err := NewReader(buf, buf.Size())
 	if err != nil {
 		t.Fatal("reader:", err)
 	}
@@ -814,8 +832,6 @@ func TestSuffixSaver(t *testing.T) {
 type zeros struct{}
 
 func (zeros) Read(p []byte) (int, error) {
-	for i := range p {
-		p[i] = 0
-	}
+	clear(p)
 	return len(p), nil
 }

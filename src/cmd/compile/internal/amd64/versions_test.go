@@ -75,10 +75,11 @@ func TestGoAMD64v1(t *testing.T) {
 	cmd := testenv.Command(t, dst.Name())
 	testenv.CleanCmdEnv(cmd)
 	cmd.Env = append(cmd.Env, "TESTGOAMD64V1=yes")
-	cmd.Env = append(cmd.Env, fmt.Sprintf("GODEBUG=%s", strings.Join(features, ",")))
+	// Disable FIPS 140-3 mode, since it would detect the modified binary.
+	cmd.Env = append(cmd.Env, fmt.Sprintf("GODEBUG=%s,fips140=off", strings.Join(features, ",")))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("couldn't execute test: %s", err)
+		t.Fatalf("couldn't execute test: %s\n%s", err, out)
 	}
 	// Expect to see output of the form "PASS\n", unless the test binary
 	// was compiled for coverage (in which case there will be an extra line).
@@ -246,6 +247,7 @@ func setOf(keys ...string) map[string]bool {
 var runtimeFeatures = setOf(
 	"adx", "aes", "avx", "avx2", "bmi1", "bmi2", "erms", "fma",
 	"pclmulqdq", "popcnt", "rdtscp", "sse3", "sse41", "sse42", "ssse3",
+	"avx512f", "avx512dq",
 )
 
 var featureToOpcodes = map[string][]string{
@@ -278,6 +280,7 @@ var featureToOpcodes = map[string][]string{
 	"fma":   {"vfmadd231sd"},
 	"movbe": {"movbeqq", "movbeq", "movbell", "movbel", "movbe"},
 	"lzcnt": {"lzcntq", "lzcntl", "lzcnt"},
+	"avx2":  {"vmovsd", "vpbroadcastq", "vmulpd", "vpextrq"}, // not a complete list
 }
 
 // Test to use POPCNT instruction, if available
@@ -430,4 +433,22 @@ func TestFMA(t *testing.T) {
 			t.Errorf("FMA(%f,%f,%f) = %f, want %f", tt.x, tt.y, tt.z, got, tt.want)
 		}
 	}
+}
+
+func TestLoop(t *testing.T) {
+	// Make sure non-v1 ops are not lifted out of loops (and
+	// hence, out of the cpu feature test that guards them).
+	// See issue 78997.
+	testLoop1(6, 7)
+	testLoop2(6, 7) // in versions_(no)simd_test.go
+	testLoop3(6, 7) // in versions_(no)simd_test.go
+}
+
+//go:noinline
+func testLoop1(n int, x uint64) int {
+	var r int
+	for range n {
+		r += bits.OnesCount64(x)
+	}
+	return r
 }

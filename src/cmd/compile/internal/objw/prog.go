@@ -109,17 +109,14 @@ func (pp *Progs) NewProg() *obj.Prog {
 // Flush converts from pp to machine code.
 func (pp *Progs) Flush() {
 	plist := &obj.Plist{Firstpc: pp.Text, Curfn: pp.CurFunc}
-	obj.Flushplist(base.Ctxt, plist, pp.NewProg, base.Ctxt.Pkgpath)
+	obj.Flushplist(base.Ctxt, plist, pp.NewProg)
 }
 
 // Free clears pp and any associated resources.
 func (pp *Progs) Free() {
 	if base.Ctxt.CanReuseProgs() {
 		// Clear progs to enable GC and avoid abuse.
-		s := pp.Cache[:pp.CacheIndex]
-		for i := range s {
-			s[i] = obj.Prog{}
-		}
+		clear(pp.Cache[:pp.CacheIndex])
 	}
 	// Clear pp to avoid abuse.
 	*pp = Progs{}

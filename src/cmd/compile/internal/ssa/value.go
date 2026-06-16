@@ -9,6 +9,7 @@ import (
 	"cmd/compile/internal/types"
 	"cmd/internal/src"
 	"fmt"
+	"internal/buildcfg"
 	"math"
 	"sort"
 	"strings"
@@ -139,9 +140,16 @@ func (v *Value) AuxValAndOff() ValAndOff {
 
 func (v *Value) AuxArm64BitField() arm64BitField {
 	if opcodeTable[v.Op].auxType != auxARM64BitField {
-		v.Fatalf("op %s doesn't have a ValAndOff aux field", v.Op)
+		v.Fatalf("op %s doesn't have a ARM64BitField aux field", v.Op)
 	}
 	return arm64BitField(v.AuxInt)
+}
+
+func (v *Value) AuxArm64ConditionalParams() arm64ConditionalParams {
+	if opcodeTable[v.Op].auxType != auxARM64ConditionalParams {
+		v.Fatalf("op %s doesn't have a ARM64ConditionalParams aux field", v.Op)
+	}
+	return auxIntToArm64ConditionalParams(v.AuxInt)
 }
 
 // long form print.  v# = opcode <type> [aux] args [: reg] (names)
@@ -200,9 +208,18 @@ func (v *Value) auxString() string {
 	case auxUInt8:
 		return fmt.Sprintf(" [%d]", v.AuxUInt8())
 	case auxARM64BitField:
-		lsb := v.AuxArm64BitField().getARM64BFlsb()
-		width := v.AuxArm64BitField().getARM64BFwidth()
+		lsb := v.AuxArm64BitField().lsb()
+		width := v.AuxArm64BitField().width()
 		return fmt.Sprintf(" [lsb=%d,width=%d]", lsb, width)
+	case auxARM64ConditionalParams:
+		params := v.AuxArm64ConditionalParams()
+		cond := params.Cond()
+		nzcv := params.Nzcv()
+		imm, ok := params.ConstValue()
+		if ok {
+			return fmt.Sprintf(" [cond=%s,nzcv=%d,imm=%d]", cond, nzcv, imm)
+		}
+		return fmt.Sprintf(" [cond=%s,nzcv=%d]", cond, nzcv)
 	case auxFloat32, auxFloat64:
 		return fmt.Sprintf(" [%g]", v.AuxFloat())
 	case auxString:
@@ -228,7 +245,7 @@ func (v *Value) auxString() string {
 		}
 		return s + fmt.Sprintf(" [%s]", v.AuxValAndOff())
 	case auxCCop:
-		return fmt.Sprintf(" {%s}", Op(v.AuxInt))
+		return fmt.Sprintf(" [%s]", Op(v.AuxInt))
 	case auxS390XCCMask, auxS390XRotateParams:
 		return fmt.Sprintf(" {%v}", v.Aux)
 	case auxFlagConstant:
@@ -332,6 +349,13 @@ func (v *Value) SetArgs3(a, b, c *Value) {
 	v.AddArg(a)
 	v.AddArg(b)
 	v.AddArg(c)
+}
+func (v *Value) SetArgs4(a, b, c, d *Value) {
+	v.resetArgs()
+	v.AddArg(a)
+	v.AddArg(b)
+	v.AddArg(c)
+	v.AddArg(d)
 }
 
 func (v *Value) resetArgs() {
@@ -448,9 +472,9 @@ func (v *Value) copyIntoWithXPos(b *Block, pos src.XPos) *Value {
 	return c
 }
 
-func (v *Value) Logf(msg string, args ...interface{}) { v.Block.Logf(msg, args...) }
-func (v *Value) Log() bool                            { return v.Block.Log() }
-func (v *Value) Fatalf(msg string, args ...interface{}) {
+func (v *Value) Logf(msg string, args ...any) { v.Block.Logf(msg, args...) }
+func (v *Value) Log() bool                    { return v.Block.Log() }
+func (v *Value) Fatalf(msg string, args ...any) {
 	v.Block.Func.fe.Fatalf(v.Pos, msg, args...)
 }
 
@@ -552,7 +576,11 @@ func (v *Value) LackingPos() bool {
 // if its use count drops to 0.
 func (v *Value) removeable() bool {
 	if v.Type.IsVoid() {
-		// Void ops, like nil pointer checks, must stay.
+		// Void ops (inline marks), must stay.
+		return false
+	}
+	if opcodeTable[v.Op].nilCheck {
+		// Nil pointer checks must stay.
 		return false
 	}
 	if v.Type.IsMemory() {
@@ -573,11 +601,67 @@ func (v *Value) removeable() bool {
 func AutoVar(v *Value) (*ir.Name, int64) {
 	if loc, ok := v.Block.Func.RegAlloc[v.ID].(LocalSlot); ok {
 		if v.Type.Size() > loc.Type.Size() {
-			v.Fatalf("spill/restore type %s doesn't fit in slot type %s", v.Type, loc.Type)
+			v.Fatalf("v%d: spill/restore type %v doesn't fit in slot type %v", v.ID, v.Type, loc.Type)
 		}
 		return loc.N, loc.Off
 	}
 	// Assume it is a register, return its spill slot, which needs to be live
 	nameOff := v.Aux.(*AuxNameOffset)
 	return nameOff.Name, nameOff.Offset
+}
+
+// CanSSA reports whether values of type t can be represented as a Value.
+func CanSSA(t *types.Type) bool {
+	types.CalcSize(t)
+	if t.IsSIMD() {
+		return true
+	}
+	if t.Size() == 0 {
+		return true
+	}
+	sizeLimit := int64(MaxStruct * types.PtrSize)
+	if t.Size() > sizeLimit {
+		// 4*Widthptr is an arbitrary constant. We want it
+		// to be at least 3*Widthptr so slices can be registerized.
+		// Too big and we'll introduce too much register pressure.
+		if !buildcfg.Experiment.SIMD {
+			return false
+		}
+	}
+	switch t.Kind() {
+	case types.TARRAY:
+		// We can't do larger arrays because dynamic indexing is
+		// not supported on SSA variables.
+		// TODO: allow if all indexes are constant.
+		if t.NumElem() <= 1 {
+			return CanSSA(t.Elem())
+		}
+		return false
+	case types.TSTRUCT:
+		if types.IsDirectIface(t) {
+			// Note: even if t.NumFields()>MaxStruct! See issue 77534.
+			return true
+		}
+		if t.NumFields() > MaxStruct {
+			return false
+		}
+		for _, t1 := range t.Fields() {
+			if !CanSSA(t1.Type) {
+				return false
+			}
+		}
+		// Special check for SIMD. If the composite type
+		// contains SIMD vectors we can return true
+		// if it pass the checks below.
+		if !buildcfg.Experiment.SIMD {
+			return true
+		}
+		if t.Size() <= sizeLimit {
+			return true
+		}
+		i, f := t.Registers()
+		return i+f <= MaxStruct
+	default:
+		return true
+	}
 }

@@ -7,11 +7,19 @@
 package sanitizers_test
 
 import (
+	"internal/testenv"
 	"strings"
 	"testing"
 )
 
 func TestLibFuzzer(t *testing.T) {
+	// Skip tests in short mode.
+	if testing.Short() {
+		t.Skip("libfuzzer tests can take upwards of minutes to run; skipping in short mode")
+	}
+	testenv.MustHaveGoBuild(t)
+	testenv.MustHaveCGO(t)
+
 	goos, err := goEnv("GOOS")
 	if err != nil {
 		t.Fatal(err)
@@ -35,7 +43,6 @@ func TestLibFuzzer(t *testing.T) {
 		{goSrc: "libfuzzer2.go", cSrc: "libfuzzer2.c", expectedError: "panic: found it"},
 	}
 	for _, tc := range cases {
-		tc := tc
 		name := strings.TrimSuffix(tc.goSrc, ".go")
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -49,7 +56,7 @@ func TestLibFuzzer(t *testing.T) {
 			mustRun(t, config.goCmd("build", "-buildmode=c-archive", "-o", archivePath, srcPath(tc.goSrc)))
 
 			// build C code (if any) and link with Go code
-			cmd, err := cc(config.cFlags...)
+			cmd, err := cc(t.Context(), config.cFlags...)
 			if err != nil {
 				t.Fatalf("error running cc: %v", err)
 			}
@@ -87,6 +94,8 @@ func libFuzzerSupported(goos, goarch string) bool {
 		default:
 			return false
 		}
+	case "loong64":
+		return true
 	default:
 		return false
 	}

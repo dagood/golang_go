@@ -6,9 +6,11 @@ package os_test
 
 import (
 	"bytes"
+	"errors"
 	. "os"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"testing"
 )
 
@@ -43,7 +45,7 @@ func TestReadFile(t *testing.T) {
 func TestWriteFile(t *testing.T) {
 	t.Parallel()
 
-	f, err := CreateTemp("", "ioutil-test")
+	f, err := CreateTemp("", "os-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,16 +80,11 @@ func TestReadOnlyWriteFile(t *testing.T) {
 	t.Parallel()
 
 	// We don't want to use CreateTemp directly, since that opens a file for us as 0600.
-	tempDir, err := MkdirTemp("", t.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer RemoveAll(tempDir)
-	filename := filepath.Join(tempDir, "blurp.txt")
+	filename := filepath.Join(t.TempDir(), "blurp.txt")
 
 	shmorp := []byte("shmorp")
 	florp := []byte("florp")
-	err = WriteFile(filename, shmorp, 0444)
+	err := WriteFile(filename, shmorp, 0444)
 	if err != nil {
 		t.Fatalf("WriteFile %s: %v", filename, err)
 	}
@@ -108,9 +105,18 @@ func TestReadDir(t *testing.T) {
 	t.Parallel()
 
 	dirname := "rumpelstilzchen"
-	_, err := ReadDir(dirname)
-	if err == nil {
+	if _, err := ReadDir(dirname); err == nil {
 		t.Fatalf("ReadDir %s: error expected, none found", dirname)
+	}
+
+	filename := filepath.Join(t.TempDir(), "foo")
+	f, err := Create(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if list, err := ReadDir(filename); list != nil || !errors.Is(err, syscall.ENOTDIR) {
+		t.Fatalf("ReadDir %s: (nil, ENOTDIR) expected, got (%v, %v)", filename, list, err)
 	}
 
 	dirname = "."

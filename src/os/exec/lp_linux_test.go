@@ -19,7 +19,7 @@ func TestFindExecutableVsNoexec(t *testing.T) {
 	t.Parallel()
 
 	// This test case relies on faccessat2(2) syscall, which appeared in Linux v5.8.
-	if major, minor := unix.KernelVersion(); major < 5 || (major == 5 && minor < 8) {
+	if !unix.KernelVersionGE(5, 8) {
 		t.Skip("requires Linux kernel v5.8 with faccessat2(2) syscall")
 	}
 
@@ -50,7 +50,7 @@ func TestFindExecutableVsNoexec(t *testing.T) {
 	// Check that it works as expected.
 	_, err = exec.LookPath(path)
 	if err != nil {
-		t.Fatalf("findExecutable: got %v, want nil", err)
+		t.Fatalf("LookPath: got %v, want nil", err)
 	}
 
 	for {

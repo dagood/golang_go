@@ -48,6 +48,7 @@ import (
 	"crypto/cipher"
 	"errors"
 	"runtime"
+	"slices"
 	"strconv"
 	"unsafe"
 )
@@ -228,26 +229,41 @@ func (c *aesCipher) NewGCM(nonceSize, tagSize int) (cipher.AEAD, error) {
 	if tagSize != gcmTagSize {
 		return cipher.NewGCMWithTagSize(&noGCM{c}, tagSize)
 	}
-	return c.newGCM(false)
+	return c.newGCM(0)
 }
+
+const (
+	VersionTLS12 = 0x0303
+	VersionTLS13 = 0x0304
+)
 
 func NewGCMTLS(c cipher.Block) (cipher.AEAD, error) {
-	return c.(*aesCipher).newGCM(true)
+	return c.(*aesCipher).newGCM(VersionTLS12)
 }
 
-func (c *aesCipher) newGCM(tls bool) (cipher.AEAD, error) {
+func NewGCMTLS13(c cipher.Block) (cipher.AEAD, error) {
+	return c.(*aesCipher).newGCM(VersionTLS13)
+}
+
+func (c *aesCipher) newGCM(tlsVersion uint16) (cipher.AEAD, error) {
 	var aead *C.GO_EVP_AEAD
 	switch len(c.key) * 8 {
 	case 128:
-		if tls {
+		switch tlsVersion {
+		case VersionTLS12:
 			aead = C._goboringcrypto_EVP_aead_aes_128_gcm_tls12()
-		} else {
+		case VersionTLS13:
+			aead = C._goboringcrypto_EVP_aead_aes_128_gcm_tls13()
+		default:
 			aead = C._goboringcrypto_EVP_aead_aes_128_gcm()
 		}
 	case 256:
-		if tls {
+		switch tlsVersion {
+		case VersionTLS12:
 			aead = C._goboringcrypto_EVP_aead_aes_256_gcm_tls12()
-		} else {
+		case VersionTLS13:
+			aead = C._goboringcrypto_EVP_aead_aes_256_gcm_tls13()
+		default:
 			aead = C._goboringcrypto_EVP_aead_aes_256_gcm()
 		}
 	default:
@@ -308,9 +324,7 @@ func (g *aesGCM) Seal(dst, nonce, plaintext, additionalData []byte) []byte {
 
 	// Make room in dst to append plaintext+overhead.
 	n := len(dst)
-	for cap(dst) < n+len(plaintext)+gcmTagSize {
-		dst = append(dst[:cap(dst)], 0)
-	}
+	dst = slices.Grow(dst, len(plaintext)+gcmTagSize)
 	dst = dst[:n+len(plaintext)+gcmTagSize]
 
 	// Check delayed until now to make sure len(dst) is accurate.

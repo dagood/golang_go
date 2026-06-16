@@ -8,7 +8,7 @@ package runtime
 
 import (
 	"internal/abi"
-	"runtime/internal/atomic"
+	"internal/runtime/atomic"
 	"unsafe"
 )
 
@@ -27,6 +27,7 @@ type funcDescriptor struct {
 type mOS struct {
 	waitsema uintptr // semaphore for parking on locks
 	perrno   uintptr // pointer to tls errno
+	libcall  libcall
 }
 
 //go:nosplit
@@ -97,8 +98,12 @@ func osinit() {
 	// before calling minit on m0.
 	miniterrno()
 
-	ncpu = int32(sysconf(__SC_NPROCESSORS_ONLN))
+	numCPUStartup = getCPUCount()
 	physPageSize = sysconf(__SC_PAGE_SIZE)
+}
+
+func getCPUCount() int32 {
+	return int32(sysconf(__SC_NPROCESSORS_ONLN))
 }
 
 // newosproc0 is a version of newosproc that can be called before the runtime
@@ -107,7 +112,7 @@ func osinit() {
 // This function is not safe to use after initialization as it does not pass an M as fnarg.
 //
 //go:nosplit
-func newosproc0(stacksize uintptr, fn *funcDescriptor) {
+func newosproc0(stacksize uintptr, fn unsafe.Pointer) {
 	var (
 		attr pthread_attr
 		oset sigset
@@ -157,6 +162,10 @@ func newosproc0(stacksize uintptr, fn *funcDescriptor) {
 //go:nosplit
 //go:nowritebarrierrec
 func libpreinit() {
+	// On AIX, pthread_create expects a function descriptor pointer,
+	// not a raw code address. Set rt0LibGoFn to the descriptor
+	// so that libInit passes the right value.
+	rt0LibGoFn = uintptr(unsafe.Pointer(&rt0LibGoDesc))
 	initsig(true)
 }
 
@@ -183,15 +192,23 @@ func minit() {
 
 func unminit() {
 	unminitSignals()
+	getg().m.procid = 0
 }
 
-// Called from exitm, but not from drop, to undo the effect of thread-owned
+// Called from mexit, but not from dropm, to undo the effect of thread-owned
 // resources in minit, semacreate, or elsewhere. Do not take locks after calling this.
+//
+// This always runs without a P, so //go:nowritebarrierrec is required.
+//
+//go:nowritebarrierrec
 func mdestroy(mp *m) {
 }
 
 // tstart is a function descriptor to _tstart defined in assembly.
 var tstart funcDescriptor
+
+// rt0LibGoDesc is a function descriptor to rt0_lib_go defined in assembly.
+var rt0LibGoDesc funcDescriptor
 
 func newosproc(mp *m) {
 	var (
@@ -216,7 +233,7 @@ func newosproc(mp *m) {
 	// with signals disabled. It will enable them in minit.
 	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
 	ret := retryOnEAGAIN(func() int32 {
-		return pthread_create(&tid, &attr, &tstart, unsafe.Pointer(mp))
+		return pthread_create(&tid, &attr, unsafe.Pointer(&tstart), unsafe.Pointer(mp))
 	})
 	sigprocmask(_SIG_SETMASK, &oset, nil)
 	if ret != 0 {
@@ -238,11 +255,11 @@ func exitThread(wait *atomic.Uint32) {
 var urandom_dev = []byte("/dev/urandom\x00")
 
 //go:nosplit
-func getRandomData(r []byte) {
+func readRandom(r []byte) int {
 	fd := open(&urandom_dev[0], 0 /* O_RDONLY */, 0)
 	n := read(fd, unsafe.Pointer(&r[0]), int32(len(r)))
 	closefd(fd)
-	extendRandom(r, int(n))
+	return int(n)
 }
 
 func goenvs() {

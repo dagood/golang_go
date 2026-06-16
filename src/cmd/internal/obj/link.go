@@ -32,6 +32,7 @@ package obj
 
 import (
 	"bufio"
+	"bytes"
 	"cmd/internal/dwarf"
 	"cmd/internal/goobj"
 	"cmd/internal/objabi"
@@ -97,7 +98,8 @@ import (
 //			val = string
 //
 //	<symbolic constant name>
-//		Special symbolic constants for ARM64, such as conditional flags, tlbi_op and so on.
+//		Special symbolic constants for ARM64 (such as conditional flags, tlbi_op and so on)
+//		and RISCV64 (such as names for vector configuration instruction arguments and CSRs).
 //		Encoding:
 //			type = TYPE_SPECIAL
 //			offset = The constant value corresponding to this symbol
@@ -179,14 +181,16 @@ import (
 //			offset = ((reg&31) << 16) | (exttype << 13) | (amount<<10)
 //
 //	reg.<T>
-//		Register arrangement for ARM64 SIMD register
-//		e.g.: V1.S4, V2.S2, V7.D2, V2.H4, V6.B16
+//		Register arrangement for ARM64 and Loong64 SIMD register
+//		e.g.:
+//			On ARM64: V1.S4, V2.S2, V7.D2, V2.H4, V6.B16
+//			On Loong64: X1.B32, X1.H16, X1.W8, X2.V4, X1.Q1, V1.B16, V1.H8, V1.W4, V1.V2
 //		Encoding:
 //			type = TYPE_REG
 //			reg = REG_ARNG + register + arrangement
 //
 //	reg.<T>[index]
-//		Register element for ARM64
+//		Register element for ARM64 and Loong64
 //		Encoding:
 //			type = TYPE_REG
 //			reg = REG_ELEM + register + arrangement
@@ -207,7 +211,7 @@ type Addr struct {
 	//	for TYPE_FCONST, a float64
 	//	for TYPE_BRANCH, a *Prog (optional)
 	//	for TYPE_TEXTSIZE, an int32 (optional)
-	Val interface{}
+	Val any
 }
 
 type AddrName int8
@@ -314,7 +318,7 @@ type Prog struct {
 	RegTo2   int16     // 2nd destination operand
 	Mark     uint16    // bitmask of arch-specific items
 	Optab    uint16    // arch-specific opcode index
-	Scond    uint8     // bits that describe instruction suffixes (e.g. ARM conditions)
+	Scond    uint8     // bits that describe instruction suffixes (e.g. ARM conditions, RISCV Rounding Mode)
 	Back     uint8     // for x86 back end: backwards branch state
 	Ft       uint8     // for x86 back end: type index of Prog.From
 	Tt       uint8     // for x86 back end: type index of Prog.To
@@ -416,6 +420,7 @@ const (
 	AJMP
 	ANOP
 	APCALIGN
+	APCALIGNMAX // currently x86, amd64 and arm64
 	APCDATA
 	ARET
 	AGETCALLERPC
@@ -451,15 +456,16 @@ const (
 // It represents Go symbols in a flat pkg+"."+name namespace.
 type LSym struct {
 	Name string
-	Type objabi.SymKind
 	Attribute
+	Type objabi.SymKind
 
+	Align  int16
 	Size   int64
 	Gotype *LSym
 	P      []byte
 	R      []Reloc
 
-	Extra *interface{} // *FuncInfo, *VarInfo, *FileInfo, or *TypeInfo, if present
+	Extra *any // *FuncInfo, *VarInfo, *FileInfo, *TypeInfo, or *ItabInfo, if present
 
 	Pkg    string
 	PkgIdx int32
@@ -470,7 +476,6 @@ type LSym struct {
 type FuncInfo struct {
 	Args      int32
 	Locals    int32
-	Align     int32
 	FuncID    abi.FuncID
 	FuncFlag  abi.FuncFlag
 	StartLine int32
@@ -495,9 +500,10 @@ type FuncInfo struct {
 	WrapInfo           *LSym // for wrapper, info of wrapped function
 	JumpTables         []JumpTable
 
-	FuncInfoSym   *LSym
-	WasmImportSym *LSym
-	WasmImport    *WasmImport
+	FuncInfoSym *LSym
+
+	WasmImport *WasmImport
+	WasmExport *WasmExport
 
 	sehUnwindInfoSym *LSym
 }
@@ -517,7 +523,7 @@ func (s *LSym) NewFuncInfo() *FuncInfo {
 		panic(fmt.Sprintf("invalid use of LSym - NewFuncInfo with Extra of type %T", *s.Extra))
 	}
 	f := new(FuncInfo)
-	s.Extra = new(interface{})
+	s.Extra = new(any)
 	*s.Extra = f
 	return f
 }
@@ -541,7 +547,7 @@ func (s *LSym) NewVarInfo() *VarInfo {
 		panic(fmt.Sprintf("invalid use of LSym - NewVarInfo with Extra of type %T", *s.Extra))
 	}
 	f := new(VarInfo)
-	s.Extra = new(interface{})
+	s.Extra = new(any)
 	*s.Extra = f
 	return f
 }
@@ -568,7 +574,7 @@ func (s *LSym) NewFileInfo() *FileInfo {
 		panic(fmt.Sprintf("invalid use of LSym - NewFileInfo with Extra of type %T", *s.Extra))
 	}
 	f := new(FileInfo)
-	s.Extra = new(interface{})
+	s.Extra = new(any)
 	*s.Extra = f
 	return f
 }
@@ -585,7 +591,7 @@ func (s *LSym) File() *FileInfo {
 // A TypeInfo contains information for a symbol
 // that contains a runtime._type.
 type TypeInfo struct {
-	Type interface{} // a *cmd/compile/internal/types.Type
+	Type any // a *cmd/compile/internal/types.Type
 }
 
 func (s *LSym) NewTypeInfo() *TypeInfo {
@@ -593,9 +599,43 @@ func (s *LSym) NewTypeInfo() *TypeInfo {
 		panic(fmt.Sprintf("invalid use of LSym - NewTypeInfo with Extra of type %T", *s.Extra))
 	}
 	t := new(TypeInfo)
-	s.Extra = new(interface{})
+	s.Extra = new(any)
 	*s.Extra = t
 	return t
+}
+
+// TypeInfo returns the *TypeInfo associated with s, or else nil.
+func (s *LSym) TypeInfo() *TypeInfo {
+	if s.Extra == nil {
+		return nil
+	}
+	t, _ := (*s.Extra).(*TypeInfo)
+	return t
+}
+
+// An ItabInfo contains information for a symbol
+// that contains a runtime.itab.
+type ItabInfo struct {
+	Type any // a *cmd/compile/internal/types.Type
+}
+
+func (s *LSym) NewItabInfo() *ItabInfo {
+	if s.Extra != nil {
+		panic(fmt.Sprintf("invalid use of LSym - NewItabInfo with Extra of type %T", *s.Extra))
+	}
+	t := new(ItabInfo)
+	s.Extra = new(any)
+	*s.Extra = t
+	return t
+}
+
+// ItabInfo returns the *ItabInfo associated with s, or else nil.
+func (s *LSym) ItabInfo() *ItabInfo {
+	if s.Extra == nil {
+		return nil
+	}
+	i, _ := (*s.Extra).(*ItabInfo)
+	return i
 }
 
 // WasmImport represents a WebAssembly (WASM) imported function with
@@ -608,45 +648,139 @@ type WasmImport struct {
 	// Name holds the WASM imported function name specified by the
 	// //go:wasmimport directive.
 	Name string
-	// Params holds the imported function parameter fields.
-	Params []WasmField
-	// Results holds the imported function result fields.
-	Results []WasmField
+
+	WasmFuncType // type of the imported function
+
+	// aux symbol to pass metadata to the linker, serialization of
+	// the fields above.
+	AuxSym *LSym
 }
 
-func (wi *WasmImport) CreateSym(ctxt *Link) *LSym {
-	var sym LSym
-
-	var b [8]byte
-	writeByte := func(x byte) {
-		sym.WriteBytes(ctxt, sym.Size, []byte{x})
+func (wi *WasmImport) CreateAuxSym() {
+	var b bytes.Buffer
+	wi.Write(&b)
+	p := b.Bytes()
+	wi.AuxSym = &LSym{
+		Type: objabi.SDATA, // doesn't really matter
+		P:    append([]byte(nil), p...),
+		Size: int64(len(p)),
 	}
+}
+
+func (wi *WasmImport) Write(w *bytes.Buffer) {
+	var b [8]byte
 	writeUint32 := func(x uint32) {
 		binary.LittleEndian.PutUint32(b[:], x)
-		sym.WriteBytes(ctxt, sym.Size, b[:4])
-	}
-	writeInt64 := func(x int64) {
-		binary.LittleEndian.PutUint64(b[:], uint64(x))
-		sym.WriteBytes(ctxt, sym.Size, b[:])
+		w.Write(b[:4])
 	}
 	writeString := func(s string) {
 		writeUint32(uint32(len(s)))
-		sym.WriteString(ctxt, sym.Size, len(s), s)
+		w.WriteString(s)
 	}
 	writeString(wi.Module)
 	writeString(wi.Name)
-	writeUint32(uint32(len(wi.Params)))
-	for _, f := range wi.Params {
-		writeByte(byte(f.Type))
-		writeInt64(f.Offset)
-	}
-	writeUint32(uint32(len(wi.Results)))
-	for _, f := range wi.Results {
-		writeByte(byte(f.Type))
-		writeInt64(f.Offset)
-	}
+	wi.WasmFuncType.Write(w)
+}
 
-	return &sym
+func (wi *WasmImport) Read(b []byte) {
+	readUint32 := func() uint32 {
+		x := binary.LittleEndian.Uint32(b)
+		b = b[4:]
+		return x
+	}
+	readString := func() string {
+		n := readUint32()
+		s := string(b[:n])
+		b = b[n:]
+		return s
+	}
+	wi.Module = readString()
+	wi.Name = readString()
+	wi.WasmFuncType.Read(b)
+}
+
+// WasmFuncType represents a WebAssembly (WASM) function type with
+// parameters and results translated into WASM types based on the Go function
+// declaration.
+type WasmFuncType struct {
+	// Params holds the function parameter fields.
+	Params []WasmField
+	// Results holds the function result fields.
+	Results []WasmField
+}
+
+func (ft *WasmFuncType) Write(w *bytes.Buffer) {
+	var b [8]byte
+	writeByte := func(x byte) {
+		w.WriteByte(x)
+	}
+	writeUint32 := func(x uint32) {
+		binary.LittleEndian.PutUint32(b[:], x)
+		w.Write(b[:4])
+	}
+	writeInt64 := func(x int64) {
+		binary.LittleEndian.PutUint64(b[:], uint64(x))
+		w.Write(b[:])
+	}
+	writeUint32(uint32(len(ft.Params)))
+	for _, f := range ft.Params {
+		writeByte(byte(f.Type))
+		writeInt64(f.Offset)
+	}
+	writeUint32(uint32(len(ft.Results)))
+	for _, f := range ft.Results {
+		writeByte(byte(f.Type))
+		writeInt64(f.Offset)
+	}
+}
+
+func (ft *WasmFuncType) Read(b []byte) {
+	readByte := func() byte {
+		x := b[0]
+		b = b[1:]
+		return x
+	}
+	readUint32 := func() uint32 {
+		x := binary.LittleEndian.Uint32(b)
+		b = b[4:]
+		return x
+	}
+	readInt64 := func() int64 {
+		x := binary.LittleEndian.Uint64(b)
+		b = b[8:]
+		return int64(x)
+	}
+	ft.Params = make([]WasmField, readUint32())
+	for i := range ft.Params {
+		ft.Params[i].Type = WasmFieldType(readByte())
+		ft.Params[i].Offset = readInt64()
+	}
+	ft.Results = make([]WasmField, readUint32())
+	for i := range ft.Results {
+		ft.Results[i].Type = WasmFieldType(readByte())
+		ft.Results[i].Offset = readInt64()
+	}
+}
+
+// WasmExport represents a WebAssembly (WASM) exported function with
+// parameters and results translated into WASM types based on the Go function
+// declaration.
+type WasmExport struct {
+	WasmFuncType
+
+	WrappedSym *LSym // the wrapped Go function
+	AuxSym     *LSym // aux symbol to pass metadata to the linker
+}
+
+func (we *WasmExport) CreateAuxSym() {
+	var b bytes.Buffer
+	we.WasmFuncType.Write(&b)
+	p := b.Bytes()
+	we.AuxSym = &LSym{
+		Type: objabi.SDATA, // doesn't really matter
+		P:    append([]byte(nil), p...),
+		Size: int64(len(p)),
+	}
 }
 
 type WasmField struct {
@@ -665,6 +799,11 @@ const (
 	WasmF32
 	WasmF64
 	WasmPtr
+	WasmV128
+
+	// bool is not really a wasm type, but we allow it on wasmimport/wasmexport
+	// function parameters/results. 32-bit on Wasm side, 8-bit on Go side.
+	WasmBool
 )
 
 type InlMark struct {
@@ -836,6 +975,12 @@ const (
 	// PkgInit indicates this is a compiler-generated package init func.
 	AttrPkgInit
 
+	// Linkname indicates this is a go:linkname'd symbol.
+	AttrLinkname
+
+	// LinknameStd indicates this is a go:linknamestd'd symbol.
+	AttrLinknameStd
+
 	// attrABIBase is the value at which the ABI is encoded in
 	// Attribute. This must be last; all bits after this are
 	// assumed to be an ABI value.
@@ -865,6 +1010,8 @@ func (a *Attribute) ContentAddressable() bool { return a.load()&AttrContentAddre
 func (a *Attribute) ABIWrapper() bool         { return a.load()&AttrABIWrapper != 0 }
 func (a *Attribute) IsPcdata() bool           { return a.load()&AttrPcdata != 0 }
 func (a *Attribute) IsPkgInit() bool          { return a.load()&AttrPkgInit != 0 }
+func (a *Attribute) IsLinkname() bool         { return a.load()&AttrLinkname != 0 }
+func (a *Attribute) IsLinknameStd() bool      { return a.load()&AttrLinknameStd != 0 }
 
 func (a *Attribute) Set(flag Attribute, value bool) {
 	for {
@@ -914,6 +1061,8 @@ var textAttrStrings = [...]struct {
 	{bit: AttrContentAddressable, s: ""},
 	{bit: AttrABIWrapper, s: "ABIWRAPPER"},
 	{bit: AttrPkgInit, s: "PKGINIT"},
+	{bit: AttrLinkname, s: "LINKNAME"},
+	{bit: AttrLinknameStd, s: "LINKNAMESTD"},
 }
 
 // String formats a for printing in as part of a TEXT prog.
@@ -998,45 +1147,55 @@ type Auto struct {
 type RegSpill struct {
 	Addr           Addr
 	Reg            int16
+	Reg2           int16 // If not 0, a second register to spill at Addr+regSize. Only for some archs.
 	Spill, Unspill As
+}
+
+// A Func represents a Go function. If non-nil, it must be a *ir.Func.
+type Func interface {
+	Pos() src.XPos
 }
 
 // Link holds the context for writing object code from a compiler
 // to be linker input or for reading that input into the linker.
 type Link struct {
-	Headtype           objabi.HeadType
-	Arch               *LinkArch
-	Debugasm           int
-	Debugvlog          bool
-	Debugpcln          string
-	Flag_shared        bool
-	Flag_dynlink       bool
-	Flag_linkshared    bool
-	Flag_optimize      bool
-	Flag_locationlists bool
-	Flag_noRefName     bool   // do not include referenced symbol names in object file
-	Retpoline          bool   // emit use of retpoline stubs for indirect jmp/call
-	Flag_maymorestack  string // If not "", call this function before stack checks
-	Bso                *bufio.Writer
-	Pathname           string
-	Pkgpath            string           // the current package's import path
-	hashmu             sync.Mutex       // protects hash, funchash
-	hash               map[string]*LSym // name -> sym mapping
-	funchash           map[string]*LSym // name -> sym mapping for ABIInternal syms
-	statichash         map[string]*LSym // name -> sym mapping for static syms
-	PosTable           src.PosTable
-	InlTree            InlTree // global inlining tree used by gc/inl.go
-	DwFixups           *DwarfFixupTable
-	Imports            []goobj.ImportedPkg
-	DiagFunc           func(string, ...interface{})
-	DiagFlush          func()
-	DebugInfo          func(fn *LSym, info *LSym, curfn interface{}) ([]dwarf.Scope, dwarf.InlCalls, src.XPos) // if non-nil, curfn is a *ir.Func
-	GenAbstractFunc    func(fn *LSym)
-	Errors             int
+	Headtype             objabi.HeadType
+	Arch                 *LinkArch
+	CompressInstructions bool // use compressed instructions where possible (if supported by architecture)
+	Debugasm             int
+	Debugvlog            bool
+	Debugpcln            string
+	Flag_shared          bool
+	Flag_dynlink         bool
+	Flag_linkshared      bool
+	Flag_optimize        bool
+	Flag_locationlists   bool
+	Flag_noRefName       bool   // do not include referenced symbol names in object file
+	Retpoline            bool   // emit use of retpoline stubs for indirect jmp/call
+	Flag_maymorestack    string // If not "", call this function before stack checks
+	Bso                  *bufio.Writer
+	Pathname             string
+	Pkgpath              string // the current package's import path
+
+	hashmu          sync.Mutex       // protects hash, funchash
+	hash            sync.Map         // name(string) -> sym(*syncOnce) mapping
+	funchash        sync.Map         // name(string) -> sym(*syncOnce) mapping for ABIInternal syms
+	statichash      map[string]*LSym // name -> sym mapping for static syms
+	PosTable        src.PosTable
+	InlTree         InlTree // global inlining tree used by gc/inl.go
+	DwFixups        *DwarfFixupTable
+	DwTextCount     int
+	Imports         []goobj.ImportedPkg
+	DiagFunc        func(string, ...any)
+	DiagFlush       func()
+	DebugInfo       func(ctxt *Link, fn *LSym, info *LSym, curfn Func) ([]dwarf.Scope, dwarf.InlCalls)
+	GenAbstractFunc func(fn *LSym)
+	Errors          int
 
 	InParallel    bool // parallel backend phase in effect
 	UseBASEntries bool // use Base Address Selection Entries in location lists and PC ranges
 	IsAsm         bool // is the source assembly language, which may contain surprising idioms (e.g., call tables)
+	Std           bool // is standard library package
 
 	// state for writing objects
 	Text []*LSym
@@ -1047,6 +1206,10 @@ type Link struct {
 	// add them to a separate list, sort at the end, and append it
 	// to Data.
 	constSyms []*LSym
+
+	// Windows SEH symbols are also data symbols that can be created
+	// concurrently.
+	SEHSyms []*LSym
 
 	// pkgIdx maps package path to index. The index is used for
 	// symbol reference in the object file.
@@ -1061,12 +1224,26 @@ type Link struct {
 	Fingerprint goobj.FingerprintType // fingerprint of symbol indices, to catch index mismatch
 }
 
-func (ctxt *Link) Diag(format string, args ...interface{}) {
+// symOnce is a "marker" value for our sync.Maps. We insert it on lookup and
+// use the atomic value to check whether initialization has been completed.
+type symOnce struct {
+	sym    LSym
+	inited atomic.Bool
+}
+
+// Assert to vet's printf checker that Link.DiagFunc is a printf-like.
+func _(ctxt *Link) {
+	ctxt.DiagFunc = func(format string, args ...any) {
+		_ = fmt.Sprintf(format, args...)
+	}
+}
+
+func (ctxt *Link) Diag(format string, args ...any) {
 	ctxt.Errors++
 	ctxt.DiagFunc(format, args...)
 }
 
-func (ctxt *Link) Logf(format string, args ...interface{}) {
+func (ctxt *Link) Logf(format string, args ...any) {
 	fmt.Fprintf(ctxt.Bso, format, args...)
 	ctxt.Bso.Flush()
 }
@@ -1080,6 +1257,10 @@ func (fi *FuncInfo) SpillRegisterArgs(last *Prog, pa ProgAlloc) *Prog {
 		spill.As = ra.Spill
 		spill.From.Type = TYPE_REG
 		spill.From.Reg = ra.Reg
+		if ra.Reg2 != 0 {
+			spill.From.Type = TYPE_REGREG
+			spill.From.Offset = int64(ra.Reg2)
+		}
 		spill.To = ra.Addr
 		last = spill
 	}
@@ -1096,6 +1277,10 @@ func (fi *FuncInfo) UnspillRegisterArgs(last *Prog, pa ProgAlloc) *Prog {
 		unspill.From = ra.Addr
 		unspill.To.Type = TYPE_REG
 		unspill.To.Reg = ra.Reg
+		if ra.Reg2 != 0 {
+			unspill.To.Type = TYPE_REGREG
+			unspill.To.Offset = int64(ra.Reg2)
+		}
 		last = unspill
 	}
 	return last

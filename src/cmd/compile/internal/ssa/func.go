@@ -7,7 +7,10 @@ package ssa
 import (
 	"cmd/compile/internal/abi"
 	"cmd/compile/internal/base"
+	"cmd/compile/internal/ir"
+	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
+	"cmd/internal/obj"
 	"cmd/internal/src"
 	"fmt"
 	"math"
@@ -38,10 +41,14 @@ type Func struct {
 	ABISelf        *abi.ABIConfig // ABI for function being compiled
 	ABIDefault     *abi.ABIConfig // ABI for rtcall and other no-parsed-signature/pragma functions.
 
+	maxCPUFeatures CPUfeatures // union of all the CPU features in all the blocks.
+
 	scheduled   bool  // Values in Blocks are in final order
 	laidout     bool  // Blocks are ordered
 	NoSplit     bool  // true if function is marked as nosplit.  Used by schedule check pass.
 	dumpFileSeq uint8 // the sequence numbers of dump file. (%s_%02d__%s.dump", funcname, dumpFileSeq, phaseName)
+	IsPgoHot    bool
+	DeferReturn *Block // avoid creating more than one deferreturn if there's multiple calls to deferproc-etc.
 
 	// when register allocation is done, maps value ids to locations
 	RegAlloc []Location
@@ -61,8 +68,11 @@ type Func struct {
 
 	// RegArgs is a slice of register-memory pairs that must be spilled and unspilled in the uncommon path of function entry.
 	RegArgs []Spill
-	// AuxCall describing parameters and results for this function.
+	// OwnAux describes parameters and results for this function.
 	OwnAux *AuxCall
+	// CloSlot holds the compiler-synthesized name (".closureptr")
+	// where we spill the closure pointer for range func bodies.
+	CloSlot *ir.Name
 
 	freeValues *Value // free Values linked by argstorage[0].  All other fields except ID are 0/nil.
 	freeBlocks *Block // free Blocks linked by succstorage[0].b.  All other fields except ID are 0/nil.
@@ -84,9 +94,18 @@ type LocalSlotSplitKey struct {
 }
 
 // NewFunc returns a new, empty function object.
-// Caller must set f.Config and f.Cache before using f.
-func NewFunc(fe Frontend) *Func {
-	return &Func{fe: fe, NamedValues: make(map[LocalSlot][]*Value), CanonicalLocalSlots: make(map[LocalSlot]*LocalSlot), CanonicalLocalSplits: make(map[LocalSlotSplitKey]*LocalSlot)}
+// Caller must reset cache before calling NewFunc.
+func (c *Config) NewFunc(fe Frontend, cache *Cache) *Func {
+	return &Func{
+		fe:     fe,
+		Config: c,
+		Cache:  cache,
+
+		NamedValues:          make(map[LocalSlot][]*Value),
+		CanonicalLocalSlots:  make(map[LocalSlot]*LocalSlot),
+		CanonicalLocalSplits: make(map[LocalSlotSplitKey]*LocalSlot),
+		OwnAux:               &AuxCall{},
+	}
 }
 
 // NumBlocks returns an integer larger than the id of any Block in the Func.
@@ -97,6 +116,21 @@ func (f *Func) NumBlocks() int {
 // NumValues returns an integer larger than the id of any Value in the Func.
 func (f *Func) NumValues() int {
 	return f.vid.num()
+}
+
+// NameABI returns the function name followed by comma and the ABI number.
+// This is intended for use with GOSSAFUNC and HTML dumps, and differs from
+// the linker's "<1>" convention because "<" and ">" require shell quoting
+// and are not legal file names (for use with GOSSADIR) on Windows.
+func (f *Func) NameABI() string {
+	return FuncNameABI(f.Name, f.ABISelf.Which())
+}
+
+// FuncNameABI returns n followed by a comma and the value of a.
+// This is a separate function to allow a single point encoding
+// of the format, which is used in places where there's not a Func yet.
+func FuncNameABI(n string, a obj.ABI) string {
+	return fmt.Sprintf("%s,%d", n, a)
 }
 
 // newSparseSet returns a sparse set that can store at least up to n integers.
@@ -304,14 +338,14 @@ func (f *Func) newValueNoBlock(op Op, t *types.Type, pos src.XPos) *Value {
 // context to allow item-by-item comparisons across runs.
 // For example:
 // awk 'BEGIN {FS="\t"} $3~/TIME/{sum+=$4} END{print "t(ns)=",sum}' t.log
-func (f *Func) LogStat(key string, args ...interface{}) {
+func (f *Func) LogStat(key string, args ...any) {
 	value := ""
 	for _, a := range args {
 		value += fmt.Sprintf("\t%v", a)
 	}
 	n := "missing_pass"
 	if f.pass != nil {
-		n = strings.Replace(f.pass.name, " ", "_", -1)
+		n = strings.ReplaceAll(f.pass.name, " ", "_")
 	}
 	f.Warnl(f.Entry.Pos, "\t%s\t%s%s\t%s", n, key, value, f.Name)
 }
@@ -600,6 +634,19 @@ func (b *Block) NewValue4(pos src.XPos, op Op, t *types.Type, arg0, arg1, arg2, 
 	return v
 }
 
+// NewValue4A returns a new value in the block with four arguments and zero aux values.
+func (b *Block) NewValue4A(pos src.XPos, op Op, t *types.Type, aux Aux, arg0, arg1, arg2, arg3 *Value) *Value {
+	v := b.Func.newValue(op, t, b, pos)
+	v.AuxInt = 0
+	v.Aux = aux
+	v.Args = []*Value{arg0, arg1, arg2, arg3}
+	arg0.Uses++
+	arg1.Uses++
+	arg2.Uses++
+	arg3.Uses++
+	return v
+}
+
 // NewValue4I returns a new value in the block with four arguments and auxint value.
 func (b *Block) NewValue4I(pos src.XPos, op Op, t *types.Type, auxint int64, arg0, arg1, arg2, arg3 *Value) *Value {
 	v := b.Func.newValue(op, t, b, pos)
@@ -695,15 +742,14 @@ func (f *Func) ConstOffPtrSP(t *types.Type, c int64, sp *Value) *Value {
 		v.AddArg(sp)
 	}
 	return v
-
 }
 
-func (f *Func) Frontend() Frontend                                  { return f.fe }
-func (f *Func) Warnl(pos src.XPos, msg string, args ...interface{}) { f.fe.Warnl(pos, msg, args...) }
-func (f *Func) Logf(msg string, args ...interface{})                { f.fe.Logf(msg, args...) }
-func (f *Func) Log() bool                                           { return f.fe.Log() }
+func (f *Func) Frontend() Frontend                          { return f.fe }
+func (f *Func) Warnl(pos src.XPos, msg string, args ...any) { f.fe.Warnl(pos, msg, args...) }
+func (f *Func) Logf(msg string, args ...any)                { f.fe.Logf(msg, args...) }
+func (f *Func) Log() bool                                   { return f.fe.Log() }
 
-func (f *Func) Fatalf(msg string, args ...interface{}) {
+func (f *Func) Fatalf(msg string, args ...any) {
 	stats := "crashed"
 	if f.Log() {
 		f.Logf("  pass %s end %s\n", f.pass.name, stats)
@@ -767,13 +813,14 @@ func (f *Func) invalidateCFG() {
 //	base.DebugHashMatch(this function's package.name)
 //
 // for use in bug isolation.  The return value is true unless
-// environment variable GOSSAHASH is set, in which case "it depends".
+// environment variable GOCOMPILEDEBUG=gossahash=X is set, in which case "it depends on X".
 // See [base.DebugHashMatch] for more information.
 func (f *Func) DebugHashMatch() bool {
 	if !base.HasDebugHash() {
 		return true
 	}
-	return base.DebugHashMatchPkgFunc(f.fe.MyImportPath(), f.Name)
+	sym := f.fe.Func().Sym()
+	return base.DebugHashMatchPkgFunc(sym.Pkg.Path, sym.Name)
 }
 
 func (f *Func) spSb() (sp, sb *Value) {
@@ -801,11 +848,33 @@ func (f *Func) spSb() (sp, sb *Value) {
 // useFMA allows targeted debugging w/ GOFMAHASH
 // If you have an architecture-dependent FP glitch, this will help you find it.
 func (f *Func) useFMA(v *Value) bool {
-	if !f.Config.UseFMA {
-		return false
-	}
 	if base.FmaHash == nil {
 		return true
 	}
 	return base.FmaHash.MatchPos(v.Pos, nil)
+}
+
+// NewLocal returns a new anonymous local variable of the given type.
+func (f *Func) NewLocal(pos src.XPos, typ *types.Type) *ir.Name {
+	nn := typecheck.TempAt(pos, f.fe.Func(), typ) // Note: adds new auto to fn.Dcl list
+	nn.SetNonMergeable(true)
+	return nn
+}
+
+// IsMergeCandidate returns true if variable n could participate in
+// stack slot merging. For now we're restricting the set to things to
+// items larger than what CanSSA would allow (approximateky, we disallow things
+// marked as open defer slots so as to avoid complicating liveness
+// analysis.
+func IsMergeCandidate(n *ir.Name) bool {
+	if base.Debug.MergeLocals == 0 ||
+		base.Flag.N != 0 ||
+		n.Class != ir.PAUTO ||
+		n.Type().Size() <= int64(3*types.PtrSize) ||
+		n.Addrtaken() ||
+		n.NonMergeable() ||
+		n.OpenDeferSlot() {
+		return false
+	}
+	return true
 }

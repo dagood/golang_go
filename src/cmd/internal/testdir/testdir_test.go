@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -51,7 +52,11 @@ var (
 // the linux-amd64 builder that's already very fast, so we get more
 // test coverage on trybots. See https://go.dev/issue/34297.
 func defaultAllCodeGen() bool {
-	return os.Getenv("GO_BUILDER_NAME") == "linux-amd64"
+	// Note: Checking with HasPrefix allows us to enable -all_codegen
+	// on builders with experimental features like `gotip-linux-amd64-simd`
+	//
+	// See issue #79899.
+	return strings.HasPrefix(testenv.Builder(), "gotip-linux-amd64")
 }
 
 var (
@@ -61,15 +66,17 @@ var (
 	goarch       string // Target GOARCH
 	cgoEnabled   bool
 	goExperiment string
+	goDebug      string
+	tmpDir       string
 
 	// dirs are the directories to look for *.go files in.
 	// TODO(bradfitz): just use all directories?
-	dirs = []string{".", "ken", "chan", "interface", "syntax", "dwarf", "fixedbugs", "codegen", "runtime", "abi", "typeparam", "typeparam/mdempsky", "arenas"}
+	dirs = []string{".", "ken", "chan", "interface", "internal/runtime/sys", "syntax", "dwarf", "fixedbugs", "codegen", "abi", "typeparam", "typeparam/mdempsky", "arenas", "simd"}
 )
 
 // Test is the main entrypoint that runs tests in the GOROOT/test directory.
 //
-// Each .go file test case in GOROOT/test is registered as a subtest with a
+// Each .go file test case in GOROOT/test is registered as a subtest with
 // a full name like "Test/fixedbugs/bug000.go" ('/'-separated relative path).
 func Test(t *testing.T) {
 	if *target != "" {
@@ -99,6 +106,7 @@ func Test(t *testing.T) {
 		GOOS         string
 		GOARCH       string
 		GOEXPERIMENT string
+		GODEBUG      string
 		CGO_ENABLED  string
 	}
 	if err := json.NewDecoder(stdout).Decode(&env); err != nil {
@@ -111,6 +119,8 @@ func Test(t *testing.T) {
 	goarch = env.GOARCH
 	cgoEnabled, _ = strconv.ParseBool(env.CGO_ENABLED)
 	goExperiment = env.GOEXPERIMENT
+	goDebug = env.GODEBUG
+	tmpDir = t.TempDir()
 
 	common := testCommon{
 		gorootTestDir: filepath.Join(testenv.GOROOT(t), "test"),
@@ -158,22 +168,17 @@ func shardMatch(name string) bool {
 }
 
 func goFiles(t *testing.T, dir string) []string {
-	f, err := os.Open(filepath.Join(testenv.GOROOT(t), "test", dir))
-	if err != nil {
-		t.Fatal(err)
-	}
-	dirnames, err := f.Readdirnames(-1)
-	f.Close()
+	files, err := os.ReadDir(filepath.Join(testenv.GOROOT(t), "test", dir))
 	if err != nil {
 		t.Fatal(err)
 	}
 	names := []string{}
-	for _, name := range dirnames {
+	for _, file := range files {
+		name := file.Name()
 		if !strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".go") && shardMatch(name) {
 			names = append(names, name)
 		}
 	}
-	sort.Strings(names)
 	return names
 }
 
@@ -210,52 +215,45 @@ func compileInDir(runcmd runCmd, dir string, flags []string, importcfg string, p
 	return runcmd(cmd...)
 }
 
-var stdlibImportcfgStringOnce sync.Once // TODO(#56102): Use sync.OnceValue once available. Also below.
-var stdlibImportcfgString string
+var stdlibImportcfg = sync.OnceValue(func() string {
+	cmd := exec.Command(goTool, "list", "-export", "-f", "{{if .Export}}packagefile {{.ImportPath}}={{.Export}}{{end}}", "std")
+	cmd.Env = append(os.Environ(), "GOENV=off", "GOFLAGS=")
+	output, err := cmd.Output()
+	if err, ok := err.(*exec.ExitError); ok && len(err.Stderr) != 0 {
+		log.Fatalf("'go list' failed: %v: %s", err, err.Stderr)
+	}
+	if err != nil {
+		log.Fatalf("'go list' failed: %v", err)
+	}
+	return string(output)
+})
 
-func stdlibImportcfg() string {
-	stdlibImportcfgStringOnce.Do(func() {
-		output, err := exec.Command(goTool, "list", "-export", "-f", "{{if .Export}}packagefile {{.ImportPath}}={{.Export}}{{end}}", "std").Output()
-		if err != nil {
-			log.Fatal(err)
-		}
-		stdlibImportcfgString = string(output)
-	})
-	return stdlibImportcfgString
-}
+var stdlibImportcfgFile = sync.OnceValue(func() string {
+	filename := filepath.Join(tmpDir, "importcfg")
+	err := os.WriteFile(filename, []byte(stdlibImportcfg()), 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return filename
+})
 
-var stdlibImportcfgFilenameOnce sync.Once
-var stdlibImportcfgFilename string
-
-func stdlibImportcfgFile() string {
-	stdlibImportcfgFilenameOnce.Do(func() {
-		tmpdir, err := os.MkdirTemp("", "importcfg")
-		if err != nil {
-			log.Fatal(err)
-		}
-		filename := filepath.Join(tmpdir, "importcfg")
-		err = os.WriteFile(filename, []byte(stdlibImportcfg()), 0644)
-		if err != nil {
-			log.Fatal(err)
-		}
-		stdlibImportcfgFilename = filename
-	})
-	return stdlibImportcfgFilename
-}
-
-func linkFile(runcmd runCmd, goname string, importcfg string, ldflags []string) (err error) {
+// linkFile links infile with the given importcfg and ldflags, writes to outfile.
+// infile can be the name of an object file or a go source file.
+func linkFile(runcmd runCmd, outfile, infile string, importcfg string, ldflags []string) (err error) {
 	if importcfg == "" {
 		importcfg = stdlibImportcfgFile()
 	}
-	pfile := strings.Replace(goname, ".go", ".o", -1)
-	cmd := []string{goTool, "tool", "link", "-w", "-o", "a.exe", "-importcfg=" + importcfg}
+	if strings.HasSuffix(infile, ".go") {
+		infile = infile[:len(infile)-3] + ".o"
+	}
+	cmd := []string{goTool, "tool", "link", "-s", "-w", "-buildid=test", "-o", outfile, "-importcfg=" + importcfg}
 	if *linkshared {
 		cmd = append(cmd, "-linkshared", "-installsuffix=dynlink")
 	}
 	if ldflags != nil {
 		cmd = append(cmd, ldflags...)
 	}
-	cmd = append(cmd, pfile)
+	cmd = append(cmd, infile)
 	_, err = runcmd(cmd...)
 	return
 }
@@ -305,7 +303,7 @@ func (t test) goFileName() string {
 }
 
 func (t test) goDirName() string {
-	return filepath.Join(t.dir, strings.Replace(t.goFile, ".go", ".dir", -1))
+	return filepath.Join(t.dir, strings.ReplaceAll(t.goFile, ".go", ".dir"))
 }
 
 // goDirFiles returns .go files in dir.
@@ -372,6 +370,7 @@ func goDirPackages(t *testing.T, dir string, singlefilepkgs bool) []*goDirPkg {
 type context struct {
 	GOOS       string
 	GOARCH     string
+	allGOARCH  bool
 	cgoEnabled bool
 	noOptEnv   bool
 }
@@ -382,16 +381,31 @@ func shouldTest(src string, goos, goarch string) (ok bool, whyNot string) {
 	if *runSkips {
 		return true, ""
 	}
+
+	allGOARCH := false
 	for _, line := range strings.Split(src, "\n") {
 		if strings.HasPrefix(line, "package ") {
 			break
 		}
 
+		if *allCodegen && strings.TrimSpace(strings.TrimPrefix(line, "//")) == "asmcheck" {
+			// For asmcheck tests run under -all_codegen, treat all GOARCH build tags as satisied.
+			// These tests only verify generated assembly and can be cross-compiled, so they
+			// should not be skipped just because the host GOARCH doesn't match.
+			//
+			// For example: previously, test/codegen/simd_arm64.go was skipped on
+			// CI because the only builder with GOEXPERIMENT=simd was amd64, while the
+			// test file also requires arm64.
+			//
+			// See issue #79899.
+			allGOARCH = true
+		}
 		if expr, err := constraint.Parse(line); err == nil {
 			gcFlags := os.Getenv("GO_GCFLAGS")
 			ctxt := &context{
 				GOOS:       goos,
 				GOARCH:     goarch,
+				allGOARCH:  allGOARCH,
 				cgoEnabled: cgoEnabled,
 				noOptEnv:   strings.Contains(gcFlags, "-N") || strings.Contains(gcFlags, "-l"),
 			}
@@ -417,23 +431,31 @@ func (ctxt *context) match(name string) bool {
 		}
 	}
 
+	if slices.Contains(build.Default.ReleaseTags, name) {
+		return true
+	}
+
 	if strings.HasPrefix(name, "goexperiment.") {
-		for _, tag := range build.Default.ToolTags {
-			if tag == name {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(build.Default.ToolTags, name)
 	}
 
 	if name == "cgo" && ctxt.cgoEnabled {
 		return true
 	}
 
-	if name == ctxt.GOOS || name == ctxt.GOARCH || name == "gc" {
+	if name == ctxt.GOOS || name == "gc" {
 		return true
 	}
 
+	if ctxt.allGOARCH {
+		if _, ok := archVariants[name]; ok {
+			return ok
+		}
+	} else {
+		if name == ctxt.GOARCH {
+			return true
+		}
+	}
 	if ctxt.noOptEnv && name == "gcflags_noopt" {
 		return true
 	}
@@ -477,16 +499,20 @@ func (t test) run() error {
 	}
 	src := string(srcBytes)
 
-	// Execution recipe stops at first blank line.
-	action, _, ok := strings.Cut(src, "\n\n")
-	if !ok {
-		t.Fatalf("double newline ending execution recipe not found in GOROOT/test/%s", t.goFileName())
+	// Execution recipe is contained in a comment in
+	// the first non-empty line that is not a build constraint.
+	var action string
+	for actionSrc := src; action == "" && actionSrc != ""; {
+		var line string
+		line, actionSrc, _ = strings.Cut(actionSrc, "\n")
+		if constraint.IsGoBuild(line) || constraint.IsPlusBuild(line) {
+			continue
+		}
+		action = strings.TrimSpace(strings.TrimPrefix(line, "//"))
 	}
-	if firstLine, rest, ok := strings.Cut(action, "\n"); ok && strings.Contains(firstLine, "+build") {
-		// skip first line
-		action = rest
+	if action == "" {
+		t.Fatalf("execution recipe not found in GOROOT/test/%s", t.goFileName())
 	}
-	action = strings.TrimPrefix(action, "//")
 
 	// Check for build constraints only up to the actual code.
 	header, _, ok := strings.Cut(src, "\npackage")
@@ -533,6 +559,8 @@ func (t test) run() error {
 	}
 
 	goexp := goExperiment
+	godebug := goDebug
+	gomodvers := ""
 
 	// collect flags
 	for len(args) > 0 && strings.HasPrefix(args[0], "-") {
@@ -564,6 +592,18 @@ func (t test) run() error {
 			}
 			goexp += args[0]
 			runenv = append(runenv, "GOEXPERIMENT="+goexp)
+
+		case "-godebug": // set GODEBUG environment
+			args = args[1:]
+			if godebug != "" {
+				godebug += ","
+			}
+			godebug += args[0]
+			runenv = append(runenv, "GODEBUG="+godebug)
+
+		case "-gomodversion": // set the GoVersion in generated go.mod files (just runindir ATM)
+			args = args[1:]
+			gomodvers = args[0]
 
 		default:
 			flags = append(flags, args[0])
@@ -685,6 +725,7 @@ func (t test) run() error {
 		// against a set of regexps in comments.
 		ops := t.wantedAsmOpcodes(long)
 		self := runtime.GOOS + "/" + runtime.GOARCH
+		var lastErr error
 		for _, env := range ops.Envs() {
 			// Only run checks relevant to the current GOOS/GOARCH,
 			// to avoid triggering a cross-compile of the runtime.
@@ -722,14 +763,19 @@ func (t test) run() error {
 			var buf bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &buf, &buf
 			if err := cmd.Run(); err != nil {
+				lastErr = err
 				t.Log(env, "\n", cmd.Stderr)
-				return err
 			}
 
 			err := t.asmCheck(buf.String(), long, env, ops[env])
 			if err != nil {
-				return err
+				lastErr = err
+				t.Log(err)
 			}
+		}
+		// The error(s) have been logged earlier. Pass up a generic one.
+		if lastErr != nil {
+			return errors.New("One or more asmcheck tests failed. Check log for failure details.")
 		}
 		return nil
 
@@ -846,7 +892,7 @@ func (t test) run() error {
 			}
 
 			if i == len(pkgs)-1 {
-				err = linkFile(runcmd, pkg.files[0], importcfgfile, ldflags)
+				err = linkFile(runcmd, "a.exe", pkg.files[0], importcfgfile, ldflags)
 				if err != nil {
 					return err
 				}
@@ -882,7 +928,11 @@ func (t test) run() error {
 			t.Fatal(err)
 		}
 
-		modFile := fmt.Sprintf("module %s\ngo 1.14\n", modName)
+		modVersion := gomodvers
+		if modVersion == "" {
+			modVersion = "1.14"
+		}
+		modFile := fmt.Sprintf("module %s\ngo %s\n", modName, modVersion)
 		if err := os.WriteFile(filepath.Join(gopathSrcDir, "go.mod"), []byte(modFile), 0666); err != nil {
 			t.Fatal(err)
 		}
@@ -924,7 +974,6 @@ func (t test) run() error {
 			case ".s":
 				asms = append(asms, filepath.Join(longdir, file.Name()))
 			}
-
 		}
 		if len(asms) > 0 {
 			emptyHdrFile := filepath.Join(tempDir, "go_asm.h")
@@ -964,8 +1013,7 @@ func (t test) run() error {
 		if err != nil {
 			return err
 		}
-		cmd = []string{goTool, "tool", "link", "-importcfg=" + stdlibImportcfgFile(), "-o", "a.exe", "all.a"}
-		_, err = runcmd(cmd...)
+		err = linkFile(runcmd, "a.exe", "all.a", stdlibImportcfgFile(), nil)
 		if err != nil {
 			return err
 		}
@@ -1010,7 +1058,7 @@ func (t test) run() error {
 		runInDir = ""
 		var out []byte
 		var err error
-		if len(flags)+len(args) == 0 && t.goGcflagsIsEmpty() && !*linkshared && goarch == runtime.GOARCH && goos == runtime.GOOS && goexp == goExperiment {
+		if len(flags)+len(args) == 0 && t.goGcflagsIsEmpty() && !*linkshared && goarch == runtime.GOARCH && goos == runtime.GOOS && goexp == goExperiment && godebug == goDebug {
 			// If we're not using special go command flags,
 			// skip all the go command machinery.
 			// This avoids any time the go command would
@@ -1023,9 +1071,7 @@ func (t test) run() error {
 				return err
 			}
 			exe := filepath.Join(tempDir, "test.exe")
-			cmd := []string{goTool, "tool", "link", "-s", "-w", "-importcfg=" + stdlibImportcfgFile()}
-			cmd = append(cmd, "-o", exe, pkg)
-			if _, err := runcmd(cmd...); err != nil {
+			if err := linkFile(runcmd, exe, pkg, stdlibImportcfgFile(), nil); err != nil {
 				return err
 			}
 			out, err = runcmd(append([]string{exe}, args...)...)
@@ -1110,19 +1156,15 @@ func (t test) run() error {
 	}
 }
 
-var execCmdOnce sync.Once
-var execCmd []string
-
-func findExecCmd() []string {
-	execCmdOnce.Do(func() {
-		if goos == runtime.GOOS && goarch == runtime.GOARCH {
-			// Do nothing.
-		} else if path, err := exec.LookPath(fmt.Sprintf("go_%s_%s_exec", goos, goarch)); err == nil {
-			execCmd = []string{path}
-		}
-	})
+var findExecCmd = sync.OnceValue(func() (execCmd []string) {
+	if goos == runtime.GOOS && goarch == runtime.GOARCH {
+		return nil
+	}
+	if path, err := exec.LookPath(fmt.Sprintf("go_%s_%s_exec", goos, goarch)); err == nil {
+		execCmd = []string{path}
+	}
 	return execCmd
-}
+})
 
 // checkExpectedOutput compares the output from compiling and/or running with the contents
 // of the corresponding reference output file, if any (replace ".go" with ".out").
@@ -1139,7 +1181,7 @@ func (t test) checkExpectedOutput(gotBytes []byte) error {
 	} else if err != nil {
 		return err
 	}
-	got = strings.Replace(got, "\r\n", "\n", -1)
+	got = strings.ReplaceAll(got, "\r\n", "\n")
 	if got != string(b) {
 		if err == nil {
 			return fmt.Errorf("output does not match expected in %s. Instead saw\n%s", filename, got)
@@ -1194,7 +1236,7 @@ func (t test) errorCheck(outStr string, wantAuto bool, fullshort ...string) (err
 	for i := range out {
 		for j := 0; j < len(fullshort); j += 2 {
 			full, short := fullshort[j], fullshort[j+1]
-			out[i] = strings.Replace(out[i], full, short, -1)
+			out[i] = replacePrefix(out[i], full, short)
 		}
 	}
 
@@ -1237,6 +1279,24 @@ func (t test) errorCheck(outStr string, wantAuto bool, fullshort ...string) (err
 	}
 
 	if len(out) > 0 {
+		// If a test uses -m and instantiates an imported generic function,
+		// the errors will include messages for the instantiated function
+		// with locations in the other package. Filter those out.
+		localOut := make([]string, 0, len(out))
+	outLoop:
+		for _, errLine := range out {
+			for j := 0; j < len(fullshort); j += 2 {
+				full, short := fullshort[j], fullshort[j+1]
+				if strings.HasPrefix(errLine, full+":") || strings.HasPrefix(errLine, short+":") {
+					localOut = append(localOut, errLine)
+					continue outLoop
+				}
+			}
+		}
+		out = localOut
+	}
+
+	if len(out) > 0 {
 		errs = append(errs, fmt.Errorf("Unmatched Errors:"))
 		for _, errLine := range out {
 			errs = append(errs, fmt.Errorf("%s", errLine))
@@ -1273,9 +1333,16 @@ func (test) updateErrors(out, file string) {
 	// Parse new errors.
 	errors := make(map[int]map[string]bool)
 	tmpRe := regexp.MustCompile(`autotmp_\d+`)
+	fileRe := regexp.MustCompile(`(\.go):\d+:`)
 	for _, errStr := range splitOutput(out, false) {
-		errFile, rest, ok := strings.Cut(errStr, ":")
-		if !ok || errFile != file {
+		m := fileRe.FindStringSubmatchIndex(errStr)
+		if len(m) != 4 {
+			continue
+		}
+		// The end of the file is the end of the first and only submatch.
+		errFile := errStr[:m[3]]
+		rest := errStr[m[3]+1:]
+		if errFile != file {
 			continue
 		}
 		lineStr, msg, ok := strings.Cut(rest, ":")
@@ -1287,12 +1354,12 @@ func (test) updateErrors(out, file string) {
 		if err != nil || line < 0 || line >= len(lines) {
 			continue
 		}
-		msg = strings.Replace(msg, file, base, -1) // normalize file mentions in error itself
+		msg = strings.ReplaceAll(msg, file, base) // normalize file mentions in error itself
 		msg = strings.TrimLeft(msg, " \t")
 		for _, r := range []string{`\`, `*`, `+`, `?`, `[`, `]`, `(`, `)`} {
-			msg = strings.Replace(msg, r, `\`+r, -1)
+			msg = strings.ReplaceAll(msg, r, `\`+r)
 		}
-		msg = strings.Replace(msg, `"`, `.`, -1)
+		msg = strings.ReplaceAll(msg, `"`, `.`)
 		msg = tmpRe.ReplaceAllLiteralString(msg, `autotmp_[0-9]+`)
 		if errors[line] == nil {
 			errors[line] = make(map[string]bool)
@@ -1325,11 +1392,12 @@ func (test) updateErrors(out, file string) {
 // That is, it needs the file name prefix followed by a : or a [,
 // and possibly preceded by a directory name.
 func matchPrefix(s, prefix string) bool {
+	s = s[len(filepath.VolumeName(s)):]
 	i := strings.Index(s, ":")
 	if i < 0 {
 		return false
 	}
-	j := strings.LastIndex(s[:i], "/")
+	j := strings.LastIndex(s[:i], string(filepath.Separator))
 	s = s[j+1:]
 	if len(s) <= len(prefix) || s[:len(prefix)] != prefix {
 		return false
@@ -1362,10 +1430,11 @@ type wantedError struct {
 }
 
 var (
-	errRx       = regexp.MustCompile(`// (?:GC_)?ERROR (.*)`)
-	errAutoRx   = regexp.MustCompile(`// (?:GC_)?ERRORAUTO (.*)`)
-	errQuotesRx = regexp.MustCompile(`"([^"]*)"`)
-	lineRx      = regexp.MustCompile(`LINE(([+-])(\d+))?`)
+	errRx            = regexp.MustCompile(`// (?:GC_)?ERROR (.*)`)
+	errAutoRx        = regexp.MustCompile(`// (?:GC_)?ERRORAUTO (.*)`)
+	errQuotesRx      = regexp.MustCompile(`"([^"]*)"`)
+	lineRx           = regexp.MustCompile(`LINE(([+-])(\d+))?`)
+	possibleOpcodeRx = regexp.MustCompile(`([A-Z][A-Z]|[IF](32|64))`) // two caps, or a wasm prefix
 )
 
 func (t test) wantedErrors(file, short string) (errs []wantedError) {
@@ -1431,9 +1500,10 @@ func (t test) wantedErrors(file, short string) (errs []wantedError) {
 
 const (
 	// Regexp to match a single opcode check: optionally begin with "-" (to indicate
-	// a negative check), followed by a string literal enclosed in "" or ``. For "",
+	// a negative check) or a positive number (to specify the expected number of
+	// matches), followed by a string literal enclosed in "" or ``. For "",
 	// backslashes must be handled.
-	reMatchCheck = `-?(?:\x60[^\x60]*\x60|"(?:[^"\\]|\\.)*")`
+	reMatchCheck = `(-|[1-9]\d*)?(?:\x60[^\x60]*\x60|"(?:[^"\\]|\\.)*")`
 )
 
 var (
@@ -1443,7 +1513,19 @@ var (
 	// Regexp to extract an architecture check: architecture name (or triplet),
 	// followed by semi-colon, followed by a comma-separated list of opcode checks.
 	// Extraneous spaces are ignored.
-	rxAsmPlatform = regexp.MustCompile(`(\w+)(/\w+)?(/\w*)?\s*:\s*(` + reMatchCheck + `(?:\s*,\s*` + reMatchCheck + `)*)`)
+	//
+	// An example: arm64/v8.1 : -`ADD` `SUB`
+	//	"(\w+)" matches "arm64" (architecture name)
+	//	"(/[\w.]+)?" matches "v8.1" (architecture version)
+	//	"(/\w*)?" doesn't match anything here (it's an optional part of the triplet)
+	//	"\s*:\s*" matches " : " (semi-colon)
+	//	"(" starts a capturing group
+	//      first reMatchCheck matches "-`ADD`"
+	//	`(?:" starts a non-capturing group
+	//	"[\s,]+" matches " "
+	//	second reMatchCheck matches "`SUB`"
+	//	")*)" closes started groups; "*" means that there might be other elements in the space-separated list
+	rxAsmPlatform = regexp.MustCompile(`(\w+)(/[\w.]+)?(/\w*)?\s*:\s*(` + reMatchCheck + `(?:[\s,]+` + reMatchCheck + `)*)`)
 
 	// Regexp to extract a single opcoded check
 	rxAsmCheck = regexp.MustCompile(reMatchCheck)
@@ -1454,8 +1536,8 @@ var (
 	archVariants = map[string][]string{
 		"386":     {"GO386", "sse2", "softfloat"},
 		"amd64":   {"GOAMD64", "v1", "v2", "v3", "v4"},
-		"arm":     {"GOARM", "5", "6", "7"},
-		"arm64":   {},
+		"arm":     {"GOARM", "5", "6", "7", "7,softfloat"},
+		"arm64":   {"GOARM64", "v8.0", "v8.1"},
 		"loong64": {},
 		"mips":    {"GOMIPS", "hardfloat", "softfloat"},
 		"mips64":  {"GOMIPS64", "hardfloat", "softfloat"},
@@ -1464,7 +1546,7 @@ var (
 		"ppc64x":  {}, // A pseudo-arch representing both ppc64 and ppc64le
 		"s390x":   {},
 		"wasm":    {},
-		"riscv64": {},
+		"riscv64": {"GORISCV64", "rva20u64", "rva22u64", "rva23u64"},
 	}
 )
 
@@ -1473,6 +1555,8 @@ type wantedAsmOpcode struct {
 	fileline string         // original source file/line (eg: "/path/foo.go:45")
 	line     int            // original source line
 	opcode   *regexp.Regexp // opcode check to be performed on assembly output
+	expected int            // expected number of matches
+	actual   int            // actual number that matched
 	negative bool           // true if the check is supposed to fail rather than pass
 	found    bool           // true if the opcode check matched at least one in the output
 }
@@ -1535,9 +1619,10 @@ func (t test) wantedAsmOpcodes(fn string) asmChecks {
 		// Parse and extract any architecture check from comments,
 		// made by one architecture name and multiple checks.
 		lnum := fn + ":" + strconv.Itoa(i+1)
+		lastUsed := 0
 		for _, ac := range rxAsmPlatform.FindAllStringSubmatch(comment, -1) {
 			archspec, allchecks := ac[1:4], ac[4]
-
+			lastUsed = strings.LastIndex(comment, allchecks) + len(allchecks)
 			var arch, subarch, os string
 			switch {
 			case archspec[2] != "": // 3 components: "linux/386/sse2"
@@ -1579,9 +1664,16 @@ func (t test) wantedAsmOpcodes(fn string) asmChecks {
 
 			for _, m := range rxAsmCheck.FindAllString(allchecks, -1) {
 				negative := false
+				expected := 0
 				if m[0] == '-' {
 					negative = true
 					m = m[1:]
+				} else if '1' <= m[0] && m[0] <= '9' {
+					for '0' <= m[0] && m[0] <= '9' {
+						expected *= 10
+						expected += int(m[0] - '0')
+						m = m[1:]
+					}
 				}
 
 				rxsrc, err := strconv.Unquote(m)
@@ -1607,12 +1699,29 @@ func (t test) wantedAsmOpcodes(fn string) asmChecks {
 						ops[env] = make(map[string][]wantedAsmOpcode)
 					}
 					ops[env][lnum] = append(ops[env][lnum], wantedAsmOpcode{
+						expected: expected,
 						negative: negative,
 						fileline: lnum,
 						line:     i + 1,
 						opcode:   oprx,
 					})
 				}
+			}
+		}
+		if lastUsed > 0 {
+			// There was an asm spec in this comment. Check for possible syntax
+			// errors, which would leave some asm patterns unused. We want
+			//  to allow some tail, for example for English comments. The
+			// heuristic we use here is we look for two consecutive capital
+			// letters (or a wasm prefix). Those are probably assembly mnemonics
+			// that weren't used.
+			tail := comment[lastUsed:]
+			if possibleOpcodeRx.MatchString(tail) {
+				t.Errorf("%s:%d: possible unused assembly pattern: %v", t.goFileName(), i+1, tail)
+			} else if strings.Count(comment, "\"")%2 != 0 || strings.Count(comment, "`")%2 != 0 {
+				t.Errorf("%s:%d: unbalanced quotes: %v", t.goFileName(), i+1, comment)
+			} else if strings.Contains(comment, "\",") || strings.Contains(comment, "`,") {
+				t.Errorf("%s:%d: comma separator - use space instead: %v", t.goFileName(), i+1, comment)
 			}
 		}
 		comment = ""
@@ -1646,6 +1755,9 @@ func (t test) asmCheck(outStr string, fn string, env buildEnv, fullops map[strin
 		}
 		srcFileLine, asm := matches[1], matches[2]
 
+		// Replace tabs with single spaces to make matches easier to write.
+		asm = strings.ReplaceAll(asm, "\t", " ")
+
 		// Associate the original file/line information to the current
 		// function in the output; it will be useful to dump it in case
 		// of error.
@@ -1655,7 +1767,8 @@ func (t test) asmCheck(outStr string, fn string, env buildEnv, fullops map[strin
 		// run the checks.
 		if ops, found := fullops[srcFileLine]; found {
 			for i := range ops {
-				if !ops[i].found && ops[i].opcode.FindString(asm) != "" {
+				if (!ops[i].found || ops[i].expected > 0) && ops[i].opcode.FindString(asm) != "" {
+					ops[i].actual++
 					ops[i].found = true
 				}
 			}
@@ -1669,6 +1782,9 @@ func (t test) asmCheck(outStr string, fn string, env buildEnv, fullops map[strin
 			// There's a failure if a negative match was found,
 			// or a positive match was not found.
 			if o.negative == o.found {
+				failed = append(failed, o)
+			}
+			if o.expected > 0 && o.expected != o.actual {
 				failed = append(failed, o)
 			}
 		}
@@ -1693,9 +1809,11 @@ func (t test) asmCheck(outStr string, fn string, env buildEnv, fullops map[strin
 		}
 
 		if o.negative {
-			fmt.Fprintf(&errbuf, "%s:%d: %s: wrong opcode found: %q\n", t.goFileName(), o.line, env, o.opcode.String())
+			fmt.Fprintf(&errbuf, "%s:%d: %s: wrong opcode found: %#q\n", t.goFileName(), o.line, env, o.opcode.String())
+		} else if o.expected > 0 {
+			fmt.Fprintf(&errbuf, "%s:%d: %s: wrong number of opcodes: %#q\n", t.goFileName(), o.line, env, o.opcode.String())
 		} else {
-			fmt.Fprintf(&errbuf, "%s:%d: %s: opcode not found: %q\n", t.goFileName(), o.line, env, o.opcode.String())
+			fmt.Fprintf(&errbuf, "%s:%d: %s: opcode not found: %#q\n", t.goFileName(), o.line, env, o.opcode.String())
 		}
 	}
 	return errors.New(errbuf.String())
@@ -1747,6 +1865,9 @@ func TestShouldTest(t *testing.T) {
 
 	// Test that (!a OR !b) matches anything.
 	assert(shouldTest("// +build !windows !plan9", "windows", "amd64"))
+
+	// Test that //go:build tag match.
+	assert(shouldTest("//go:build go1.4", "linux", "amd64"))
 }
 
 // overlayDir makes a minimal-overhead copy of srcRoot in which new files may be added.
@@ -1828,7 +1949,6 @@ var types2Failures = setOf(
 	"fixedbugs/issue20233.go", // types2 reports two instead of one error (preference: 1.17 compiler)
 	"fixedbugs/issue20245.go", // types2 reports two instead of one error (preference: 1.17 compiler)
 	"fixedbugs/issue31053.go", // types2 reports "unknown field" instead of "cannot refer to unexported field"
-	"fixedbugs/notinheap.go",  // types2 doesn't report errors about conversions that are invalid due to //go:notinheap
 )
 
 var types2Failures32Bit = setOf(
@@ -1929,4 +2049,24 @@ func splitQuoted(s string) (r []string, err error) {
 		err = errors.New("unfinished escaping")
 	}
 	return args, err
+}
+
+// replacePrefix is like strings.ReplaceAll, but only replaces instances of old
+// that are preceded by ' ', '\t', or appear at the beginning of a line.
+//
+// This does the same kind of filename string replacement as cmd/go.
+// Pilfered from src/cmd/go/internal/work/shell.go .
+func replacePrefix(s, old, new string) string {
+	n := strings.Count(s, old)
+	if n == 0 {
+		return s
+	}
+
+	s = strings.ReplaceAll(s, " "+old, " "+new)
+	s = strings.ReplaceAll(s, "\n"+old, "\n"+new)
+	s = strings.ReplaceAll(s, "\n\t"+old, "\n\t"+new)
+	if strings.HasPrefix(s, old) {
+		s = new + s[len(old):]
+	}
+	return s
 }

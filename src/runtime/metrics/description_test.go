@@ -18,7 +18,7 @@ import (
 	"os"
 	"regexp"
 	"runtime/metrics"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 	_ "unsafe"
@@ -43,7 +43,7 @@ func TestNames(t *testing.T) {
 	}
 
 	names := runtime_readMetricNames()
-	sort.Strings(names)
+	slices.Sort(names)
 	samples := make([]metrics.Sample, len(names))
 	for i, name := range names {
 		samples[i].Name = name
@@ -94,7 +94,7 @@ func TestDocs(t *testing.T) {
 		t.Fatal(err)
 	}
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "doc.go", src, parser.ParseComments)
+	f, err := parser.ParseFile(fset, "doc.go", src, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,4 +155,11 @@ func TestDocs(t *testing.T) {
 	} else if *generate {
 		fmt.Fprintf(os.Stderr, "go test -generate: doc.go already up-to-date\n")
 	}
+}
+
+func TestReadEmptySlice(t *testing.T) {
+	// Test that Read does not panic when given an empty slice.
+	// This should be a no-op.
+	metrics.Read(nil)
+	metrics.Read([]metrics.Sample{})
 }

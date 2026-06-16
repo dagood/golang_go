@@ -42,10 +42,12 @@ thing that go work use does.
 
 The -r flag searches recursively for modules in the argument
 directories, and the use command operates as if each of the directories
-were specified as arguments: namely, use directives will be added for
-directories that exist, and removed for directories that do not exist.
+were specified as arguments. When -r is used, symlinks to directories
+within the argument tree are ignored.
 
-
+The go command matches use paths to module directories without resolving
+symbolic links. A use directive that names a symlink to a directory is
+not interchangeable with one that names the symlink's target.
 
 See the workspaces reference at https://go.dev/ref/mod#workspaces
 for more information.
@@ -62,9 +64,10 @@ func init() {
 }
 
 func runUse(ctx context.Context, cmd *base.Command, args []string) {
-	modload.ForceUseModules = true
-	modload.InitWorkfile()
-	gowork := modload.WorkFilePath()
+	moduleLoader := modload.NewLoader()
+	moduleLoader.ForceUseModules = true
+	moduleLoader.InitWorkfile()
+	gowork := modload.WorkFilePath(moduleLoader)
 	if gowork == "" {
 		base.Fatalf("go: no go.work file found\n\t(run 'go work init' first or specify path using GOWORK environment variable)")
 	}
@@ -72,11 +75,11 @@ func runUse(ctx context.Context, cmd *base.Command, args []string) {
 	if err != nil {
 		base.Fatal(err)
 	}
-	workUse(ctx, gowork, wf, args)
+	workUse(ctx, moduleLoader, gowork, wf, args)
 	modload.WriteWorkFile(gowork, wf)
 }
 
-func workUse(ctx context.Context, gowork string, wf *modfile.WorkFile, args []string) {
+func workUse(ctx context.Context, s *modload.Loader, gowork string, wf *modfile.WorkFile, args []string) {
 	workDir := filepath.Dir(gowork) // absolute, since gowork itself is absolute
 
 	haveDirs := make(map[string][]string) // absolute → original(s)
@@ -95,7 +98,7 @@ func workUse(ctx context.Context, gowork string, wf *modfile.WorkFile, args []st
 	// all entries for the absolute path should be removed.
 	keepDirs := make(map[string]string)
 
-	var sw toolchain.Switcher
+	sw := toolchain.NewSwitcher(s)
 
 	// lookDir updates the entry in keepDirs for the directory dir,
 	// which is either absolute or relative to the current working directory
@@ -103,7 +106,7 @@ func workUse(ctx context.Context, gowork string, wf *modfile.WorkFile, args []st
 	lookDir := func(dir string) {
 		absDir, dir := pathRel(workDir, dir)
 
-		file := base.ShortPath(filepath.Join(absDir, "go.mod"))
+		file := filepath.Join(absDir, "go.mod")
 		fi, err := fsys.Stat(file)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -115,7 +118,7 @@ func workUse(ctx context.Context, gowork string, wf *modfile.WorkFile, args []st
 		}
 
 		if !fi.Mode().IsRegular() {
-			sw.Error(fmt.Errorf("%v is not a regular file", file))
+			sw.Error(fmt.Errorf("%v is not a regular file", base.ShortPath(file)))
 			return
 		}
 
@@ -128,7 +131,7 @@ func workUse(ctx context.Context, gowork string, wf *modfile.WorkFile, args []st
 	for _, useDir := range args {
 		absArg, _ := pathRel(workDir, useDir)
 
-		info, err := fsys.Stat(base.ShortPath(absArg))
+		info, err := fsys.Stat(absArg)
 		if err != nil {
 			// Errors raised from os.Stat are formatted to be more user-friendly.
 			if os.IsNotExist(err) {
@@ -150,18 +153,21 @@ func workUse(ctx context.Context, gowork string, wf *modfile.WorkFile, args []st
 		// If the root itself is a symlink to a directory,
 		// we want to follow it (see https://go.dev/issue/50807).
 		// Add a trailing separator to force that to happen.
-		fsys.Walk(str.WithFilePathSeparator(useDir), func(path string, info fs.FileInfo, err error) error {
+		fsys.WalkDir(str.WithFilePathSeparator(useDir), func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
 
-			if !info.IsDir() {
-				if info.Mode()&fs.ModeSymlink != 0 {
+			if !d.IsDir() {
+				if d.Type()&fs.ModeSymlink != 0 {
 					if target, err := fsys.Stat(path); err == nil && target.IsDir() {
 						fmt.Fprintf(os.Stderr, "warning: ignoring symlink %s\n", base.ShortPath(path))
 					}
 				}
 				return nil
+			}
+			if d.Name() == "vendor" {
+				return filepath.SkipDir
 			}
 			lookDir(path)
 			return nil
@@ -210,7 +216,7 @@ func workUse(ctx context.Context, gowork string, wf *modfile.WorkFile, args []st
 		} else {
 			abs = filepath.Join(workDir, use.Path)
 		}
-		_, mf, err := modload.ReadModFile(base.ShortPath(filepath.Join(abs, "go.mod")), nil)
+		_, mf, err := modload.ReadModFile(filepath.Join(abs, "go.mod"), nil)
 		if err != nil {
 			sw.Error(err)
 			continue

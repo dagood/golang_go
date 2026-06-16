@@ -225,6 +225,13 @@ TEXT runtime·mincore(SB),NOSPLIT|NOFRAME,$0-28
 
 // func walltime() (sec int64, nsec int32)
 TEXT runtime·walltime(SB),NOSPLIT,$24-12
+#ifdef GOEXPERIMENT_runtimesecret
+	MOVW 	g_secret(g), R20
+	CBZ 	R20, nosecret
+	BL	·secretEraseRegisters(SB)
+
+nosecret:
+#endif
 	MOVD	RSP, R20	// R20 is unchanged by C code
 	MOVD	RSP, R1
 
@@ -309,6 +316,13 @@ finish:
 	RET
 
 TEXT runtime·nanotime1(SB),NOSPLIT,$24-8
+#ifdef GOEXPERIMENT_runtimesecret
+	MOVW	g_secret(g), R20
+	CBZ	R20, nosecret
+	BL	·secretEraseRegisters(SB)
+
+nosecret:
+#endif
 	MOVD	RSP, R20	// R20 is unchanged by C code
 	MOVD	RSP, R1
 
@@ -784,4 +798,49 @@ TEXT runtime·sbrk0(SB),NOSPLIT,$0-8
 	MOVD	$SYS_brk, R8
 	SVC
 	MOVD	R0, ret+0(FP)
+	RET
+
+// func vgetrandom1(buf *byte, length uintptr, flags uint32, state uintptr, stateSize uintptr) int
+TEXT runtime·vgetrandom1<ABIInternal>(SB),NOSPLIT,$16-48
+	MOVD	RSP, R20
+
+	MOVD	runtime·vdsoGetrandomSym(SB), R8
+	MOVD	g_m(g), R21
+
+	MOVD	m_vdsoPC(R21), R9
+	MOVD	R9, 8(RSP)
+	MOVD	m_vdsoSP(R21), R9
+	MOVD	R9, 16(RSP)
+	MOVD	LR, m_vdsoPC(R21)
+	MOVD	$buf-8(FP), R9
+	MOVD	R9, m_vdsoSP(R21)
+
+	MOVD	RSP, R9
+	BIC	$15, R9
+	MOVD	R9, RSP
+
+	MOVBU	runtime·iscgo(SB), R9
+	CBNZ	R9, nosaveg
+	MOVD	m_gsignal(R21), R9
+	CBZ	R9, nosaveg
+	CMP	g, R9
+	BEQ	nosaveg
+	MOVD	(g_stack+stack_lo)(R9), R22
+	MOVD	g, (R22)
+
+	BL	(R8)
+
+	MOVD	ZR, (R22)
+	B	restore
+
+nosaveg:
+	BL	(R8)
+
+restore:
+	MOVD	R20, RSP
+	MOVD	16(RSP), R1
+	MOVD	R1, m_vdsoSP(R21)
+	MOVD	8(RSP), R1
+	MOVD	R1, m_vdsoPC(R21)
+	NOP	R0 // Satisfy go vet, since the return value comes from the vDSO function.
 	RET

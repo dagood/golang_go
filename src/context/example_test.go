@@ -146,8 +146,8 @@ func ExampleAfterFunc_cond() {
 		defer stopf()
 
 		// Since the wakeups are using Broadcast instead of Signal, this call to
-		// Wait may unblock due to some other goroutine's context becoming done,
-		// so to be sure that ctx is actually done we need to check it in a loop.
+		// Wait may unblock due to some other goroutine's context being canceled,
+		// so to be sure that ctx is actually canceled we need to check it in a loop.
 		for !conditionMet() {
 			cond.Wait()
 			if ctx.Err() != nil {
@@ -161,11 +161,8 @@ func ExampleAfterFunc_cond() {
 	cond := sync.NewCond(new(sync.Mutex))
 
 	var wg sync.WaitGroup
-	for i := 0; i < 4; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
+	for range 4 {
+		wg.Go(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
 			defer cancel()
 
@@ -174,7 +171,7 @@ func ExampleAfterFunc_cond() {
 
 			err := waitOnCond(ctx, cond, func() bool { return false })
 			fmt.Println(err)
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -205,7 +202,7 @@ func ExampleAfterFunc_connection() {
 		return n, err
 	}
 
-	listener, err := net.Listen("tcp", ":0")
+	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		fmt.Println(err)
 		return

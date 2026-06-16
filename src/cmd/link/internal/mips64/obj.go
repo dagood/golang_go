@@ -63,7 +63,7 @@ func Init() (*sys.Arch, ld.Arch) {
 			Linuxdynld:     "/lib64/ld64.so.1",
 			LinuxdynldMusl: musl,
 			Freebsddynld:   "XXX",
-			Openbsddynld:   "/usr/libexec/ld.so",
+			Openbsddynld:   "XXX",
 			Netbsddynld:    "XXX",
 			Dragonflydynld: "XXX",
 			Solarisdynld:   "XXX",
@@ -88,23 +88,21 @@ func archinit(ctxt *ld.Link) {
 
 	case objabi.Hplan9: /* plan 9 */
 		ld.HEADR = 32
-
-		if *ld.FlagTextAddr == -1 {
-			*ld.FlagTextAddr = 16*1024 + int64(ld.HEADR)
-		}
 		if *ld.FlagRound == -1 {
 			*ld.FlagRound = 16 * 1024
 		}
+		if *ld.FlagTextAddr == -1 {
+			*ld.FlagTextAddr = ld.Rnd(16*1024, *ld.FlagRound) + int64(ld.HEADR)
+		}
 
-	case objabi.Hlinux, /* mips64 elf */
-		objabi.Hopenbsd:
+	case objabi.Hlinux: /* mips64 elf */
 		ld.Elfinit(ctxt)
 		ld.HEADR = ld.ELFRESERVE
-		if *ld.FlagTextAddr == -1 {
-			*ld.FlagTextAddr = 0x10000 + int64(ld.HEADR)
-		}
 		if *ld.FlagRound == -1 {
 			*ld.FlagRound = 0x10000
+		}
+		if *ld.FlagTextAddr == -1 {
+			*ld.FlagTextAddr = ld.Rnd(0x10000, *ld.FlagRound) + int64(ld.HEADR)
 		}
 	}
 

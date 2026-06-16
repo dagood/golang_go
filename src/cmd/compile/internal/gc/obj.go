@@ -57,7 +57,7 @@ func dumpobj1(outfile string, mode int) {
 		fmt.Printf("can't create %s: %v\n", outfile, err)
 		base.ErrorExit()
 	}
-	defer bout.Close()
+
 	bout.WriteString("!<arch>\n")
 
 	if mode&modeCompilerObj != 0 {
@@ -69,6 +69,12 @@ func dumpobj1(outfile string, mode int) {
 		start := startArchiveEntry(bout)
 		dumpLinkerObj(bout)
 		finishArchiveEntry(bout, start, "_go_.o")
+	}
+
+	if err := bout.Close(); err != nil {
+		base.FlushErrors()
+		fmt.Printf("error while writing to file %s: %v\n", outfile, err)
+		base.ErrorExit()
 	}
 }
 
@@ -110,38 +116,9 @@ func dumpCompilerObj(bout *bio.Writer) {
 }
 
 func dumpdata() {
-	numExterns := len(typecheck.Target.Externs)
-	numDecls := len(typecheck.Target.Funcs)
-	dumpglobls(typecheck.Target.Externs)
-	addsignats(typecheck.Target.Externs)
-	reflectdata.WriteRuntimeTypes()
+	reflectdata.WriteGCSymbols()
 	reflectdata.WritePluginTable()
-	reflectdata.WriteImportStrings()
-	reflectdata.WriteBasicTypes()
 	dumpembeds()
-
-	// Calls to WriteRuntimeTypes can generate functions,
-	// like method wrappers and hash and equality routines.
-	// Compile any generated functions, process any new resulting types, repeat.
-	// This can't loop forever, because there is no way to generate an infinite
-	// number of types in a finite amount of code.
-	// In the typical case, we loop 0 or 1 times.
-	// It was not until issue 24761 that we found any code that required a loop at all.
-	for {
-		for i := numDecls; i < len(typecheck.Target.Funcs); i++ {
-			fn := typecheck.Target.Funcs[i]
-			enqueueFunc(fn)
-		}
-		numDecls = len(typecheck.Target.Funcs)
-		compileFunctions()
-		reflectdata.WriteRuntimeTypes()
-		if numDecls == len(typecheck.Target.Funcs) {
-			break
-		}
-	}
-
-	// Dump extra globals.
-	dumpglobls(typecheck.Target.Externs[numExterns:])
 
 	if reflectdata.ZeroSize > 0 {
 		zero := base.PkgLinksym("go:map", "zero", obj.ABI0)
@@ -183,10 +160,10 @@ func dumpGlobal(n *ir.Name) {
 	}
 	types.CalcSize(n.Type())
 	ggloblnod(n)
-	if n.CoverageCounter() || n.CoverageAuxVar() || n.Linksym().Static() {
+	if n.CoverageAuxVar() || n.Linksym().Static() {
 		return
 	}
-	base.Ctxt.DwarfGlobal(base.Ctxt.Pkgpath, types.TypeSymName(n.Type()), n.Linksym())
+	base.Ctxt.DwarfGlobal(types.TypeSymName(n.Type()), n.Linksym())
 }
 
 func dumpGlobalConst(n *ir.Name) {
@@ -214,19 +191,7 @@ func dumpGlobalConst(n *ir.Name) {
 		// that type so the linker knows about it. See issue 51245.
 		_ = reflectdata.TypeLinksym(t)
 	}
-	base.Ctxt.DwarfIntConst(base.Ctxt.Pkgpath, n.Sym().Name, types.TypeSymName(t), ir.IntVal(t, v))
-}
-
-func dumpglobls(externs []*ir.Name) {
-	// add globals
-	for _, n := range externs {
-		switch n.Op() {
-		case ir.ONAME:
-			dumpGlobal(n)
-		case ir.OLITERAL:
-			dumpGlobalConst(n)
-		}
-	}
+	base.Ctxt.DwarfIntConst(n.Sym().Name, types.TypeSymName(t), ir.IntVal(t, v))
 }
 
 // addGCLocals adds gcargs, gclocals, gcregs, and stack object symbols to Ctxt.Data.
@@ -294,6 +259,11 @@ func ggloblnod(nam *ir.Name) {
 	linkname := nam.Sym().Linkname
 	name := nam.Sym().Name
 
+	var saveType objabi.SymKind
+	if nam.CoverageAuxVar() {
+		saveType = s.Type
+	}
+
 	// We've skipped linkname'd globals's instrument, so we can skip them here as well.
 	if base.Flag.ASan && linkname == "" && pkginit.InstrumentGlobalsMap[name] != nil {
 		// Write the new size of instrumented global variables that have
@@ -307,8 +277,9 @@ func ggloblnod(nam *ir.Name) {
 	if nam.Libfuzzer8BitCounter() {
 		s.Type = objabi.SLIBFUZZER_8BIT_COUNTER
 	}
-	if nam.CoverageCounter() {
-		s.Type = objabi.SCOVERAGE_COUNTER
+	if nam.CoverageAuxVar() && saveType == objabi.SCOVERAGE_COUNTER {
+		// restore specialized counter type (which Globl call above overwrote)
+		s.Type = saveType
 	}
 	if nam.Sym().Linkname != "" {
 		// Make sure linkname'd symbol is non-package. When a symbol is
@@ -321,14 +292,5 @@ func ggloblnod(nam *ir.Name) {
 func dumpembeds() {
 	for _, v := range typecheck.Target.Embeds {
 		staticdata.WriteEmbed(v)
-	}
-}
-
-func addsignats(dcls []*ir.Name) {
-	// copy types from dcl list to signatset
-	for _, n := range dcls {
-		if n.Op() == ir.OTYPE {
-			reflectdata.NeedRuntimeType(n.Type())
-		}
 	}
 }

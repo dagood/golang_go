@@ -4,7 +4,14 @@
 
 package ssa
 
-import "testing"
+import (
+	"cmd/compile/internal/rttype"
+	"math"
+	"math/rand"
+	"reflect"
+	"testing"
+	"unsafe"
+)
 
 // We generate memmove for copy(x[1:], x[:]), however we may change it to OpMove,
 // because size is known. Check that OpMove is alias-safe, or we did call memmove.
@@ -35,6 +42,78 @@ func TestSubFlags(t *testing.T) {
 	if !subFlags32(0, 1).ult() {
 		t.Errorf("subFlags32(0,1).ult() returned false")
 	}
+}
+
+//go:noinline
+func unopt(f func(float64) float64, x float32) float32 {
+	return float32(f(float64(x)))
+}
+
+func differ(x, y float32) bool {
+	if x != x && y != y {
+		// if both are NaN, exact bit pattern of the NaN is uninteresting
+		return false
+	}
+	return math.Float32bits(x) != math.Float32bits(y)
+}
+
+func test32bitUnary(t *testing.T, x float32) {
+	if want, got := unopt(math.Round, x), float32(math.Round(float64(x))); differ(want, got) {
+		t.Errorf("Optimized 32-bit Round did not match, x=%f, want=%f, got=%f", x, want, got)
+	}
+	if want, got := unopt(math.RoundToEven, x), float32(math.RoundToEven(float64(x))); differ(want, got) {
+		t.Errorf("Optimized 32-bit RoundToEven did not match, x=%f, want=%f, got=%f", x, want, got)
+	}
+	if want, got := unopt(math.Trunc, x), float32(math.Trunc(float64(x))); differ(want, got) {
+		t.Errorf("Optimized 32-bit Trunc did not match, x=%f, want=%f, got=%f", x, want, got)
+	}
+	if want, got := unopt(math.Ceil, x), float32(math.Ceil(float64(x))); differ(want, got) {
+		t.Errorf("Optimized 32-bit Ceil did not match, x=%f, want=%f, got=%f", x, want, got)
+	}
+	if want, got := unopt(math.Floor, x), float32(math.Floor(float64(x))); differ(want, got) {
+		t.Errorf("Optimized 32-bit Floor did not match, x=%f, want=%f, got=%f", x, want, got)
+	}
+	if x >= 0 {
+		if want, got := unopt(math.Sqrt, x), float32(math.Sqrt(float64(x))); differ(want, got) {
+			t.Errorf("Optimized 32-bit Sqrt did not match, x=%f, want=%f, got=%f", x, want, got)
+		}
+	}
+	if want, got := unopt(math.Abs, x), float32(math.Abs(float64(x))); differ(want, got) {
+		t.Errorf("Optimized 32-bit Abs did not match, x=%f, want=%f, got=%f", x, want, got)
+	}
+
+}
+
+var zero float32
+
+func Test32bitUnary(t *testing.T) {
+	// this is mostly for testing rounding.
+	test32bitUnary(t, -1.5)
+	test32bitUnary(t, -0.5)
+	test32bitUnary(t, 0.5)
+	test32bitUnary(t, 1.5)
+
+	test32bitUnary(t, -1.4)
+	test32bitUnary(t, -0.4)
+	test32bitUnary(t, 0.4)
+	test32bitUnary(t, 1.4)
+
+	test32bitUnary(t, -1.6)
+	test32bitUnary(t, -0.6)
+	test32bitUnary(t, 0.6)
+	test32bitUnary(t, 1.6)
+
+	// negative zero
+	test32bitUnary(t, 1/(-1/zero))
+
+	var rnd = rand.New(rand.NewSource(0))
+
+	for i := uint32(0); i <= 1<<20; i++ {
+		test32bitUnary(t, math.Float32frombits(math.Float32bits(math.MaxFloat32)-i))
+		test32bitUnary(t, float32(i)+1.5)
+		test32bitUnary(t, math.Float32frombits(rnd.Uint32()))
+	}
+
 }
 
 func TestIsPPC64WordRotateMask(t *testing.T) {
@@ -215,6 +294,85 @@ func TestMergePPC64AndSrwi(t *testing.T) {
 			t.Errorf("mergePPC64AndSrwi(Test %d) should return 0", i)
 		} else if r, _, _, m := DecodePPC64RotateMask(result); v.rotate != r || v.mask != m {
 			t.Errorf("mergePPC64AndSrwi(Test %d) got (%d,0x%x) expected (%d,0x%x)", i, r, m, v.rotate, v.mask)
+		}
+	}
+}
+
+func TestDisjointTypes(t *testing.T) {
+	tests := []struct {
+		v1, v2   any // two pointers to some types
+		expected bool
+	}{
+		{new(int8), new(int8), false},
+		{new(int8), new(float32), false},
+		{new(int8), new(*int8), true},
+		{new(*int8), new(*float32), false},
+		{new(*int8), new(chan<- int8), false},
+		{new(**int8), new(*int8), false},
+		{new(***int8), new(**int8), false},
+		{new(int8), new(chan<- int8), true},
+		{new(int), unsafe.Pointer(nil), false},
+		{new(byte), new(string), false},
+		{new(int), new(string), false},
+		{new(*int8), new(struct{ a, b int }), true},
+		{new(*int8), new(struct {
+			a *int
+			b int
+		}), false},
+		{new(*int8), new(struct {
+			a int
+			b *int
+		}), false}, // with more precise analysis it should be true
+		{new(*byte), new(string), false},
+		{new(int), new(struct {
+			a int
+			b *int
+		}), false},
+		{new(float64), new(complex128), false},
+		{new(*byte), new([]byte), false},
+		{new(int), new([]byte), false},
+		{new(int), new([2]*byte), false}, // with more recise analysis it should be true
+		{new([2]int), new(*byte), true},
+	}
+	for _, tst := range tests {
+		t1 := rttype.FromReflect(reflect.TypeOf(tst.v1))
+		t2 := rttype.FromReflect(reflect.TypeOf(tst.v2))
+		result := disjointTypes(t1, t2)
+		if result != tst.expected {
+			t.Errorf("disjointTypes(%s, %s) got %t expected %t", t1.String(), t2.String(), result, tst.expected)
+		}
+	}
+}
+
+//go:noinline
+func foo(p1 *int64, p2 *float64) int64 {
+	*p1 = 10
+	*p2 = 0 // disjointTypes shouldn't consider this and preceding stores as non-aliasing
+	return *p1
+}
+
+func TestDisjointTypesRun(t *testing.T) {
+	f := float64(0)
+	i := (*int64)(unsafe.Pointer(&f))
+	r := foo(i, &f)
+	if r != 0 {
+		t.Errorf("disjointTypes gives an incorrect answer that leads to an incorrect optimization.")
+	}
+}
+
+func TestModularMultiplicativeInverse(t *testing.T) {
+	t.Parallel()
+
+	// We've got 63 bits of phase space for the Multiplier
+	// Needless to say this is too much to bruteforce here.
+	// I've randomly picked a range of 1<<24 because it runs in 0.03s on my machine which isn't too slow.
+	// We test both sides of the wrapping point (0 and math.MaxUint64) since we need to test something and it's a usual place to have bugs.
+	const halfRange = 1 << 23
+	for i := -int64(halfRange) - 1; i < halfRange; i += 2 { // odd only, a bit after to a bit before the wrapping point
+		mmi := modularMultiplicativeInverse(uint64(i))
+
+		if uint64(i)*mmi != 1 {
+			t.Errorf("%d * modularMultiplicativeInverse(%d) != 1; modularMultiplicativeInverse(%d) == %d", i, i, i, mmi)
 		}
 	}
 }

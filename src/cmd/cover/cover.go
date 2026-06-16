@@ -6,26 +6,29 @@ package main
 
 import (
 	"bytes"
+	"cmd/internal/cov/covcmd"
+	"cmp"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"go/ast"
 	"go/parser"
+	"go/scanner"
 	"go/token"
 	"internal/coverage"
-	"internal/coverage/covcmd"
 	"internal/coverage/encodemeta"
 	"internal/coverage/slicewriter"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
 	"cmd/internal/edit"
 	"cmd/internal/objabi"
+	"cmd/internal/telemetry/counter"
 )
 
 const usageMessage = "" +
@@ -51,7 +54,7 @@ where -pkgcfg points to a file containing the package path,
 package name, module path, and related info from "go build",
 and -outfilelist points to a file containing the filenames
 of the instrumented output files (one per input file).
-See https://pkg.go.dev/internal/coverage/covcmd#CoverPkgConfig for
+See https://pkg.go.dev/cmd/internal/cov/covcmd#CoverPkgConfig for
 more on the package config.
 `
 
@@ -64,29 +67,21 @@ func usage() {
 }
 
 var (
-	mode        = flag.String("mode", "", "coverage mode: set, count, atomic")
-	varVar      = flag.String("var", "GoCover", "name of coverage variable to generate")
-	output      = flag.String("o", "", "file for output")
-	outfilelist = flag.String("outfilelist", "", "file containing list of output files (one per line) if -pkgcfg is in use")
-	htmlOut     = flag.String("html", "", "generate HTML representation of coverage profile")
-	funcOut     = flag.String("func", "", "output coverage profile information for each function")
-	pkgcfg      = flag.String("pkgcfg", "", "enable full-package instrumentation mode using params from specified config file")
+	mode             = flag.String("mode", "", "coverage mode: set, count, atomic")
+	varVar           = flag.String("var", "GoCover", "name of coverage variable to generate")
+	output           = flag.String("o", "", "file for output")
+	outfilelist      = flag.String("outfilelist", "", "file containing list of output files (one per line) if -pkgcfg is in use")
+	htmlOut          = flag.String("html", "", "generate HTML representation of coverage profile")
+	funcOut          = flag.String("func", "", "output coverage profile information for each function")
+	pkgcfg           = flag.String("pkgcfg", "", "enable full-package instrumentation mode using params from specified config file")
+	pkgconfig        covcmd.CoverPkgConfig
+	outputfiles      []string // list of *.cover.go instrumented outputs to write, one per input (set when -pkgcfg is in use)
+	profile          string   // The profile to read; the value of -html or -func
+	counterStmt      func(*File, string) string
+	covervarsoutfile string // an additional Go source file into which we'll write definitions of coverage counter variables + meta data variables (set when -pkgcfg is in use).
+	cmode            coverage.CounterMode
+	cgran            coverage.CounterGranularity
 )
-
-var pkgconfig covcmd.CoverPkgConfig
-
-// outputfiles is the list of *.cover.go instrumented outputs to write,
-// one per input (set when -pkgcfg is in use)
-var outputfiles []string
-
-// covervarsoutfile is an additional Go source file into which we'll
-// write definitions of coverage counter variables + meta data variables
-// (set when -pkgcfg is in use).
-var covervarsoutfile string
-
-var profile string // The profile to read; the value of -html or -func
-
-var counterStmt func(*File, string) string
 
 const (
 	atomicPackagePath = "sync/atomic"
@@ -94,9 +89,13 @@ const (
 )
 
 func main() {
+	counter.Open()
+
 	objabi.AddVersionFlag()
 	flag.Usage = usage
 	objabi.Flagparse(usage)
+	counter.Inc("cover/invocations")
+	counter.CountFlags("cover/flag:", *flag.CommandLine)
 
 	// Usage information when no arguments.
 	if flag.NFlag() == 0 && flag.NArg() == 0 {
@@ -152,12 +151,19 @@ func parseFlags() error {
 		switch *mode {
 		case "set":
 			counterStmt = setCounterStmt
+			cmode = coverage.CtrModeSet
 		case "count":
 			counterStmt = incCounterStmt
+			cmode = coverage.CtrModeCount
 		case "atomic":
 			counterStmt = atomicCounterStmt
-		case "regonly", "testmain":
+			cmode = coverage.CtrModeAtomic
+		case "regonly":
 			counterStmt = nil
+			cmode = coverage.CtrModeRegOnly
+		case "testmain":
+			counterStmt = nil
+			cmode = coverage.CtrModeTestMain
 		default:
 			return fmt.Errorf("unknown -mode %v", *mode)
 		}
@@ -215,7 +221,12 @@ func readPackageConfig(path string) error {
 	if err := json.Unmarshal(data, &pkgconfig); err != nil {
 		return fmt.Errorf("error reading pkgconfig file %q: %v", path, err)
 	}
-	if pkgconfig.Granularity != "perblock" && pkgconfig.Granularity != "perfunc" {
+	switch pkgconfig.Granularity {
+	case "perblock":
+		cgran = coverage.CtrGranularityPerBlock
+	case "perfunc":
+		cgran = coverage.CtrGranularityPerFunc
+	default:
 		return fmt.Errorf(`%s: pkgconfig requires perblock/perfunc value`, path)
 	}
 	return nil
@@ -254,6 +265,142 @@ type File struct {
 	mdb     *encodemeta.CoverageMetaDataBuilder
 	fn      Func
 	pkg     *Package
+}
+
+// Range represents a contiguous range of executable code within a basic block.
+type Range struct {
+	pos token.Pos
+	end token.Pos
+}
+
+// codeRanges analyzes a block range and returns the sub-ranges that contain
+// executable code, excluding comment-only and blank lines.
+// If no executable code is found, it returns a single zero-width range at
+// start, so that callers always get at least one range (required by pkgcfg
+// mode, which needs a counter unit for every function body).
+func (f *File) codeRanges(start, end token.Pos) []Range {
+	var (
+		startOffset = f.offset(start)
+		endOffset   = f.offset(end)
+		src         = f.content[startOffset:endOffset]
+		origFile    = f.fset.File(start)
+	)
+
+	// Create a temporary File for scanning this block.
+	// We use a separate file because we're scanning a slice of the
+	// original source, so positions in scanFile are relative to the
+	// block start, not the original file.
+	scanFile := token.NewFileSet().AddFile("", -1, len(src))
+
+	var s scanner.Scanner
+	s.Init(scanFile, src, nil, 0)
+
+	// Build ranges in a single pass through the token stream.
+	// We track the last line known to contain code (prevEndLine).
+	// When the next token appears on a line beyond prevEndLine+1,
+	// a gap (comment or blank lines) has been detected: close the
+	// current range and start a new one. Using the token's position
+	// directly (rather than the line start) ensures counter insertion
+	// lands after any closing "*/" on that line.
+	var ranges []Range
+	var codeStart token.Pos // start of current code range (in origFile)
+	prevEndLine := 0        // last line with code; 0 means no code yet
+
+	for {
+		pos, tok, lit := s.Scan()
+		if tok == token.EOF {
+			break
+		}
+
+		// Skip braces and automatic semicolons: braces are block
+		// delimiters, not executable code. The Go spec
+		// (https://go.dev/ref/spec#Semicolons) requires the scanner
+		// to insert semicolons (with lit == "\n") after }, ), ], etc.
+		// These are always on lines already marked by real tokens,
+		// except for lone "}" lines. Skipping both prevents a lone
+		// "}" from being treated as a separate code range, which
+		// would cause counter insertion after return statements.
+		if tok == token.LBRACE || tok == token.RBRACE {
+			continue
+		}
+		if tok == token.SEMICOLON && lit == "\n" {
+			continue
+		}
+
+		// Use PositionFor with adjusted=false to ignore //line directives.
+		startLine := scanFile.PositionFor(pos, false).Line
+		endLine := startLine
+		if tok == token.STRING {
+			// Only string literals can span multiple lines.
+			// TODO(adonovan): simplify when https://go.dev/issue/74958 is resolved.
+			endLine = scanFile.PositionFor(pos+token.Pos(len(lit)), false).Line
+		}
+
+		if prevEndLine == 0 {
+			// First code token — start the first range.
+			codeStart = origFile.Pos(startOffset + scanFile.Offset(pos))
+		} else if startLine > prevEndLine+1 {
+			// Gap detected — close previous range, start new one.
+			codeEnd := origFile.Pos(startOffset + scanFile.Offset(scanFile.LineStart(prevEndLine+1)))
+			ranges = append(ranges, Range{pos: codeStart, end: codeEnd})
+			codeStart = origFile.Pos(startOffset + scanFile.Offset(pos))
+		}
+
+		if endLine > prevEndLine {
+			prevEndLine = endLine
+		}
+	}
+
+	// Close any open code range at the end.
+	if prevEndLine > 0 {
+		if prevEndLine < scanFile.LineCount() {
+			// There are non-code lines after the last code line
+			// (e.g., a lone "}"). Close at the next line's start.
+			codeEnd := origFile.Pos(startOffset + scanFile.Offset(scanFile.LineStart(prevEndLine+1)))
+			ranges = append(ranges, Range{pos: codeStart, end: codeEnd})
+		} else {
+			ranges = append(ranges, Range{pos: codeStart, end: end})
+		}
+	}
+
+	// If no code was found, return a zero-width range so that callers
+	// still get a counter (needed for pkgcfg function registration)
+	// but the range doesn't visually cover any source lines.
+	if len(ranges) == 0 {
+		return []Range{{pos: start, end: start}}
+	}
+
+	return ranges
+}
+
+// insideStatement reports whether pos falls strictly inside
+// (not at the start of) any statement in stmts.
+func insideStatement(pos token.Pos, stmts []ast.Stmt) bool {
+	// Binary search for the first statement starting at or after pos.
+	i, _ := slices.BinarySearchFunc(stmts, pos, func(s ast.Stmt, p token.Pos) int {
+		return cmp.Compare(s.Pos(), p)
+	})
+	// Check if pos falls inside the preceding statement.
+	return i > 0 && pos < stmts[i-1].End()
+}
+
+// mergeRangesWithinStatements merges consecutive ranges when a later range's
+// start position falls strictly inside a statement. This prevents counter
+// insertion inside multi-line statements such as const (...) blocks.
+func mergeRangesWithinStatements(ranges []Range, stmts []ast.Stmt) []Range {
+	if len(ranges) <= 1 {
+		return ranges
+	}
+	merged := []Range{ranges[0]}
+	for _, r := range ranges[1:] {
+		if insideStatement(r.pos, stmts) {
+			// Extend previous range to cover this one.
+			merged[len(merged)-1].end = r.end
+		} else {
+			merged = append(merged, r)
+		}
+	}
+	return merged
 }
 
 // findText finds text in the original source, starting at pos.
@@ -401,7 +548,7 @@ func (f *File) Visit(node ast.Node) ast.Visitor {
 		//
 		// Note that in the current implementation (Go 1.20) both
 		// routines are assembly stubs that forward calls to the
-		// runtime/internal/atomic equivalents, hence the infinite
+		// internal/runtime/atomic equivalents, hence the infinite
 		// loop scenario is purely theoretical (maybe if in some
 		// future implementation one of these functions might be
 		// written in Go). See #57445 for more details.
@@ -626,7 +773,7 @@ func (p *Package) annotateFile(name string, fd io.Writer) {
 	if err != nil {
 		log.Fatalf("cover: %s: %s", name, err)
 	}
-	parsedFile, err := parser.ParseFile(fset, name, content, parser.ParseComments)
+	parsedFile, err := parser.ParseFile(fset, name, content, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		log.Fatalf("cover: %s: %s", name, err)
 	}
@@ -710,8 +857,9 @@ func (f *File) newCounter(start, end token.Pos, numStmt int) string {
 			panic("internal error: counter var unset")
 		}
 		stmt = counterStmt(f, fmt.Sprintf("%s[%d]", f.fn.counterVar, slot))
-		stpos := f.fset.Position(start)
-		enpos := f.fset.Position(end)
+		// Physical positions, ignoring //line directives.
+		stpos := f.position(start)
+		enpos := f.position(end)
 		stpos, enpos = dedup(stpos, enpos)
 		unit := coverage.CoverableUnit{
 			StLine:  uint32(stpos.Line),
@@ -745,7 +893,8 @@ func (f *File) addCounters(pos, insertPos, blockEnd token.Pos, list []ast.Stmt, 
 	// Special case: make sure we add a counter to an empty block. Can't do this below
 	// or we will add a counter to an empty statement list after, say, a return statement.
 	if len(list) == 0 {
-		f.edit.Insert(f.offset(insertPos), f.newCounter(insertPos, blockEnd, 0)+";")
+		r := f.codeRanges(insertPos, blockEnd)[0]
+		f.edit.Insert(f.offset(r.pos), f.newCounter(r.pos, r.end, 0)+";")
 		return
 	}
 	// Make a copy of the list, as we may mutate it and should leave the
@@ -795,7 +944,16 @@ func (f *File) addCounters(pos, insertPos, blockEnd token.Pos, list []ast.Stmt, 
 			end = blockEnd
 		}
 		if pos != end { // Can have no source to cover if e.g. blocks abut.
-			f.edit.Insert(f.offset(insertPos), f.newCounter(pos, end, last)+";")
+			// Create counters only for executable code ranges.
+			// Merge back ranges that fall inside a statement to avoid
+			// inserting counters inside multi-line constructs (e.g. const blocks).
+			for i, r := range mergeRangesWithinStatements(f.codeRanges(pos, end), list[:last]) {
+				insertOffset := f.offset(r.pos)
+				if i == 0 {
+					insertOffset = f.offset(insertPos)
+				}
+				f.edit.Insert(insertOffset, f.newCounter(r.pos, r.end, last)+";")
+			}
 		}
 		list = list[last:]
 		if len(list) == 0 {
@@ -966,15 +1124,14 @@ type block1 struct {
 	index int
 }
 
-type blockSlice []block1
-
-func (b blockSlice) Len() int           { return len(b) }
-func (b blockSlice) Less(i, j int) bool { return b[i].startByte < b[j].startByte }
-func (b blockSlice) Swap(i, j int)      { b[i], b[j] = b[j], b[i] }
+// position returns the Position for pos, ignoring //line directives.
+func (f *File) position(pos token.Pos) token.Position {
+	return f.fset.PositionFor(pos, false)
+}
 
 // offset translates a token position into a 0-indexed byte offset.
 func (f *File) offset(pos token.Pos) int {
-	return f.fset.Position(pos).Offset
+	return f.position(pos).Offset
 }
 
 // addVariables adds to the end of the file the declarations to set up the counter and position variables.
@@ -988,7 +1145,9 @@ func (f *File) addVariables(w io.Writer) {
 		t[i].Block = f.blocks[i]
 		t[i].index = i
 	}
-	sort.Sort(blockSlice(t))
+	slices.SortFunc(t, func(a, b block1) int {
+		return cmp.Compare(a.startByte, b.startByte)
+	})
 	for i := 1; i < len(t); i++ {
 		if t[i-1].endByte > t[i].startByte {
 			fmt.Fprintf(os.Stderr, "cover: internal error: block %d overlaps block %d\n", t[i-1].index, t[i].index)
@@ -1014,8 +1173,9 @@ func (f *File) addVariables(w io.Writer) {
 	// - 32-bit ending line number
 	// - (16 bit ending column number << 16) | (16-bit starting column number).
 	for i, block := range f.blocks {
-		start := f.fset.Position(block.startByte)
-		end := f.fset.Position(block.endByte)
+		// Physical positions, ignoring //line directives.
+		start := f.position(block.startByte)
+		end := f.position(block.endByte)
 
 		start, end = dedup(start, end)
 
@@ -1088,6 +1248,14 @@ func (p *Package) emitMetaData(w io.Writer) {
 		return
 	}
 
+	// If the "EmitMetaFile" path has been set, invoke a helper
+	// that will write out a pre-cooked meta-data file for this package
+	// to the specified location, in effect simulating the execution
+	// of a test binary that doesn't do any testing to speak of.
+	if pkgconfig.EmitMetaFile != "" {
+		p.emitMetaFile(pkgconfig.EmitMetaFile)
+	}
+
 	// Something went wrong if regonly/testmain mode is in effect and
 	// we have instrumented functions.
 	if counterStmt == nil && len(p.counterLengths) != 0 {
@@ -1157,4 +1325,41 @@ func atomicPackagePrefix() string {
 		return ""
 	}
 	return atomicPackageName + "."
+}
+
+func (p *Package) emitMetaFile(outpath string) {
+	// Open output file.
+	of, err := os.OpenFile(outpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+	if err != nil {
+		log.Fatalf("opening covmeta %s: %v", outpath, err)
+	}
+
+	if len(p.counterLengths) == 0 {
+		// This corresponds to the case where we have no functions
+		// in the package to instrument. Leave the file empty file if
+		// this happens.
+		if err = of.Close(); err != nil {
+			log.Fatalf("closing meta-data file: %v", err)
+		}
+		return
+	}
+
+	// Encode meta-data.
+	var sws slicewriter.WriteSeeker
+	digest, err := p.mdb.Emit(&sws)
+	if err != nil {
+		log.Fatalf("encoding meta-data: %v", err)
+	}
+	payload := sws.BytesWritten()
+	blobs := [][]byte{payload}
+
+	// Write meta-data file directly.
+	mfw := encodemeta.NewCoverageMetaFileWriter(outpath, of)
+	err = mfw.Write(digest, blobs, cmode, cgran)
+	if err != nil {
+		log.Fatalf("writing meta-data file: %v", err)
+	}
+	if err = of.Close(); err != nil {
+		log.Fatalf("closing meta-data file: %v", err)
+	}
 }

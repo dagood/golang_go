@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build unix || wasip1
+//go:build unix || js || wasip1
 
 package net
 
@@ -10,14 +10,11 @@ import (
 	"context"
 	"internal/bytealg"
 	"sync"
-	"syscall"
 )
 
-var onceReadProtocols sync.Once
-
-// readProtocols loads contents of /etc/protocols into protocols map
+// readProtocolsOnce loads contents of /etc/protocols into protocols map
 // for quick access.
-func readProtocols() {
+var readProtocolsOnce = sync.OnceFunc(func() {
 	file, err := open("/etc/protocols")
 	if err != nil {
 		return
@@ -44,12 +41,12 @@ func readProtocols() {
 			}
 		}
 	}
-}
+})
 
 // lookupProtocol looks up IP protocol name in /etc/protocols and
 // returns correspondent protocol number.
 func lookupProtocol(_ context.Context, name string) (int, error) {
-	onceReadProtocols.Do(readProtocols)
+	readProtocolsOnce()
 	return lookupProtocolMap(name)
 }
 
@@ -62,9 +59,6 @@ func (r *Resolver) lookupHost(ctx context.Context, host string) (addrs []string,
 }
 
 func (r *Resolver) lookupIP(ctx context.Context, network, host string) (addrs []IPAddr, err error) {
-	if r.preferGo() {
-		return r.goLookupIP(ctx, network, host)
-	}
 	order, conf := systemConf().hostLookupOrder(r, host)
 	if order == hostLookupCgo {
 		return cgoLookupIP(ctx, network, host)
@@ -93,8 +87,8 @@ func (r *Resolver) lookupPort(ctx context.Context, network, service string) (int
 func (r *Resolver) lookupCNAME(ctx context.Context, name string) (string, error) {
 	order, conf := systemConf().hostLookupOrder(r, name)
 	if order == hostLookupCgo {
-		if cname, err, ok := cgoLookupCNAME(ctx, name); ok {
-			return cname, err
+		if cname, err := cgoLookupCNAME(ctx, name); err == nil {
+			return cname, nil
 		}
 	}
 	return r.goLookupCNAME(ctx, name, order, conf)
@@ -122,28 +116,4 @@ func (r *Resolver) lookupAddr(ctx context.Context, addr string) ([]string, error
 		return cgoLookupPTR(ctx, addr)
 	}
 	return r.goLookupPTR(ctx, addr, order, conf)
-}
-
-// concurrentThreadsLimit returns the number of threads we permit to
-// run concurrently doing DNS lookups via cgo. A DNS lookup may use a
-// file descriptor so we limit this to less than the number of
-// permitted open files. On some systems, notably Darwin, if
-// getaddrinfo is unable to open a file descriptor it simply returns
-// EAI_NONAME rather than a useful error. Limiting the number of
-// concurrent getaddrinfo calls to less than the permitted number of
-// file descriptors makes that error less likely. We don't bother to
-// apply the same limit to DNS lookups run directly from Go, because
-// there we will return a meaningful "too many open files" error.
-func concurrentThreadsLimit() int {
-	var rlim syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rlim); err != nil {
-		return 500
-	}
-	r := rlim.Cur
-	if r > 500 {
-		r = 500
-	} else if r > 30 {
-		r -= 30
-	}
-	return int(r)
 }

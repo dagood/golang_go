@@ -8,8 +8,8 @@ package syscall
 
 import (
 	errorspkg "errors"
-	"internal/itoa"
 	"internal/oserror"
+	"internal/strconv"
 	"sync"
 	"unsafe"
 )
@@ -48,7 +48,7 @@ const PathMax = 256
 //		err = errno
 //	}
 //
-// Errno values can be tested against error values using errors.Is.
+// Errno values can be tested against error values using [errors.Is].
 // For example:
 //
 //	_, _, err := syscall.Syscall(...)
@@ -62,7 +62,7 @@ func (e Errno) Error() string {
 			return s
 		}
 	}
-	return "errno " + itoa.Itoa(int(e))
+	return "errno " + strconv.Itoa(int(e))
 }
 
 func (e Errno) Is(target error) bool {
@@ -88,7 +88,7 @@ func (e Errno) Timeout() bool {
 }
 
 // A Signal is a number describing a process signal.
-// It implements the os.Signal interface.
+// It implements the [os.Signal] interface.
 type Signal int
 
 const (
@@ -110,7 +110,7 @@ func (s Signal) String() string {
 			return str
 		}
 	}
-	return "signal " + itoa.Itoa(int(s))
+	return "signal " + strconv.Itoa(int(s))
 }
 
 var signals = [...]string{}
@@ -128,12 +128,13 @@ const (
 	O_WRONLY = 1
 	O_RDWR   = 2
 
-	O_CREAT  = 0100
-	O_CREATE = O_CREAT
-	O_TRUNC  = 01000
-	O_APPEND = 02000
-	O_EXCL   = 0200
-	O_SYNC   = 010000
+	O_CREAT     = 0100
+	O_CREATE    = O_CREAT
+	O_TRUNC     = 01000
+	O_APPEND    = 02000
+	O_EXCL      = 0200
+	O_SYNC      = 010000
+	O_DIRECTORY = 020000
 
 	O_CLOEXEC = 0
 )

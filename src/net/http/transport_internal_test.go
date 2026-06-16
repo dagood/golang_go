@@ -8,10 +8,12 @@ package http
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"io"
 	"net"
+	"net/http/internal/http2"
 	"net/http/internal/testcert"
 	"strings"
 	"testing"
@@ -36,7 +38,8 @@ func TestTransportPersistConnReadLoopEOF(t *testing.T) {
 	tr := new(Transport)
 	req, _ := NewRequest("GET", "http://"+ln.Addr().String(), nil)
 	req = req.WithT(t)
-	treq := &transportRequest{Request: req}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	treq := &transportRequest{Request: req, ctx: ctx, cancel: cancel}
 	cm := connectMethod{targetScheme: "http", targetAddr: ln.Addr().String()}
 	pc, err := tr.getConn(treq, cm)
 	if err != nil {
@@ -58,8 +61,8 @@ func TestTransportPersistConnReadLoopEOF(t *testing.T) {
 
 	<-pc.closech
 	err = pc.closed
-	if !isTransportReadFromServerError(err) && err != errServerClosedIdle {
-		t.Errorf("pc.closed = %#v, %v; want errServerClosedIdle or transportReadFromServerError", err, err)
+	if !isNothingWrittenError(err) && !isTransportReadFromServerError(err) && err != errServerClosedIdle {
+		t.Errorf("pc.closed = %#v, %v; want errServerClosedIdle or transportReadFromServerError, or nothingWrittenError", err, err)
 	}
 }
 
@@ -134,7 +137,7 @@ func TestTransportShouldRetryRequest(t *testing.T) {
 		2: {
 			pc:   &persistConn{reused: true},
 			req:  dummyRequest("POST"),
-			err:  http2ErrNoCachedConn,
+			err:  http2.ErrNoCachedConn,
 			want: true,
 		},
 		3: {
@@ -241,7 +244,7 @@ func TestTransportBodyAltRewind(t *testing.T) {
 						}, nil
 					}
 					roundTripped = true
-					return nil, http2noCachedConnError{}
+					return nil, http2.ErrNoCachedConn
 				})
 			},
 		},

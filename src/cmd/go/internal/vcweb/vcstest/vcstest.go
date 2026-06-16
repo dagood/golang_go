@@ -7,9 +7,10 @@
 package vcstest
 
 import (
+	"bytes"
 	"cmd/go/internal/vcs"
 	"cmd/go/internal/vcweb"
-	"cmd/go/internal/web"
+	"cmd/go/internal/web/intercept"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -70,7 +71,9 @@ func NewServer() (srv *Server, err error) {
 		}
 	}()
 
-	srvHTTP := httptest.NewServer(handler)
+	srvHTTP := httptest.NewUnstartedServer(handler)
+	srvHTTP.Config.ErrorLog = testLogger()
+	srvHTTP.Start()
 	httpURL, err := url.Parse(srvHTTP.URL)
 	if err != nil {
 		return nil, err
@@ -81,7 +84,9 @@ func NewServer() (srv *Server, err error) {
 		}
 	}()
 
-	srvHTTPS := httptest.NewTLSServer(handler)
+	srvHTTPS := httptest.NewUnstartedServer(handler)
+	srvHTTPS.Config.ErrorLog = testLogger()
+	srvHTTPS.StartTLS()
 	httpsURL, err := url.Parse(srvHTTPS.URL)
 	if err != nil {
 		return nil, err
@@ -101,18 +106,31 @@ func NewServer() (srv *Server, err error) {
 	vcs.VCSTestRepoURL = srv.HTTP.URL
 	vcs.VCSTestHosts = Hosts
 
-	var interceptors []web.Interceptor
+	interceptors := make([]intercept.Interceptor, 0, 2*len(Hosts))
 	for _, host := range Hosts {
 		interceptors = append(interceptors,
-			web.Interceptor{Scheme: "http", FromHost: host, ToHost: httpURL.Host, Client: srv.HTTP.Client()},
-			web.Interceptor{Scheme: "https", FromHost: host, ToHost: httpsURL.Host, Client: srv.HTTPS.Client()})
+			intercept.Interceptor{Scheme: "http", FromHost: host, ToHost: httpURL.Host, Client: srv.HTTP.Client()},
+			intercept.Interceptor{Scheme: "https", FromHost: host, ToHost: httpsURL.Host, Client: srv.HTTPS.Client()})
 	}
-	web.EnableTestHooks(interceptors)
+	intercept.EnableTestHooks(interceptors)
 
 	fmt.Fprintln(os.Stderr, "vcs-test.golang.org rerouted to "+srv.HTTP.URL)
 	fmt.Fprintln(os.Stderr, "https://vcs-test.golang.org rerouted to "+srv.HTTPS.URL)
 
 	return srv, nil
+}
+
+func testLogger() *log.Logger {
+	return log.New(httpLogger{}, "vcweb: ", 0)
+}
+
+type httpLogger struct{}
+
+func (httpLogger) Write(b []byte) (int, error) {
+	if bytes.Contains(b, []byte("TLS handshake error")) {
+		return len(b), nil
+	}
+	return os.Stdout.Write(b)
 }
 
 func (srv *Server) Close() error {
@@ -121,7 +139,7 @@ func (srv *Server) Close() error {
 	}
 	vcs.VCSTestRepoURL = ""
 	vcs.VCSTestHosts = nil
-	web.DisableTestHooks()
+	intercept.DisableTestHooks()
 
 	srv.HTTP.Close()
 	srv.HTTPS.Close()

@@ -2,11 +2,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !js && !wasip1
-
 package net
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"internal/testenv"
 	"io"
@@ -475,6 +475,9 @@ func TestTCPReadWriteAllocs(t *testing.T) {
 		t.Skipf("not supported on %s", runtime.GOOS)
 	}
 
+	// Optimizations are required to remove the allocs.
+	testenv.SkipIfOptimizationOff(t)
+
 	ln, err := Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -509,7 +512,7 @@ func TestTCPReadWriteAllocs(t *testing.T) {
 		}
 	})
 	if allocs > 0 {
-		t.Fatalf("got %v; want 0", allocs)
+		t.Errorf("got %v; want 0", allocs)
 	}
 
 	var bufwrt [128]byte
@@ -531,7 +534,7 @@ func TestTCPReadWriteAllocs(t *testing.T) {
 		}
 	})
 	if allocs > 0 {
-		t.Fatalf("got %v; want 0", allocs)
+		t.Errorf("got %v; want 0", allocs)
 	}
 }
 
@@ -670,6 +673,11 @@ func TestTCPBig(t *testing.T) {
 }
 
 func TestCopyPipeIntoTCP(t *testing.T) {
+	switch runtime.GOOS {
+	case "js", "wasip1":
+		t.Skipf("skipping: os.Pipe not supported on %s", runtime.GOOS)
+	}
+
 	ln := newLocalListener(t, "tcp")
 	defer ln.Close()
 
@@ -770,8 +778,8 @@ func TestDialTCPDefaultKeepAlive(t *testing.T) {
 	defer ln.Close()
 
 	got := time.Duration(-1)
-	testHookSetKeepAlive = func(d time.Duration) { got = d }
-	defer func() { testHookSetKeepAlive = func(time.Duration) {} }()
+	testHookSetKeepAlive = func(cfg KeepAliveConfig) { got = cfg.Idle }
+	defer func() { testHookSetKeepAlive = func(KeepAliveConfig) {} }()
 
 	c, err := DialTCP("tcp", nil, ln.Addr().(*TCPAddr))
 	if err != nil {
@@ -779,7 +787,52 @@ func TestDialTCPDefaultKeepAlive(t *testing.T) {
 	}
 	defer c.Close()
 
-	if got != defaultTCPKeepAlive {
-		t.Errorf("got keepalive %v; want %v", got, defaultTCPKeepAlive)
+	if got != 0 {
+		t.Errorf("got keepalive %v; want %v", got, defaultTCPKeepAliveIdle)
+	}
+}
+
+func TestTCPListenAfterClose(t *testing.T) {
+	// Regression test for https://go.dev/issue/50216:
+	// after calling Close on a Listener, the fake net implementation would
+	// erroneously Accept a connection dialed before the call to Close.
+
+	ln := newLocalListener(t, "tcp")
+	defer ln.Close()
+
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+
+	d := &Dialer{}
+	for n := 2; n > 0; n-- {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			c, err := d.DialContext(ctx, ln.Addr().Network(), ln.Addr().String())
+			if err == nil {
+				<-ctx.Done()
+				c.Close()
+			}
+		}()
+	}
+
+	c, err := ln.Accept()
+	if err == nil {
+		c.Close()
+	} else {
+		t.Error(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	wg.Wait()
+	ln.Close()
+
+	c, err = ln.Accept()
+	if !errors.Is(err, ErrClosed) {
+		if err == nil {
+			c.Close()
+		}
+		t.Errorf("after l.Close(), l.Accept() = _, %v\nwant %v", err, ErrClosed)
 	}
 }

@@ -8,6 +8,7 @@ package sanitizers_test
 
 import (
 	"internal/testenv"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -24,7 +25,7 @@ func TestTSAN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The msan tests require support for the -msan option.
+	// The tsan tests require support for the -tsan option.
 	if !compilerRequiredTsanVersion(goos, goarch) {
 		t.Skipf("skipping on %s/%s; compiler version for -tsan option is too old.", goos, goarch)
 	}
@@ -54,9 +55,10 @@ func TestTSAN(t *testing.T) {
 		{src: "tsan12.go", needsRuntime: true},
 		{src: "tsan13.go", needsRuntime: true},
 		{src: "tsan14.go", needsRuntime: true},
+		{src: "tsan15.go", needsRuntime: true},
+		{src: "tsan_tracebackctxt", needsRuntime: true}, // Subdirectory
 	}
 	for _, tc := range cases {
-		tc := tc
 		name := strings.TrimSuffix(tc.src, ".go")
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -65,9 +67,25 @@ func TestTSAN(t *testing.T) {
 			defer dir.RemoveAll(t)
 
 			outPath := dir.Join(name)
-			mustRun(t, config.goCmd("build", "-o", outPath, srcPath(tc.src)))
+			mustRun(t, config.goCmd("build", "-o", outPath, "./"+srcPath(tc.src)))
 
-			cmd := hangProneCmd(outPath)
+			cmdArgs := []string{outPath}
+			if goos == "linux" {
+				// Disable ASLR for TSAN. See https://go.dev/issue/59418.
+				out, err := exec.Command("uname", "-m").Output()
+				if err != nil {
+					t.Fatalf("failed to run `uname -m`: %v", err)
+				}
+				arch := strings.TrimSpace(string(out))
+				if _, err := exec.Command("setarch", arch, "-R", "true").Output(); err != nil {
+					// Some systems don't have permission to run `setarch`.
+					// See https://go.dev/issue/70463.
+					t.Logf("failed to run `setarch %s -R true`: %v", arch, err)
+				} else {
+					cmdArgs = []string{"setarch", arch, "-R", outPath}
+				}
+			}
+			cmd := hangProneCmd(cmdArgs[0], cmdArgs[1:]...)
 			if tc.needsRuntime {
 				config.skipIfRuntimeIncompatible(t)
 			}

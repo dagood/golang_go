@@ -28,6 +28,7 @@ import (
 	"cmd/go/internal/modload"
 	"cmd/go/internal/str"
 	"cmd/go/internal/work"
+	"cmd/internal/pathcache"
 )
 
 var CmdGenerate = &base.Command{
@@ -175,12 +176,15 @@ var (
 )
 
 func init() {
-	work.AddBuildFlags(CmdGenerate, work.DefaultBuildFlags)
+	work.AddBuildFlags(CmdGenerate, work.OmitBuildOnlyFlags)
 	CmdGenerate.Flag.StringVar(&generateRunFlag, "run", "", "")
 	CmdGenerate.Flag.StringVar(&generateSkipFlag, "skip", "", "")
 }
 
 func runGenerate(ctx context.Context, cmd *base.Command, args []string) {
+	moduleLoader := modload.NewLoader()
+	moduleLoader.InitWorkfile()
+
 	if generateRunFlag != "" {
 		var err error
 		generateRunRE, err = regexp.Compile(generateRunFlag)
@@ -201,13 +205,20 @@ func runGenerate(ctx context.Context, cmd *base.Command, args []string) {
 	// Even if the arguments are .go files, this loop suffices.
 	printed := false
 	pkgOpts := load.PackageOpts{IgnoreImports: true}
-	for _, pkg := range load.PackagesAndErrors(ctx, pkgOpts, args) {
-		if modload.Enabled() && pkg.Module != nil && !pkg.Module.Main {
+	for _, pkg := range load.PackagesAndErrors(moduleLoader, ctx, pkgOpts, args) {
+		if moduleLoader.Enabled() && pkg.Module != nil && !pkg.Module.Main {
 			if !printed {
 				fmt.Fprintf(os.Stderr, "go: not generating in packages in dependency modules\n")
 				printed = true
 			}
 			continue
+		}
+
+		if pkg.Error != nil && len(pkg.InternalAllGoFiles()) == 0 {
+			// A directory only contains a Go package if it has at least
+			// one .go source file, so the fact that there are no files
+			// implies that the package couldn't be found.
+			base.Errorf("%v", pkg.Error)
 		}
 
 		for _, file := range pkg.InternalGoFiles() {
@@ -222,6 +233,7 @@ func runGenerate(ctx context.Context, cmd *base.Command, args []string) {
 			}
 		}
 	}
+	base.ExitIfErrors()
 }
 
 // generate runs the generation directives for a single file.
@@ -232,7 +244,7 @@ func generate(absFile string) bool {
 	}
 
 	// Parse package clause
-	filePkg, err := parser.ParseFile(token.NewFileSet(), "", src, parser.PackageClauseOnly)
+	filePkg, err := parser.ParseFile(token.NewFileSet(), "", src, parser.PackageClauseOnly|parser.SkipObjectResolution)
 	if err != nil {
 		// Invalid package clause - ignore file.
 		return true
@@ -479,7 +491,7 @@ func (g *Generator) exec(words []string) {
 		// intends to use the same 'go' as 'go generate' itself.
 		// Prefer to resolve the binary from GOROOT/bin, and for consistency
 		// prefer to resolve any other commands there too.
-		gorootBinPath, err := exec.LookPath(filepath.Join(cfg.GOROOTbin, path))
+		gorootBinPath, err := pathcache.LookPath(filepath.Join(cfg.GOROOTbin, path))
 		if err == nil {
 			path = gorootBinPath
 		}

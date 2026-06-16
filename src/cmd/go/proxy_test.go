@@ -25,7 +25,7 @@ import (
 	"testing"
 
 	"cmd/go/internal/modfetch/codehost"
-	"cmd/go/internal/par"
+	"cmd/internal/par"
 
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
@@ -169,6 +169,23 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(path, "sumdb-wrong/") {
 		r.URL.Path = path[len("sumdb-wrong"):]
 		sumdbWrongServer.ServeHTTP(w, r)
+		return
+	}
+
+	// Request for $GOPROXY/sumdb-redirect/module@version:/lookup/...
+	// performs a lookup for module@version rather than the requested module.
+	if strings.HasPrefix(path, "sumdb-redirect/") {
+		redirect, rest, ok := strings.Cut(path[len("sumdb-redirect"):], ":")
+		if !ok {
+			w.WriteHeader(500)
+			return
+		}
+		if strings.HasPrefix(rest, "/lookup/") {
+			r.URL.Path = "/lookup" + redirect
+		} else {
+			r.URL.Path = rest
+		}
+		sumdbServer.ServeHTTP(w, r)
 		return
 	}
 

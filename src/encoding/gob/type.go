@@ -8,6 +8,7 @@ import (
 	"encoding"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"reflect"
 	"sync"
@@ -24,7 +25,7 @@ type userTypeInfo struct {
 	base        reflect.Type // the base type after all indirections
 	indir       int          // number of indirections to reach the base type
 	externalEnc int          // xGob, xBinary, or xText
-	externalDec int          // xGob, xBinary or xText
+	externalDec int          // xGob, xBinary, or xText
 	encIndir    int8         // number of indirections to reach the receiver type; may be negative
 	decIndir    int8         // number of indirections to reach the receiver type; may be negative
 }
@@ -263,12 +264,12 @@ var (
 	tComplex   = bootstrapType("complex", (*complex128)(nil))
 	tInterface = bootstrapType("interface", (*any)(nil))
 	// Reserve some Ids for compatible expansion
-	tReserved7 = bootstrapType("_reserved1", (*struct{ r7 int })(nil))
-	tReserved6 = bootstrapType("_reserved1", (*struct{ r6 int })(nil))
-	tReserved5 = bootstrapType("_reserved1", (*struct{ r5 int })(nil))
-	tReserved4 = bootstrapType("_reserved1", (*struct{ r4 int })(nil))
-	tReserved3 = bootstrapType("_reserved1", (*struct{ r3 int })(nil))
-	tReserved2 = bootstrapType("_reserved1", (*struct{ r2 int })(nil))
+	tReserved7 = bootstrapType("_reserved7", (*struct{ r7 int })(nil))
+	tReserved6 = bootstrapType("_reserved6", (*struct{ r6 int })(nil))
+	tReserved5 = bootstrapType("_reserved5", (*struct{ r5 int })(nil))
+	tReserved4 = bootstrapType("_reserved4", (*struct{ r4 int })(nil))
+	tReserved3 = bootstrapType("_reserved3", (*struct{ r3 int })(nil))
+	tReserved2 = bootstrapType("_reserved2", (*struct{ r2 int })(nil))
 	tReserved1 = bootstrapType("_reserved1", (*struct{ r1 int })(nil))
 )
 
@@ -589,6 +590,7 @@ func isSent(field *reflect.StructField) bool {
 	if typ.Kind() == reflect.Chan || typ.Kind() == reflect.Func {
 		return false
 	}
+
 	return true
 }
 
@@ -778,10 +780,7 @@ func buildTypeInfo(ut *userTypeInfo, rt reflect.Type) (*typeInfo, error) {
 
 	// Create new map with old contents plus new entry.
 	m, _ := typeInfoMap.Load().(map[reflect.Type]*typeInfo)
-	newm := make(map[reflect.Type]*typeInfo, len(m))
-	for k, v := range m {
-		newm[k] = v
-	}
+	newm := maps.Clone(m)
 	newm[rt] = info
 	typeInfoMap.Store(newm)
 	return info, nil
@@ -828,7 +827,7 @@ var (
 	concreteTypeToName sync.Map // map[reflect.Type]string
 )
 
-// RegisterName is like Register but uses the provided name rather than the
+// RegisterName is like [Register] but uses the provided name rather than the
 // type's default.
 func RegisterName(name string, value any) {
 	if name == "" {

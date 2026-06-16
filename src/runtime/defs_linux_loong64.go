@@ -10,6 +10,7 @@ const (
 	_EINTR  = 0x4
 	_EAGAIN = 0xb
 	_ENOMEM = 0xc
+	_ENOSYS = 0x26
 
 	_PROT_NONE  = 0x0
 	_PROT_READ  = 0x1
@@ -184,6 +185,7 @@ type sigcontext struct {
 	sc_pc         uint64
 	sc_regs       [32]uint64
 	sc_flags      uint32
+	sc_pad0       [1]uint32
 	sc_extcontext [0]uint64
 }
 

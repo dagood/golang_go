@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"internal/goexperiment"
 	"io"
 	"log/slog/internal/buffer"
 	"math"
@@ -101,6 +102,7 @@ func TestAppendJSONValue(t *testing.T) {
 		}
 		if got != want {
 			t.Errorf("%v: got %s, want %s", value, got, want)
+			t.Errorf("%v: got %x, want %x", value, got, want)
 		}
 	}
 }
@@ -142,6 +144,43 @@ func jsonValueString(v Value) string {
 	return string(buf)
 }
 
+func TestJSONAllocs(t *testing.T) {
+	ctx := t.Context()
+	l := New(NewJSONHandler(io.Discard, &HandlerOptions{}))
+	testErr := errors.New("an error occurred")
+	testEvent := struct {
+		ID      int
+		Scope   string
+		Enabled bool
+	}{
+		123456, "abcdefgh", true,
+	}
+
+	t.Run("message", func(t *testing.T) {
+		wantAllocs(t, 0, func() {
+			l.LogAttrs(ctx, LevelInfo,
+				"hello world",
+			)
+		})
+	})
+	t.Run("attrs", func(t *testing.T) {
+		// TODO(https://go.dev/issue/74617): JSONv2 heap copies aggressively
+		// to ensure that Go values are addressable in case a pointer method
+		// must be called. This leads to more allocations than necessary,
+		// but as an implementation detail, it can eventually be optimized away.
+		wantAllocs(t, 1+goexperiment.JSONv2Int, func() {
+			l.LogAttrs(ctx, LevelInfo,
+				"hello world",
+				String("component", "subtest"),
+				Int("id", 67890),
+				Bool("flag", true),
+				Any("error", testErr),
+				Any("event", testEvent),
+			)
+		})
+	})
+}
+
 func BenchmarkJSONHandler(b *testing.B) {
 	for _, bench := range []struct {
 		name string
@@ -181,8 +220,7 @@ func BenchmarkJSONHandler(b *testing.B) {
 				String("traceID", "2039232309232309"),
 				String("URL", "https://pkg.go.dev/golang.org/x/log/slog"))
 			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				l.LogAttrs(ctx, LevelInfo, "this is a typical log message",
 					String("module", "github.com/google/go-cmp"),
 					String("version", "v1.23.4"),
@@ -243,8 +281,7 @@ func BenchmarkPreformatting(b *testing.B) {
 		b.Run(bench.name, func(b *testing.B) {
 			l := New(NewJSONHandler(bench.wc, nil)).With(bench.attrs...)
 			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				l.LogAttrs(ctx, LevelInfo, "this is a typical log message",
 					String("module", "github.com/google/go-cmp"),
 					String("version", "v1.23.4"),

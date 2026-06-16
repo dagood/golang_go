@@ -13,11 +13,14 @@ package sanitizers_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"internal/testenv"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -108,6 +111,24 @@ func appendExperimentEnv(cmd *exec.Cmd, experiments []string) {
 	cmd.Env = append(cmd.Env, "GOEXPERIMENT="+exps)
 }
 
+func appendASANOptions(cmd *exec.Cmd, opts ...string) {
+	if cmd.Env == nil {
+		cmd.Env = cmd.Environ()
+	}
+	var asanOptions string
+	for _, evar := range cmd.Env {
+		name, value, ok := strings.Cut(evar, "=")
+		if ok && name == "ASAN_OPTIONS" {
+			asanOptions = value
+		}
+	}
+	if asanOptions != "" {
+		asanOptions += ":"
+	}
+	asanOptions += strings.Join(opts, ":")
+	cmd.Env = append(cmd.Env, "ASAN_OPTIONS="+asanOptions)
+}
+
 // mustRun executes t and fails cmd with a well-formatted message if it fails.
 func mustRun(t *testing.T, cmd *exec.Cmd) {
 	t.Helper()
@@ -135,7 +156,7 @@ func mustRun(t *testing.T, cmd *exec.Cmd) {
 }
 
 // cc returns a cmd that executes `$(go env CC) $(go env GOGCCFLAGS) $args`.
-func cc(args ...string) (*exec.Cmd, error) {
+func cc(ctx context.Context, args ...string) (*exec.Cmd, error) {
 	CC, err := goEnv("CC")
 	if err != nil {
 		return nil, err
@@ -184,7 +205,7 @@ func cc(args ...string) (*exec.Cmd, error) {
 		flags = append(flags, GOGCCFLAGS[start:])
 	}
 
-	cmd := exec.Command(CC, flags...)
+	cmd := exec.CommandContext(ctx, CC, flags...)
 	cmd.Args = append(cmd.Args, args...)
 	return cmd, nil
 }
@@ -209,7 +230,7 @@ func compilerVersion() (version, error) {
 		compiler.err = func() error {
 			compiler.name = "unknown"
 
-			cmd, err := cc("--version")
+			cmd, err := cc(context.Background(), "--version")
 			if err != nil {
 				return err
 			}
@@ -222,7 +243,7 @@ func compilerVersion() (version, error) {
 			var match [][]byte
 			if bytes.HasPrefix(out, []byte("gcc")) {
 				compiler.name = "gcc"
-				cmd, err := cc("-dumpfullversion", "-dumpversion")
+				cmd, err := cc(context.Background(), "-dumpfullversion", "-dumpversion")
 				if err != nil {
 					return err
 				}
@@ -264,12 +285,33 @@ func compilerSupportsLocation() bool {
 	}
 	switch compiler.name {
 	case "gcc":
-		return compiler.major >= 10
+		// TODO(72752): the asan runtime support library
+		// (libasan.so.6) shipped with GCC 10 has problems digesting
+		// version 5 DWARF produced by the Go toolchain. Disable
+		// location checking if gcc is not sufficiently up to date in
+		// this case.
+		return compiler.major > 10
 	case "clang":
+		// TODO(65606): The clang toolchain on the LUCI builders is not built against
+		// zlib, the ASAN runtime can't actually symbolize its own stack trace. Once
+		// this is resolved, one way or another, switch this back to 'true'. We still
+		// have coverage from the 'gcc' case above.
+		if inLUCIBuild() {
+			return false
+		}
 		return true
 	default:
 		return false
 	}
+}
+
+// inLUCIBuild returns true if we're currently executing in a LUCI build.
+func inLUCIBuild() bool {
+	u, err := user.Current()
+	if err != nil {
+		return false
+	}
+	return testenv.Builder() != "" && u.Username == "swarming"
 }
 
 // compilerRequiredTsanVersion reports whether the compiler is the version required by Tsan.
@@ -293,15 +335,27 @@ func compilerRequiredAsanVersion(goos, goarch string) bool {
 	}
 	switch compiler.name {
 	case "gcc":
+		if goarch == "loong64" {
+			return compiler.major >= 14
+		}
 		if goarch == "ppc64le" {
 			return compiler.major >= 9
 		}
 		return compiler.major >= 7
 	case "clang":
+		if goarch == "loong64" {
+			return compiler.major >= 16
+		}
 		return compiler.major >= 9
 	default:
 		return false
 	}
+}
+
+// compilerRequiredLsanVersion reports whether the compiler is the
+// version required by Lsan.
+func compilerRequiredLsanVersion(goos, goarch string) bool {
+	return compilerRequiredAsanVersion(goos, goarch)
 }
 
 type compilerCheck struct {
@@ -331,10 +385,18 @@ func configure(sanitizer string) *config {
 		return c
 	}
 
+	sanitizerOpt := sanitizer
+	// For the leak detector, we use "go build -asan",
+	// which implies the address sanitizer.
+	// We may want to adjust this someday.
+	if sanitizer == "leak" {
+		sanitizerOpt = "address"
+	}
+
 	c := &config{
 		sanitizer: sanitizer,
-		cFlags:    []string{"-fsanitize=" + sanitizer},
-		ldFlags:   []string{"-fsanitize=" + sanitizer},
+		cFlags:    []string{"-fsanitize=" + sanitizerOpt},
+		ldFlags:   []string{"-fsanitize=" + sanitizerOpt},
 	}
 
 	if testing.Verbose() {
@@ -353,7 +415,7 @@ func configure(sanitizer string) *config {
 			c.ldFlags = append(c.ldFlags, "-fPIC", "-static-libtsan")
 		}
 
-	case "address":
+	case "address", "leak":
 		c.goFlags = append(c.goFlags, "-asan")
 		// Set the debug mode to print the C stack trace.
 		c.cFlags = append(c.cFlags, "-g")
@@ -421,6 +483,11 @@ int LLVMFuzzerTestOneInput(char *data, size_t size) {
 `)
 
 func (c *config) checkCSanitizer() (skip bool, err error) {
+	// The sanitizer probes compile and run tiny C programs. If either step
+	// takes longer than this, treat the C sanitizer configuration as broken
+	// instead of letting the package-level test timeout fire.
+	probeTimeout := 20 * time.Second
+
 	dir, err := os.MkdirTemp("", c.sanitizer)
 	if err != nil {
 		return false, fmt.Errorf("failed to create temp directory: %v", err)
@@ -438,20 +505,32 @@ func (c *config) checkCSanitizer() (skip bool, err error) {
 	}
 
 	dst := filepath.Join(dir, "return0")
-	cmd, err := cc(c.cFlags...)
+	compileCtx, cancelCompile := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancelCompile()
+	cmd, err := cc(compileCtx, c.cFlags...)
 	if err != nil {
 		return false, err
 	}
 	cmd.Args = append(cmd.Args, c.ldFlags...)
 	cmd.Args = append(cmd.Args, "-o", dst, src)
+	if c.sanitizer == "address" {
+		// This is only a compiler support probe for ASAN. Some libasan versions
+		// run a slow LeakSanitizer check at exit even for this no-op C program,
+		// which can hang TestASAN before it starts testing Go binaries.
+		appendASANOptions(cmd, "leak_check_at_exit=0")
+	}
+	makeHangProne(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if errors.Is(compileCtx.Err(), context.DeadlineExceeded) {
+			return true, fmt.Errorf("%#q timed out after %v", cmd, probeTimeout)
+		}
 		if bytes.Contains(out, []byte("-fsanitize")) &&
 			(bytes.Contains(out, []byte("unrecognized")) ||
 				bytes.Contains(out, []byte("unsupported"))) {
 			return true, errors.New(string(out))
 		}
-		return true, fmt.Errorf("%#q failed: %v\n%s", strings.Join(cmd.Args, " "), err, out)
+		return true, fmt.Errorf("%#q failed: %v\n%s", cmd, err, out)
 	}
 
 	if c.sanitizer == "fuzzer" {
@@ -459,12 +538,25 @@ func (c *config) checkCSanitizer() (skip bool, err error) {
 		return false, nil
 	}
 
-	if out, err := exec.Command(dst).CombinedOutput(); err != nil {
+	runCtx, cancelRun := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancelRun()
+	cmd = exec.CommandContext(runCtx, dst)
+	makeHangProne(cmd)
+	if c.sanitizer == "address" {
+		// Match the compile-time probe above: avoid libasan's implicit LSan exit
+		// scan for this standalone C binary. The explicit LSAN tests still run
+		// with leak checking enabled.
+		appendASANOptions(cmd, "leak_check_at_exit=0")
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			return true, fmt.Errorf("%#q timed out after %v", cmd, probeTimeout)
+		}
 		if os.IsNotExist(err) {
-			return true, fmt.Errorf("%#q failed to produce executable: %v", strings.Join(cmd.Args, " "), err)
+			return true, fmt.Errorf("%#q failed to produce executable: %v", cmd, err)
 		}
 		snippet, _, _ := bytes.Cut(out, []byte("\n"))
-		return true, fmt.Errorf("%#q generated broken executable: %v\n%s", strings.Join(cmd.Args, " "), err, snippet)
+		return true, fmt.Errorf("%#q generated broken executable: %v\n%s", cmd, err, snippet)
 	}
 
 	return false, nil
@@ -494,25 +586,24 @@ func (c *config) checkRuntime() (skip bool, err error) {
 	// libcgo.h sets CGO_TSAN if it detects TSAN support in the C compiler.
 	// Dump the preprocessor defines to check that works.
 	// (Sometimes it doesn't: see https://golang.org/issue/15983.)
-	cmd, err := cc(c.cFlags...)
+	cmd, err := cc(context.Background(), c.cFlags...)
 	if err != nil {
 		return false, err
 	}
 	cmd.Args = append(cmd.Args, "-dM", "-E", "../../../../runtime/cgo/libcgo.h")
-	cmdStr := strings.Join(cmd.Args, " ")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return false, fmt.Errorf("%#q exited with %v\n%s", cmdStr, err, out)
+		return false, fmt.Errorf("%#q exited with %v\n%s", cmd, err, out)
 	}
 	if !bytes.Contains(out, []byte("#define CGO_TSAN")) {
-		return true, fmt.Errorf("%#q did not define CGO_TSAN", cmdStr)
+		return true, fmt.Errorf("%#q did not define CGO_TSAN", cmd)
 	}
 	return false, nil
 }
 
 // srcPath returns the path to the given file relative to this test's source tree.
 func srcPath(path string) string {
-	return filepath.Join("testdata", path)
+	return "./testdata/" + path
 }
 
 // A tempDir manages a temporary directory within a test.
@@ -539,12 +630,7 @@ func (d *tempDir) Join(name string) string {
 }
 
 func newTempDir(t *testing.T) *tempDir {
-	t.Helper()
-	dir, err := os.MkdirTemp("", filepath.Dir(t.Name()))
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	return &tempDir{base: dir}
+	return &tempDir{base: t.TempDir()}
 }
 
 // hangProneCmd returns an exec.Cmd for a command that is likely to hang.
@@ -557,8 +643,14 @@ func newTempDir(t *testing.T) *tempDir {
 // leak.
 func hangProneCmd(name string, arg ...string) *exec.Cmd {
 	cmd := exec.Command(name, arg...)
+	makeHangProne(cmd)
+	return cmd
+}
+
+// makeHangProne configures cmd to receive SIGKILL when the parent process receives SIGINT.
+// See [hangProneCmd] for details.
+func makeHangProne(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Pdeathsig: syscall.SIGKILL,
 	}
-	return cmd
 }

@@ -7,7 +7,7 @@ package net
 import (
 	"context"
 	"internal/bytealg"
-	"internal/itoa"
+	"internal/strconv"
 	"io/fs"
 	"os"
 	"syscall"
@@ -128,6 +128,7 @@ func startPlan9(ctx context.Context, net string, addr Addr) (ctl *os.File, dest,
 
 	clone, dest, err := queryCS1(ctx, proto, ip, port)
 	if err != nil {
+		err = handlePlan9DNSError(err, net+":"+ip.String()+":"+strconv.Itoa(port))
 		return
 	}
 	f, err := os.OpenFile(clone, os.O_RDWR, 0)
@@ -181,7 +182,6 @@ func dialPlan9(ctx context.Context, net string, laddr, raddr Addr) (fd *netFD, e
 	}
 	resc := make(chan res)
 	go func() {
-		testHookDialChannel()
 		fd, err := dialPlan9Blocking(ctx, net, laddr, raddr)
 		select {
 		case resc <- res{fd, err}:
@@ -227,7 +227,7 @@ func dialPlan9Blocking(ctx context.Context, net string, laddr, raddr Addr) (fd *
 		f.Close()
 		return nil, err
 	}
-	return newFD(proto, name, nil, f, data, laddr, raddr)
+	return newFD(proto, name, nil, f, data, laddr, raddr), nil
 }
 
 func listenPlan9(ctx context.Context, net string, laddr Addr) (fd *netFD, err error) {
@@ -246,10 +246,10 @@ func listenPlan9(ctx context.Context, net string, laddr Addr) (fd *netFD, err er
 		f.Close()
 		return nil, err
 	}
-	return newFD(proto, name, nil, f, nil, laddr, nil)
+	return newFD(proto, name, nil, f, nil, laddr, nil), nil
 }
 
-func (fd *netFD) netFD() (*netFD, error) {
+func (fd *netFD) netFD() *netFD {
 	return newFD(fd.net, fd.n, fd.listen, fd.ctl, fd.data, fd.laddr, fd.raddr)
 }
 
@@ -288,7 +288,7 @@ func (fd *netFD) acceptPlan9() (nfd *netFD, err error) {
 		data.Close()
 		return nil, err
 	}
-	return newFD(fd.net, name, listen, ctl, data, fd.laddr, raddr)
+	return newFD(fd.net, name, listen, ctl, data, fd.laddr, raddr), nil
 }
 
 func isWildcard(a Addr) bool {
@@ -337,9 +337,9 @@ func plan9LocalAddr(addr Addr) string {
 		if port == 0 {
 			return ""
 		}
-		return itoa.Itoa(port)
+		return strconv.Itoa(port)
 	}
-	return ip.String() + "!" + itoa.Itoa(port)
+	return ip.String() + "!" + strconv.Itoa(port)
 }
 
 func hangupCtlWrite(ctx context.Context, proto string, ctl *os.File, msg string) error {

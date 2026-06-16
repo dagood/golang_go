@@ -21,7 +21,12 @@ func RawSyscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno)
 func RawSyscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
 
 // Implemented in runtime/syscall_aix.go.
+// Accessed in assembly in x/sys/unix and x/sys/cpu.
+//
+//go:linkname rawSyscall6
 func rawSyscall6(trap, nargs, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
+
+//go:linkname syscall6
 func syscall6(trap, nargs, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
 
 // Constant expected by package but not supported
@@ -119,11 +124,11 @@ func Getwd() (ret string, err error) {
 		b := make([]byte, len)
 		err := getcwd(&b[0], len)
 		if err == nil {
-			i := 0
-			for b[i] != 0 {
-				i++
+			n := clen(b[:])
+			if n < 1 {
+				return "", EINVAL
 			}
-			return string(b[0:i]), nil
+			return string(b[:n]), nil
 		}
 		if err != ERANGE {
 			return "", err
@@ -222,7 +227,7 @@ func Wait4(pid int, wstatus *WaitStatus, options int, rusage *Rusage) (wpid int,
 	var status _C_int
 	var r _Pid_t
 	err = ERESTART
-	// AIX wait4 may return with ERESTART errno, while the processus is still
+	// AIX wait4 may return with ERESTART errno, while the process is still
 	// active.
 	for err == ERESTART {
 		r, err = wait4(_Pid_t(pid), &status, options, rusage)
@@ -629,6 +634,7 @@ func PtraceDetach(pid int) (err error) { return ptrace64(PT_DETACH, int64(pid), 
 //sysnb	Setegid(egid int) (err error)
 //sysnb	Seteuid(euid int) (err error)
 //sysnb	Setgid(gid int) (err error)
+//sysnb	Setuid(uid int) (err error)
 //sysnb	Setpgid(pid int, pgid int) (err error)
 //sys	Setpriority(which int, who int, prio int) (err error)
 //sysnb	Setregid(rgid int, egid int) (err error)

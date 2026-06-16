@@ -5,17 +5,17 @@
 package sql
 
 import (
+	"bytes"
 	"context"
 	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
 	"reflect"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -62,8 +62,31 @@ type fakeConnector struct {
 
 func (c *fakeConnector) Connect(context.Context) (driver.Conn, error) {
 	conn, err := fdriver.Open(c.name)
+	if err != nil {
+		return nil, err
+	}
 	conn.(*fakeConn).waiter = c.waiter
-	return conn, err
+	return conn, nil
+}
+
+func getFakeConn(c driver.Conn) *fakeConn {
+	return c.(interface {
+		getFakeConn() *fakeConn
+	}).getFakeConn()
+}
+
+func (c *fakeConn) getFakeConn() *fakeConn {
+	return c
+}
+
+func getRowsCursor(rs *Rows) *rowsCursor {
+	return rs.rowsi.(interface {
+		getRowsCursor() *rowsCursor
+	}).getRowsCursor()
+}
+
+func (rc *rowsCursor) getRowsCursor() *rowsCursor {
+	return rc
 }
 
 func (c *fakeConnector) Driver() driver.Driver {
@@ -90,8 +113,6 @@ func (cc *fakeDriverCtx) OpenConnector(name string) (driver.Connector, error) {
 
 type fakeDB struct {
 	name string
-
-	useRawBytes atomic.Bool
 
 	mu       sync.Mutex
 	tables   map[string]*table
@@ -120,12 +141,7 @@ type table struct {
 }
 
 func (t *table) columnIndex(name string) int {
-	for n, nname := range t.colname {
-		if name == nname {
-			return n
-		}
-	}
-	return -1
+	return slices.Index(t.colname, name)
 }
 
 type row struct {
@@ -217,15 +233,6 @@ func init() {
 	Register("test", fdriver)
 }
 
-func contains(list []string, y string) bool {
-	for _, x := range list {
-		if x == y {
-			return true
-		}
-	}
-	return false
-}
-
 type Dummy struct {
 	driver.Driver
 }
@@ -235,7 +242,7 @@ func TestDrivers(t *testing.T) {
 	Register("test", fdriver)
 	Register("invalid", Dummy{})
 	all := Drivers()
-	if len(all) < 2 || !sort.StringsAreSorted(all) || !contains(all, "test") || !contains(all, "invalid") {
+	if len(all) < 2 || !slices.IsSorted(all) || !slices.Contains(all, "test") || !slices.Contains(all, "invalid") {
 		t.Fatalf("Drivers = %v, want sorted list with at least [invalid, test]", all)
 	}
 }
@@ -345,10 +352,8 @@ func (db *fakeDB) columnType(table, column string) (typ string, ok bool) {
 	if !ok {
 		return
 	}
-	for n, cname := range t.colname {
-		if cname == column {
-			return t.coltype[n], true
-		}
+	if i := slices.Index(t.colname, column); i != -1 {
+		return t.coltype[i], true
 	}
 	return "", false
 }
@@ -700,8 +705,6 @@ func (c *fakeConn) PrepareContext(ctx context.Context, query string) (driver.Stm
 		switch cmd {
 		case "WIPE":
 			// Nothing
-		case "USE_RAWBYTES":
-			c.db.useRawBytes.Store(true)
 		case "SELECT":
 			stmt, err = c.prepareSelect(stmt, parts)
 		case "CREATE":
@@ -805,9 +808,6 @@ func (s *fakeStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (d
 	case "WIPE":
 		db.wipe()
 		return driver.ResultNoRows, nil
-	case "USE_RAWBYTES":
-		s.c.db.useRawBytes.Store(true)
-		return driver.ResultNoRows, nil
 	case "CREATE":
 		if err := db.createTable(s.table, s.colName, s.colType); err != nil {
 			return nil, err
@@ -821,6 +821,15 @@ func (s *fakeStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (d
 		return s.execInsert(args, false)
 	}
 	return nil, fmt.Errorf("fakedb: unimplemented statement Exec command type of %q", s.cmd)
+}
+
+func valueFromPlaceholderName(args []driver.NamedValue, name string) driver.Value {
+	for i := range args {
+		if args[i].Name == name {
+			return args[i].Value
+		}
+	}
+	return nil
 }
 
 // When doInsert is true, add the row to the table.
@@ -857,11 +866,8 @@ func (s *fakeStmt) execInsert(args []driver.NamedValue, doInsert bool) (driver.R
 				val = args[argPos].Value
 			} else {
 				// Assign value from argument placeholder name.
-				for _, a := range args {
-					if a.Name == strvalue[1:] {
-						val = a.Value
-						break
-					}
+				if v := valueFromPlaceholderName(args, strvalue[1:]); v != nil {
+					val = v
 				}
 			}
 			argPos++
@@ -986,7 +992,7 @@ func (s *fakeStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (
 				idx := t.columnIndex(wcol.Column)
 				if idx == -1 {
 					t.mu.Unlock()
-					return nil, fmt.Errorf("fakedb: invalid where clause column %q", wcol)
+					return nil, fmt.Errorf("fakedb: invalid where clause column %v", wcol)
 				}
 				tcol := trow.cols[idx]
 				if bs, ok := tcol.([]byte); ok {
@@ -997,12 +1003,8 @@ func (s *fakeStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (
 				if wcol.Placeholder == "?" {
 					argValue = args[wcol.Ordinal-1].Value
 				} else {
-					// Assign arg value from placeholder name.
-					for _, a := range args {
-						if a.Name == wcol.Placeholder[1:] {
-							argValue = a.Value
-							break
-						}
+					if v := valueFromPlaceholderName(args, wcol.Placeholder[1:]); v != nil {
+						argValue = v
 					}
 				}
 				if fmt.Sprintf("%v", tcol) != fmt.Sprintf("%v", argValue) {
@@ -1090,10 +1092,9 @@ type rowsCursor struct {
 	errPos int
 	err    error
 
-	// a clone of slices to give out to clients, indexed by the
-	// original slice's first byte address.  we clone them
-	// just so we're able to corrupt them on close.
-	bytesClone map[*byte][]byte
+	// Data returned to clients.
+	// We clone and stash it here so it can be invalidated by Close and Next.
+	driverOwnedMemory [][]byte
 
 	// Every operation writes to line to enable the race detector
 	// check for data races.
@@ -1110,9 +1111,19 @@ func (rc *rowsCursor) touchMem() {
 	rc.line++
 }
 
+func (rc *rowsCursor) invalidateDriverOwnedMemory() {
+	for _, buf := range rc.driverOwnedMemory {
+		for i := range buf {
+			buf[i] = 'x'
+		}
+	}
+	rc.driverOwnedMemory = nil
+}
+
 func (rc *rowsCursor) Close() error {
 	rc.touchMem()
 	rc.parentMem.touchMem()
+	rc.invalidateDriverOwnedMemory()
 	rc.closed = true
 	return rc.closeErr
 }
@@ -1143,6 +1154,8 @@ func (rc *rowsCursor) Next(dest []driver.Value) error {
 	if rc.posRow >= len(rc.rows[rc.posSet]) {
 		return io.EOF // per interface spec
 	}
+	// Corrupt any previously returned bytes.
+	rc.invalidateDriverOwnedMemory()
 	for i, v := range rc.rows[rc.posSet][rc.posRow].cols {
 		// TODO(bradfitz): convert to subset types? naah, I
 		// think the subset types should only be input to
@@ -1150,20 +1163,13 @@ func (rc *rowsCursor) Next(dest []driver.Value) error {
 		// a wider range of types coming out of drivers. all
 		// for ease of drivers, and to prevent drivers from
 		// messing up conversions or doing them differently.
-		dest[i] = v
-
-		if bs, ok := v.([]byte); ok && !rc.db.useRawBytes.Load() {
-			if rc.bytesClone == nil {
-				rc.bytesClone = make(map[*byte][]byte)
-			}
-			clone, ok := rc.bytesClone[&bs[0]]
-			if !ok {
-				clone = make([]byte, len(bs))
-				copy(clone, bs)
-				rc.bytesClone[&bs[0]] = clone
-			}
-			dest[i] = clone
+		if bs, ok := v.([]byte); ok {
+			// Clone []bytes and stash for later invalidation.
+			bs = bytes.Clone(bs)
+			rc.driverOwnedMemory = append(rc.driverOwnedMemory, bs)
+			v = bs
 		}
+		dest[i] = v
 	}
 	return nil
 }
@@ -1241,6 +1247,12 @@ func converterForType(typ string) driver.ValueConverter {
 	case "datetime":
 		return driver.NotNull{Converter: driver.DefaultParameterConverter}
 	case "nulldatetime":
+		return driver.Null{Converter: driver.DefaultParameterConverter}
+	case "uuid":
+		return driver.NotNull{Converter: driver.DefaultParameterConverter}
+	case "nulluuid":
+		return driver.Null{Converter: driver.DefaultParameterConverter}
+	case "nulltable":
 		return driver.Null{Converter: driver.DefaultParameterConverter}
 	case "any":
 		return anyTypeConverter{}

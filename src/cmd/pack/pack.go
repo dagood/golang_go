@@ -6,6 +6,8 @@ package main
 
 import (
 	"cmd/internal/archive"
+	"cmd/internal/objabi"
+	"cmd/internal/telemetry/counter"
 	"fmt"
 	"io"
 	"io/fs"
@@ -30,6 +32,8 @@ func usage() {
 func main() {
 	log.SetFlags(0)
 	log.SetPrefix("pack: ")
+	counter.Open()
+	objabi.Flagparse(usage)
 	// need "pack op archive" at least.
 	if len(os.Args) < 3 {
 		log.Print("not enough arguments")
@@ -37,6 +41,8 @@ func main() {
 		usage()
 	}
 	setOp(os.Args[1])
+	counter.Inc("pack/invocations")
+	counter.Inc("pack/op:" + string(op))
 	var ar *Archive
 	switch op {
 	case 'p':
@@ -134,6 +140,11 @@ func openArchive(name string, mode int, files []string) *Archive {
 	}
 	if err != nil {
 		log.Fatal(err)
+	}
+	for _, f := range a.Entries {
+		if !filepath.IsLocal(f.Name) || filepath.Base(f.Name) != f.Name {
+			log.Fatalf("%q: invalid name", f.Name)
+		}
 	}
 	return &Archive{
 		a:        a,

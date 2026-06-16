@@ -305,6 +305,7 @@ func ForCapture(fn *ir.Func) []VarAndLoop {
 						as := ir.NewAssignStmt(x.Pos(), z, tz)
 						as.Def = true
 						as.SetTypecheck(1)
+						z.Defn = as
 						preBody.Append(as)
 						dclFixups[z] = as
 
@@ -355,26 +356,17 @@ func ForCapture(fn *ir.Func) []VarAndLoop {
 					})
 
 					postNotNil := x.Post != nil
-					var tmpFirstDcl *ir.AssignStmt
+					var tmpFirstDcl ir.Node
 					if postNotNil {
 						// body' = prebody +
 						// (6)     if tmp_first {tmp_first = false} else {Post} +
 						//         if !cond {break} + ...
 						tmpFirst := typecheck.TempAt(base.Pos, fn, types.Types[types.TBOOL])
-
-						// tmpFirstAssign assigns val to tmpFirst
-						tmpFirstAssign := func(val bool) *ir.AssignStmt {
-							s := ir.NewAssignStmt(x.Pos(), tmpFirst, typecheck.OrigBool(tmpFirst, val))
-							s.SetTypecheck(1)
-							return s
-						}
-
-						tmpFirstDcl = tmpFirstAssign(true)
-						tmpFirstDcl.Def = true // also declares tmpFirst
-						tmpFirstSetFalse := tmpFirstAssign(false)
+						tmpFirstDcl = typecheck.Stmt(ir.NewAssignStmt(x.Pos(), tmpFirst, ir.NewBool(base.Pos, true)))
+						tmpFirstSetFalse := typecheck.Stmt(ir.NewAssignStmt(x.Pos(), tmpFirst, ir.NewBool(base.Pos, false)))
 						ifTmpFirst := ir.NewIfStmt(x.Pos(), tmpFirst, ir.Nodes{tmpFirstSetFalse}, ir.Nodes{x.Post})
-						ifTmpFirst.SetTypecheck(1)
-						preBody.Append(ifTmpFirst)
+						ifTmpFirst.PtrInit().Append(typecheck.Stmt(ir.NewDecl(base.Pos, ir.ODCL, tmpFirst))) // declares tmpFirst
+						preBody.Append(typecheck.Stmt(ifTmpFirst))
 					}
 
 					// body' = prebody +
@@ -456,6 +448,11 @@ func ForCapture(fn *ir.Func) []VarAndLoop {
 		}
 	}
 	ir.WithFunc(fn, forCapture)
+
+	if ir.MatchAstDump(fn, "loopvar") {
+		ir.AstDump(fn, "loopvar, "+ir.FuncName(fn))
+	}
+
 	return transformed
 }
 
@@ -496,8 +493,6 @@ func rewriteNodes(fn *ir.Func, editNodes func(c ir.Nodes) ir.Nodes) {
 		switch x := n.(type) {
 		case *ir.Func:
 			x.Body = editNodes(x.Body)
-			x.Enter = editNodes(x.Enter)
-			x.Exit = editNodes(x.Exit)
 		case *ir.InlinedCallExpr:
 			x.Body = editNodes(x.Body)
 
@@ -567,7 +562,7 @@ func LogTransformations(transformed []VarAndLoop) {
 
 			if logopt.Enabled() {
 				// For automated checking of coverage of this transformation, include this in the JSON information.
-				var nString interface{} = n
+				var nString any = n
 				if inner != outer {
 					nString = fmt.Sprintf("%v (from inline)", n)
 				}

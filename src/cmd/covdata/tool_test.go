@@ -9,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"internal/coverage/pods"
-	"internal/goexperiment"
 	"internal/testenv"
 	"log"
 	"os"
@@ -20,17 +19,6 @@ import (
 	"sync"
 	"testing"
 )
-
-// testcovdata returns the path to the unit test executable to be used as
-// standin for 'go tool covdata'.
-func testcovdata(t testing.TB) string {
-	exe, err := os.Executable()
-	if err != nil {
-		t.Helper()
-		t.Fatal(err)
-	}
-	return exe
-}
 
 // Top level tempdir for test.
 var testTempDir string
@@ -62,7 +50,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "debug: preserving tmpdir %s\n", topTmpdir)
 	}
 	os.Setenv("CMDCOVDATA_TEST_RUN_MAIN", "true")
-	os.Exit(m.Run())
+	m.Run()
 }
 
 var tdmu sync.Mutex
@@ -161,9 +149,6 @@ const debugWorkDir = false
 
 func TestCovTool(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
-	if !goexperiment.CoverageRedesign {
-		t.Skipf("stubbed out due to goexperiment.CoverageRedesign=false")
-	}
 	dir := tempDir(t)
 	if testing.Short() {
 		t.Skip()
@@ -184,7 +169,7 @@ func TestCovTool(t *testing.T) {
 	s.exepath3, s.exedir3 = buildProg(t, "prog1", dir, "atomic", flags)
 
 	// Reuse unit test executable as tool to be tested.
-	s.tool = testcovdata(t)
+	s.tool = testenv.Executable(t)
 
 	// Create a few coverage output dirs.
 	for i := 0; i < 4; i++ {
@@ -294,7 +279,7 @@ func runToolOp(t *testing.T, s state, op string, args []string) []string {
 	cmd := testenv.Command(t, s.tool, args...)
 	b, err := cmd.CombinedOutput()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "## %s output: %s\n", op, string(b))
+		fmt.Fprintf(os.Stderr, "## %s output: %s\n", op, b)
 		t.Fatalf("%q run error: %v", op, err)
 	}
 	output := strings.TrimSpace(string(b))
@@ -429,7 +414,7 @@ func testTextfmt(t *testing.T, s state) {
 		dumplines(lines[0:10])
 		t.Errorf("textfmt: want %s got %s", want0, lines[0])
 	}
-	want1 := mainPkgPath + "/prog1.go:13.14,15.2 1 1"
+	want1 := mainPkgPath + "/prog1.go:14.2,15.1 1 1"
 	if lines[1] != want1 {
 		dumplines(lines[0:10])
 		t.Errorf("textfmt: want %s got %s", want1, lines[1])
@@ -560,7 +545,7 @@ func testMergeSimple(t *testing.T, s state, indir1, indir2, tag string) {
 		},
 		{
 			tag:     "third function unit 0",
-			re:      regexp.MustCompile(`^0: L23:C23 -- L24:C12 NS=1 = (\d+)$`),
+			re:      regexp.MustCompile(`^0: L24:C2 -- L24:C12 NS=1 = (\d+)$`),
 			nonzero: true,
 		},
 		{
@@ -570,7 +555,7 @@ func testMergeSimple(t *testing.T, s state, indir1, indir2, tag string) {
 		},
 		{
 			tag:     "third function unit 2",
-			re:      regexp.MustCompile(`^2: L24:C12 -- L26:C3 NS=1 = (\d+)$`),
+			re:      regexp.MustCompile(`^2: L25:C3 -- L26:C1 NS=1 = (\d+)$`),
 			nonzero: true,
 		},
 	}
@@ -742,7 +727,7 @@ func testSubtract(t *testing.T, s state) {
 		},
 		{
 			tag:  "third function unit 0",
-			re:   regexp.MustCompile(`^0: L23:C23 -- L24:C12 NS=1 = (\d+)$`),
+			re:   regexp.MustCompile(`^0: L24:C2 -- L24:C12 NS=1 = (\d+)$`),
 			zero: true,
 		},
 		{
@@ -752,7 +737,7 @@ func testSubtract(t *testing.T, s state) {
 		},
 		{
 			tag:  "third function unit 2",
-			re:   regexp.MustCompile(`^2: L24:C12 -- L26:C3 NS=1 = (\d+)$`),
+			re:   regexp.MustCompile(`^2: L25:C3 -- L26:C1 NS=1 = (\d+)$`),
 			zero: true,
 		},
 	}

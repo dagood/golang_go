@@ -75,7 +75,7 @@ func Fixup() {
 		}
 		if strings.HasPrefix(s.Name, counterPrefix) {
 			ckTypSanity(nm, "countervar")
-			nm.SetCoverageCounter(true)
+			nm.SetCoverageAuxVar(true)
 			s := nm.Linksym()
 			s.Type = objabi.SCOVERAGE_COUNTER
 		}
@@ -131,7 +131,7 @@ func metaHashAndLen() ([16]byte, int) {
 	}
 	var hv [16]byte
 	for i := 0; i < 16; i++ {
-		nib := string(mhash[i*2 : i*2+2])
+		nib := mhash[i*2 : i*2+2]
 		x, err := strconv.ParseInt(nib, 16, 32)
 		if err != nil {
 			base.Fatalf("metahash bad byte %q", nib)

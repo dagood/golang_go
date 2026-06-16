@@ -18,8 +18,7 @@ import (
 
 // IsRegularMemory reports whether t can be compared/hashed as regular memory.
 func IsRegularMemory(t *types.Type) bool {
-	a, _ := types.AlgType(t)
-	return a == types.AMEM
+	return types.AlgType(t) == types.AMEM
 }
 
 // Memrun finds runs of struct fields for which memory-only algs are appropriate.
@@ -148,7 +147,7 @@ func calculateCostForType(t *types.Type) int64 {
 		return EqStructCost(t)
 	case types.TSLICE:
 		// Slices are not comparable.
-		base.Fatalf("eqStructFieldCost: unexpected slice type")
+		base.Fatalf("calculateCostForType: unexpected slice type")
 	case types.TARRAY:
 		elemCost := calculateCostForType(t.Elem())
 		cost = t.NumElem() * elemCost
@@ -258,8 +257,8 @@ func EqStruct(t *types.Type, np, nq ir.Node) ([]ir.Node, bool) {
 func EqString(s, t ir.Node) (eqlen *ir.BinaryExpr, eqmem *ir.CallExpr) {
 	s = typecheck.Conv(s, types.Types[types.TSTRING])
 	t = typecheck.Conv(t, types.Types[types.TSTRING])
-	sptr := ir.NewUnaryExpr(base.Pos, ir.OSPTR, s)
-	tptr := ir.NewUnaryExpr(base.Pos, ir.OSPTR, t)
+	sptr := ir.NewConvExpr(base.Pos, ir.OCONVNOP, types.Types[types.TUNSAFEPTR], ir.NewUnaryExpr(base.Pos, ir.OSPTR, s))
+	tptr := ir.NewConvExpr(base.Pos, ir.OCONVNOP, types.Types[types.TUNSAFEPTR], ir.NewUnaryExpr(base.Pos, ir.OSPTR, t))
 	slen := typecheck.Conv(ir.NewUnaryExpr(base.Pos, ir.OLEN, s), types.Types[types.TUINTPTR])
 	tlen := typecheck.Conv(ir.NewUnaryExpr(base.Pos, ir.OLEN, t), types.Types[types.TUINTPTR])
 
@@ -294,7 +293,7 @@ func EqString(s, t ir.Node) (eqlen *ir.BinaryExpr, eqmem *ir.CallExpr) {
 		cmplen = tlen
 	}
 
-	fn := typecheck.LookupRuntime("memequal", types.Types[types.TUINT8], types.Types[types.TUINT8])
+	fn := typecheck.LookupRuntime("memequal")
 	call := typecheck.Call(base.Pos, fn, []ir.Node{sptr, tptr, ir.Copy(cmplen)}, false).(*ir.CallExpr)
 
 	cmp := ir.NewBinaryExpr(base.Pos, ir.OEQ, slen, tlen)
@@ -371,6 +370,11 @@ func eqmem(p, q ir.Node, field int, size int64) ir.Node {
 }
 
 func eqmemfunc(size int64, t *types.Type) (fn *ir.Name, needsize bool) {
+	if !base.Ctxt.Arch.CanMergeLoads && t.Alignment() < int64(base.Ctxt.Arch.Alignment) && t.Alignment() < t.Size() {
+		// We can't use larger comparisons if the value might not be aligned
+		// enough for the larger comparison. See issues 46283 and 67160.
+		size = 0
+	}
 	switch size {
 	case 1, 2, 4, 8, 16:
 		buf := fmt.Sprintf("memequal%d", int(size)*8)

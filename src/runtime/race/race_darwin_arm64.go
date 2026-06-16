@@ -8,6 +8,9 @@
 
 package race
 
+//go:cgo_import_dynamic _Block_object_assign _Block_object_assign ""
+//go:cgo_import_dynamic _Block_object_dispose _Block_object_dispose ""
+//go:cgo_import_dynamic _NSConcreteStackBlock _NSConcreteStackBlock ""
 //go:cgo_import_dynamic _NSGetArgv _NSGetArgv ""
 //go:cgo_import_dynamic _NSGetEnviron _NSGetEnviron ""
 //go:cgo_import_dynamic _NSGetExecutablePath _NSGetExecutablePath ""
@@ -20,6 +23,8 @@ package race
 //go:cgo_import_dynamic _dyld_get_image_header _dyld_get_image_header ""
 //go:cgo_import_dynamic _dyld_get_image_name _dyld_get_image_name ""
 //go:cgo_import_dynamic _dyld_get_image_vmaddr_slide _dyld_get_image_vmaddr_slide ""
+//go:cgo_import_dynamic _dyld_get_shared_cache_range _dyld_get_shared_cache_range ""
+//go:cgo_import_dynamic _dyld_get_shared_cache_uuid _dyld_get_shared_cache_uuid ""
 //go:cgo_import_dynamic _dyld_image_count _dyld_image_count ""
 //go:cgo_import_dynamic _exit _exit ""
 //go:cgo_import_dynamic abort abort ""
@@ -29,6 +34,7 @@ package race
 //go:cgo_import_dynamic dlsym dlsym ""
 //go:cgo_import_dynamic dup dup ""
 //go:cgo_import_dynamic dup2 dup2 ""
+//go:cgo_import_dynamic dyld_shared_cache_iterate_text dyld_shared_cache_iterate_text ""
 //go:cgo_import_dynamic execve execve ""
 //go:cgo_import_dynamic exit exit ""
 //go:cgo_import_dynamic fstat fstat ""
@@ -48,7 +54,6 @@ package race
 //go:cgo_import_dynamic madvise madvise ""
 //go:cgo_import_dynamic malloc_num_zones malloc_num_zones ""
 //go:cgo_import_dynamic malloc_zones malloc_zones ""
-//go:cgo_import_dynamic memcpy memcpy ""
 //go:cgo_import_dynamic memset_pattern16 memset_pattern16 ""
 //go:cgo_import_dynamic mkdir mkdir ""
 //go:cgo_import_dynamic mprotect mprotect ""
@@ -68,6 +73,7 @@ package race
 //go:cgo_import_dynamic pthread_get_stackaddr_np pthread_get_stackaddr_np ""
 //go:cgo_import_dynamic pthread_get_stacksize_np pthread_get_stacksize_np ""
 //go:cgo_import_dynamic pthread_getspecific pthread_getspecific ""
+//go:cgo_import_dynamic pthread_introspection_hook_install pthread_introspection_hook_install ""
 //go:cgo_import_dynamic pthread_join pthread_join ""
 //go:cgo_import_dynamic pthread_self pthread_self ""
 //go:cgo_import_dynamic pthread_sigmask pthread_sigmask ""

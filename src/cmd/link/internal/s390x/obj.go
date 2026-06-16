@@ -52,9 +52,10 @@ func Init() (*sys.Arch, ld.Arch) {
 		Archrelocvariant: archrelocvariant,
 		Gentext:          gentext,
 		Machoreloc1:      machoreloc1,
+		TLSIEtoLE:        tlsIEtoLE,
 
 		ELF: ld.ELFArch{
-			Linuxdynld:     "/lib64/ld64.so.1",
+			Linuxdynld:     "/lib/ld64.so.1",
 			LinuxdynldMusl: "/lib/ld-musl-s390x.so.1",
 
 			// not relevant for s390x
@@ -81,11 +82,11 @@ func archinit(ctxt *ld.Link) {
 	case objabi.Hlinux: // s390x ELF
 		ld.Elfinit(ctxt)
 		ld.HEADR = ld.ELFRESERVE
-		if *ld.FlagTextAddr == -1 {
-			*ld.FlagTextAddr = 0x10000 + int64(ld.HEADR)
-		}
 		if *ld.FlagRound == -1 {
 			*ld.FlagRound = 0x10000
+		}
+		if *ld.FlagTextAddr == -1 {
+			*ld.FlagTextAddr = ld.Rnd(0x10000, *ld.FlagRound) + int64(ld.HEADR)
 		}
 	}
 }

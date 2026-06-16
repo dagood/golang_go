@@ -8,17 +8,22 @@ import (
 	"bufio"
 	"bytes"
 	"cmd/compile/internal/base"
+	"cmd/compile/internal/bloop"
 	"cmd/compile/internal/coverage"
-	"cmd/compile/internal/devirtualize"
+	"cmd/compile/internal/deadlocals"
 	"cmd/compile/internal/dwarfgen"
 	"cmd/compile/internal/escape"
 	"cmd/compile/internal/inline"
+	"cmd/compile/internal/inline/interleaved"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/logopt"
 	"cmd/compile/internal/loopvar"
 	"cmd/compile/internal/noder"
-	"cmd/compile/internal/pgo"
+	"cmd/compile/internal/pgoir"
 	"cmd/compile/internal/pkginit"
+	"cmd/compile/internal/reflectdata"
+	"cmd/compile/internal/rttype"
+	"cmd/compile/internal/slice"
 	"cmd/compile/internal/ssa"
 	"cmd/compile/internal/ssagen"
 	"cmd/compile/internal/staticinit"
@@ -28,6 +33,7 @@ import (
 	"cmd/internal/obj"
 	"cmd/internal/objabi"
 	"cmd/internal/src"
+	"cmd/internal/telemetry/counter"
 	"flag"
 	"fmt"
 	"internal/buildcfg"
@@ -41,6 +47,8 @@ import (
 // already been some compiler errors). It may also be invoked from the explicit panic in
 // hcrash(), in which case, we pass the panic on through.
 func handlePanic() {
+	ir.CloseHTMLWriters()
+	noder.CloseHTMLWriters()
 	if err := recover(); err != nil {
 		if err == "-h" {
 			// Force real panic now with -h option (hcrash) - the error
@@ -56,6 +64,8 @@ func handlePanic() {
 // code, and finally writes the compiled package definition to disk.
 func Main(archInit func(*ssagen.ArchInfo)) {
 	base.Timer.Start("fe", "init")
+	counter.Open()
+	counter.Inc("compile/invocations")
 
 	defer handlePanic()
 
@@ -75,10 +85,13 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	base.DebugSSA = ssa.PhaseOption
 	base.ParseFlags()
 
-	if os.Getenv("GOGC") == "" { // GOGC set disables starting heap adjustment
-		// More processors will use more heap, but assume that more memory is available.
-		// So 1 processor -> 40MB, 4 -> 64MB, 12 -> 128MB
-		base.AdjustStartingHeap(uint64(32+8*base.Flag.LowerC) << 20)
+	if flagGCStart := base.Debug.GCStart; flagGCStart > 0 || // explicit flags overrides environment variable disable of GC boost
+		os.Getenv("GOGC") == "" && os.Getenv("GOMEMLIMIT") == "" && base.Flag.LowerC != 1 { // explicit GC knobs or no concurrency implies default heap
+		startHeapMB := int64(128)
+		if flagGCStart > 0 {
+			startHeapMB = int64(flagGCStart)
+		}
+		base.AdjustStartingHeap(uint64(startHeapMB)<<20, 0, 0, 0, base.Debug.GCAdjust == 1)
 	}
 
 	types.LocalPkg = types.NewPkg(base.Ctxt.Pkgpath, "")
@@ -97,6 +110,11 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	// insignificantly.
 	ir.Pkgs.Runtime = types.NewPkg("go.runtime", "runtime")
 	ir.Pkgs.Runtime.Prefix = "runtime"
+
+	// Pseudo-package that contains the compiler's builtin
+	// declarations for maps.
+	ir.Pkgs.InternalMaps = types.NewPkg("go.internal/runtime/maps", "internal/runtime/maps")
+	ir.Pkgs.InternalMaps.Prefix = "internal/runtime/maps"
 
 	// pseudo-packages used in symbol tables
 	ir.Pkgs.Itab = types.NewPkg("go.itab", "go.itab")
@@ -127,7 +145,7 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	}
 
 	if base.Flag.SmallFrames {
-		ir.MaxStackVarSize = 128 * 1024
+		ir.MaxStackVarSize = 64 * 1024
 		ir.MaxImplicitStackVarSize = 16 * 1024
 	}
 
@@ -175,9 +193,9 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	ir.EscFmt = escape.Fmt
 	ir.IsIntrinsicCall = ssagen.IsIntrinsicCall
+	ir.IsIntrinsicSym = ssagen.IsIntrinsicSym
 	inline.SSADumpInline = ssagen.DumpInline
 	ssagen.InitEnv()
-	ssagen.InitTables()
 
 	types.PtrSize = ssagen.Arch.LinkArch.PtrSize
 	types.RegSize = ssagen.Arch.LinkArch.RegSize
@@ -189,6 +207,12 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	typecheck.InitUniverse()
 	typecheck.InitRuntime()
+	rttype.Init()
+
+	// Some intrinsics (notably, the simd intrinsics) mention
+	// types "eagerly", thus ssagen must be initialized AFTER
+	// the type system is ready.
+	ssagen.InitTables()
 
 	// Parse and typecheck input.
 	noder.LoadPackage(flag.Args())
@@ -204,63 +228,47 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	dwarfgen.RecordPackageName()
 
-	// Prepare for backend processing. This must happen before pkginit,
-	// because it generates itabs for initializing global variables.
+	// Prepare for backend processing.
 	ssagen.InitConfig()
-
-	// Create "init" function for package-scope variable initialization
-	// statements, if any.
-	pkginit.MakeInit()
 
 	// Apply coverage fixups, if applicable.
 	coverage.Fixup()
 
-	// Compute Addrtaken for names.
-	// We need to wait until typechecking is done so that when we see &x[i]
-	// we know that x has its address taken if x is an array, but not if x is a slice.
-	// We compute Addrtaken in bulk here.
-	// After this phase, we maintain Addrtaken incrementally.
-	if typecheck.DirtyAddrtaken {
-		typecheck.ComputeAddrtaken(typecheck.Target.Funcs)
-		typecheck.DirtyAddrtaken = false
-	}
-	typecheck.IncrementalAddrtaken = true
-
 	// Read profile file and build profile-graph and weighted-call-graph.
 	base.Timer.Start("fe", "pgo-load-profile")
-	var profile *pgo.Profile
+	var profile *pgoir.Profile
 	if base.Flag.PgoProfile != "" {
 		var err error
-		profile, err = pgo.New(base.Flag.PgoProfile)
+		profile, err = pgoir.New(base.Flag.PgoProfile)
 		if err != nil {
 			log.Fatalf("%s: PGO error: %v", base.Flag.PgoProfile, err)
 		}
 	}
 
-	base.Timer.Start("fe", "pgo-devirtualization")
-	if profile != nil && base.Debug.PGODevirtualize > 0 {
-		// TODO(prattmic): No need to use bottom-up visit order. This
-		// is mirroring the PGO IRGraph visit order, which also need
-		// not be bottom-up.
-		ir.VisitFuncsBottomUp(typecheck.Target.Funcs, func(list []*ir.Func, recursive bool) {
-			for _, fn := range list {
-				devirtualize.ProfileGuided(fn, profile)
-			}
-		})
-		ir.CurFunc = nil
+	for _, fn := range typecheck.Target.Funcs {
+		if ir.MatchAstDump(fn, "start") {
+			ir.AstDump(fn, "start, "+ir.FuncName(fn))
+		}
 	}
 
-	// Inlining
-	base.Timer.Start("fe", "inlining")
-	if base.Flag.LowerL != 0 {
-		inline.InlinePackage(profile)
+	// Apply bloop markings.
+	bloop.Walk(typecheck.Target)
+
+	// Interleaved devirtualization and inlining.
+	base.Timer.Start("fe", "devirtualize-and-inline")
+	interleaved.DevirtualizeAndInlinePackage(typecheck.Target, profile)
+
+	for _, fn := range typecheck.Target.Funcs {
+		if ir.MatchAstDump(fn, "devirtualize-and-inline") {
+			ir.AstDump(fn, "devirtualize-and-inline, "+ir.FuncName(fn))
+		}
 	}
+
 	noder.MakeWrappers(typecheck.Target) // must happen after inlining
 
-	// Devirtualize and get variable capture right in for loops
+	// Get variable capture right in for loops.
 	var transformed []loopvar.VarAndLoop
 	for _, fn := range typecheck.Target.Funcs {
-		devirtualize.Static(fn)
 		transformed = append(transformed, loopvar.ForCapture(fn)...)
 	}
 	ir.CurFunc = nil
@@ -272,6 +280,8 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	// and doesn't benefit from dead-coding or inlining.
 	symABIs.GenABIWrappers()
 
+	deadlocals.Funcs(typecheck.Target.Funcs)
+
 	// Escape analysis.
 	// Required for moving heap allocations onto stack,
 	// which in turn is required by the closure implementation,
@@ -282,6 +292,8 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	// because large values may contain pointers, it must happen early.
 	base.Timer.Start("fe", "escapes")
 	escape.Funcs(typecheck.Target.Funcs)
+
+	slice.Funcs(typecheck.Target.Funcs)
 
 	loopvar.LogTransformations(transformed)
 
@@ -295,18 +307,62 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	ir.CurFunc = nil
 
-	// Compile top level functions.
-	// Don't use range--walk can add functions to Target.Decls.
-	base.Timer.Start("be", "compilefuncs")
-	fcount := int64(0)
-	for i := 0; i < len(typecheck.Target.Funcs); i++ {
-		fn := typecheck.Target.Funcs[i]
-		enqueueFunc(fn)
-		fcount++
-	}
-	base.Timer.AddEvent(fcount, "funcs")
+	reflectdata.WriteBasicTypes()
 
-	compileFunctions()
+	// Compile top-level declarations.
+	//
+	// There are cyclic dependencies between all of these phases, so we
+	// need to iterate all of them until we reach a fixed point.
+	base.Timer.Start("be", "compilefuncs")
+	for nextFunc, nextExtern := 0, 0; ; {
+		reflectdata.WriteRuntimeTypes()
+
+		if nextExtern < len(typecheck.Target.Externs) {
+			switch n := typecheck.Target.Externs[nextExtern]; n.Op() {
+			case ir.ONAME:
+				dumpGlobal(n)
+			case ir.OLITERAL:
+				dumpGlobalConst(n)
+			case ir.OTYPE:
+				reflectdata.NeedRuntimeType(n.Type())
+			}
+			nextExtern++
+			continue
+		}
+
+		if nextFunc < len(typecheck.Target.Funcs) {
+			enqueueFunc(typecheck.Target.Funcs[nextFunc], symABIs)
+			nextFunc++
+			continue
+		}
+
+		// The SSA backend supports using multiple goroutines, so keep it
+		// as late as possible to maximize how much work we can batch and
+		// process concurrently.
+		if len(compilequeue) != 0 {
+			compileFunctions(profile)
+			continue
+		}
+
+		// Finalize DWARF inline routine DIEs, then explicitly turn off
+		// further DWARF inlining generation to avoid problems with
+		// generated method wrappers.
+		//
+		// Note: The DWARF fixup code for inlined calls currently doesn't
+		// allow multiple invocations, so we intentionally run it just
+		// once after everything else. Worst case, some generated
+		// functions have slightly larger DWARF DIEs.
+		if base.Ctxt.DwFixups != nil {
+			base.Ctxt.DwFixups.Finalize(base.Ctxt.Pkgpath, base.Debug.DwarfInl != 0)
+			base.Ctxt.DwFixups = nil
+			base.Flag.GenDwarfInl = 0
+			continue // may have called reflectdata.TypeLinksym (#62156)
+		}
+
+		break
+	}
+
+	base.Timer.AddEvent(int64(len(typecheck.Target.Funcs)), "funcs")
 
 	if base.Flag.CompilingRuntime {
 		// Write barriers are now known. Check the call graph.
@@ -316,15 +372,6 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	// Add keep relocations for global maps.
 	if base.Debug.WrapGlobalMapCtl != 1 {
 		staticinit.AddKeepRelocations()
-	}
-
-	// Finalize DWARF inline routine DIEs, then explicitly turn off
-	// DWARF inlining gen so as to avoid problems with generated
-	// method wrappers.
-	if base.Ctxt.DwFixups != nil {
-		base.Ctxt.DwFixups.Finalize(base.Ctxt.Pkgpath, base.Debug.DwarfInl != 0)
-		base.Ctxt.DwFixups = nil
-		base.Flag.GenDwarfInl = 0
 	}
 
 	// Write object data to disk.

@@ -6,7 +6,7 @@
 package base64
 
 import (
-	"encoding/binary"
+	"internal/byteorder"
 	"io"
 	"slices"
 	"strconv"
@@ -29,9 +29,12 @@ type Encoding struct {
 }
 
 const (
-	StdPadding          rune = '=' // Standard padding character
-	NoPadding           rune = -1  // No padding
-	decodeMapInitialize      = "" +
+	StdPadding rune = '=' // Standard padding character
+	NoPadding  rune = -1  // No padding
+)
+
+const (
+	decodeMapInitialize = "" +
 		"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff" +
 		"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff" +
 		"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff" +
@@ -51,16 +54,13 @@ const (
 	invalidIndex = '\xff'
 )
 
-const encodeStd = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-const encodeURL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-
 // NewEncoding returns a new padded Encoding defined by the given alphabet,
 // which must be a 64-byte string that contains unique byte values and
 // does not contain the padding character or CR / LF ('\r', '\n').
 // The alphabet is treated as a sequence of byte values
 // without any special treatment for multi-byte UTF-8.
 // The resulting Encoding uses the default padding character ('='),
-// which may be changed or disabled via WithPadding.
+// which may be changed or disabled via [Encoding.WithPadding].
 func NewEncoding(encoder string) *Encoding {
 	if len(encoder) != 64 {
 		panic("encoding alphabet is not 64-bytes long")
@@ -87,7 +87,7 @@ func NewEncoding(encoder string) *Encoding {
 }
 
 // WithPadding creates a new encoding identical to enc except
-// with a specified padding character, or NoPadding to disable padding.
+// with a specified padding character, or [NoPadding] to disable padding.
 // The padding character must not be '\r' or '\n',
 // must not be contained in the encoding's alphabet,
 // must not be negative, and must be a rune equal or below '\xff'.
@@ -115,34 +115,33 @@ func (enc Encoding) Strict() *Encoding {
 	return &enc
 }
 
-// StdEncoding is the standard base64 encoding, as defined in
-// RFC 4648.
-var StdEncoding = NewEncoding(encodeStd)
+// StdEncoding is the standard base64 encoding, as defined in RFC 4648.
+var StdEncoding = NewEncoding("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
 
 // URLEncoding is the alternate base64 encoding defined in RFC 4648.
 // It is typically used in URLs and file names.
-var URLEncoding = NewEncoding(encodeURL)
+var URLEncoding = NewEncoding("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
 
 // RawStdEncoding is the standard raw, unpadded base64 encoding,
 // as defined in RFC 4648 section 3.2.
-// This is the same as StdEncoding but omits padding characters.
+// This is the same as [StdEncoding] but omits padding characters.
 var RawStdEncoding = StdEncoding.WithPadding(NoPadding)
 
 // RawURLEncoding is the unpadded alternate base64 encoding defined in RFC 4648.
 // It is typically used in URLs and file names.
-// This is the same as URLEncoding but omits padding characters.
+// This is the same as [URLEncoding] but omits padding characters.
 var RawURLEncoding = URLEncoding.WithPadding(NoPadding)
 
 /*
  * Encoder
  */
 
-// Encode encodes src using the encoding enc, writing
-// EncodedLen(len(src)) bytes to dst.
+// Encode encodes src using the encoding enc,
+// writing [Encoding.EncodedLen](len(src)) bytes to dst.
 //
 // The encoding pads the output to a multiple of 4 bytes,
 // so Encode is not appropriate for use on individual blocks
-// of a large data stream. Use NewEncoder() instead.
+// of a large data stream. Use [NewEncoder] instead.
 func (enc *Encoding) Encode(dst, src []byte) {
 	if len(src) == 0 {
 		return
@@ -152,44 +151,39 @@ func (enc *Encoding) Encode(dst, src []byte) {
 	// outside of the loop to speed up the encoder.
 	_ = enc.encode
 
-	di, si := 0, 0
-	n := (len(src) / 3) * 3
-	for si < n {
+	for len(src) >= 3 {
 		// Convert 3x 8bit source bytes into 4 bytes
-		val := uint(src[si+0])<<16 | uint(src[si+1])<<8 | uint(src[si+2])
+		val := uint(src[0])<<16 | uint(src[1])<<8 | uint(src[2])
 
-		dst[di+0] = enc.encode[val>>18&0x3F]
-		dst[di+1] = enc.encode[val>>12&0x3F]
-		dst[di+2] = enc.encode[val>>6&0x3F]
-		dst[di+3] = enc.encode[val&0x3F]
+		_ = dst[3] // Eliminate bounds checks below.
+		dst[0] = enc.encode[val>>18&0x3F]
+		dst[1] = enc.encode[val>>12&0x3F]
+		dst[2] = enc.encode[val>>6&0x3F]
+		dst[3] = enc.encode[val&0x3F]
 
-		si += 3
-		di += 4
+		src = src[3:]
+		dst = dst[4:]
 	}
 
-	remain := len(src) - si
-	if remain == 0 {
+	// Add the remaining small block (if any).
+	switch len(src) {
+	case 0:
 		return
-	}
-	// Add the remaining small block
-	val := uint(src[si+0]) << 16
-	if remain == 2 {
-		val |= uint(src[si+1]) << 8
-	}
-
-	dst[di+0] = enc.encode[val>>18&0x3F]
-	dst[di+1] = enc.encode[val>>12&0x3F]
-
-	switch remain {
-	case 2:
-		dst[di+2] = enc.encode[val>>6&0x3F]
-		if enc.padChar != NoPadding {
-			dst[di+3] = byte(enc.padChar)
-		}
 	case 1:
+		val := uint(src[0]) << 16
+		dst[0] = enc.encode[val>>18&0x3F]
+		dst[1] = enc.encode[val>>12&0x3F]
 		if enc.padChar != NoPadding {
-			dst[di+2] = byte(enc.padChar)
-			dst[di+3] = byte(enc.padChar)
+			dst[2] = byte(enc.padChar)
+			dst[3] = byte(enc.padChar)
+		}
+	case 2:
+		val := uint(src[0])<<16 | uint(src[1])<<8
+		dst[0] = enc.encode[val>>18&0x3F]
+		dst[1] = enc.encode[val>>12&0x3F]
+		dst[2] = enc.encode[val>>6&0x3F]
+		if enc.padChar != NoPadding {
+			dst[3] = byte(enc.padChar)
 		}
 	}
 }
@@ -410,6 +404,7 @@ func (enc *Encoding) decodeQuantum(dst, src []byte, si int) (nsi, n int, err err
 // AppendDecode appends the base64 decoded src to dst
 // and returns the extended buffer.
 // If the input is malformed, it returns the partially decoded src and an error.
+// New line characters (\r and \n) are ignored.
 func (enc *Encoding) AppendDecode(dst, src []byte) ([]byte, error) {
 	// Compute the output size without padding to avoid over allocating.
 	n := len(src)
@@ -424,6 +419,8 @@ func (enc *Encoding) AppendDecode(dst, src []byte) ([]byte, error) {
 }
 
 // DecodeString returns the bytes represented by the base64 string s.
+// If the input is malformed, it returns the partially decoded data and
+// [CorruptInputError]. New line characters (\r and \n) are ignored.
 func (enc *Encoding) DecodeString(s string) ([]byte, error) {
 	dbuf := make([]byte, enc.DecodedLen(len(s)))
 	n, err := enc.Decode(dbuf, []byte(s))
@@ -508,9 +505,10 @@ func (d *decoder) Read(p []byte) (n int, err error) {
 }
 
 // Decode decodes src using the encoding enc. It writes at most
-// DecodedLen(len(src)) bytes to dst and returns the number of bytes
-// written. If src contains invalid base64 data, it will return the
-// number of bytes successfully written and CorruptInputError.
+// [Encoding.DecodedLen](len(src)) bytes to dst and returns the number of bytes
+// written. The caller must ensure that dst is large enough to hold all
+// the decoded data. If src contains invalid base64 data, it will return the
+// number of bytes successfully written and [CorruptInputError].
 // New line characters (\r and \n) are ignored.
 func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
 	if len(src) == 0 {
@@ -535,7 +533,7 @@ func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
 			enc.decodeMap[src2[6]],
 			enc.decodeMap[src2[7]],
 		); ok {
-			binary.BigEndian.PutUint64(dst[n:], dn)
+			byteorder.BEPutUint64(dst[n:], dn)
 			n += 6
 			si += 8
 		} else {
@@ -556,7 +554,7 @@ func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
 			enc.decodeMap[src2[2]],
 			enc.decodeMap[src2[3]],
 		); ok {
-			binary.BigEndian.PutUint32(dst[n:], dn)
+			byteorder.BEPutUint32(dst[n:], dn)
 			n += 3
 			si += 4
 		} else {

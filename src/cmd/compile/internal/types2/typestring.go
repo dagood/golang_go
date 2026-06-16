@@ -9,25 +9,25 @@ package types2
 import (
 	"bytes"
 	"fmt"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 )
 
 // A Qualifier controls how named package-level objects are printed in
-// calls to TypeString, ObjectString, and SelectionString.
+// calls to [TypeString], [ObjectString], and [SelectionString].
 //
 // These three formatting routines call the Qualifier for each
 // package-level object O, and if the Qualifier returns a non-empty
 // string p, the object is printed in the form p.O.
 // If it returns an empty string, only the object name O is printed.
 //
-// Using a nil Qualifier is equivalent to using (*Package).Path: the
+// Using a nil Qualifier is equivalent to using (*[Package]).Path: the
 // object is qualified by the import path, e.g., "encoding/json.Marshal".
 type Qualifier func(*Package) string
 
-// RelativeTo returns a Qualifier that fully qualifies members of
+// RelativeTo returns a [Qualifier] that fully qualifies members of
 // all packages other than pkg.
 func RelativeTo(pkg *Package) Qualifier {
 	if pkg == nil {
@@ -42,7 +42,7 @@ func RelativeTo(pkg *Package) Qualifier {
 }
 
 // TypeString returns the string representation of typ.
-// The Qualifier controls the printing of
+// The [Qualifier] controls the printing of
 // package-level objects, and may be nil.
 func TypeString(typ Type, qf Qualifier) string {
 	var buf bytes.Buffer
@@ -51,14 +51,14 @@ func TypeString(typ Type, qf Qualifier) string {
 }
 
 // WriteType writes the string representation of typ to buf.
-// The Qualifier controls the printing of
+// The [Qualifier] controls the printing of
 // package-level objects, and may be nil.
 func WriteType(buf *bytes.Buffer, typ Type, qf Qualifier) {
 	newTypeWriter(buf, qf).typ(typ)
 }
 
 // WriteSignature writes the representation of the signature sig to buf,
-// without a leading "func" keyword. The Qualifier controls the printing
+// without a leading "func" keyword. The [Qualifier] controls the printing
 // of package-level objects, and may be nil.
 func WriteSignature(buf *bytes.Buffer, sig *Signature, qf Qualifier) {
 	newTypeWriter(buf, qf).signature(sig)
@@ -211,14 +211,7 @@ func (w *typeWriter) typ(typ Type) {
 
 	case *Interface:
 		if w.ctxt == nil {
-			if t == universeAny.Type() {
-				// When not hashing, we can try to improve type strings by writing "any"
-				// for a type that is pointer-identical to universeAny. This logic should
-				// be deprecated by more robust handling for aliases.
-				w.string("any")
-				break
-			}
-			if t == universeComparable.Type().(*Named).underlying {
+			if t == asNamed(universeComparable.Type()).underlying {
 				w.string("interface{comparable}")
 				break
 			}
@@ -307,7 +300,7 @@ func (w *typeWriter) typ(typ Type) {
 			w.error("unnamed type parameter")
 			break
 		}
-		if i := tparamIndex(w.tparams.list(), t); i >= 0 {
+		if i := slices.Index(w.tparams.list(), t); i >= 0 {
 			// The names of type parameters that are declared by the type being
 			// hashed are not part of the type identity. Replace them with a
 			// placeholder indicating their index.
@@ -322,8 +315,28 @@ func (w *typeWriter) typ(typ Type) {
 			// error messages. This doesn't need to be super-elegant; we just
 			// need a clear indication that this is not a predeclared name.
 			if w.ctxt == nil && Universe.Lookup(t.obj.name) != nil {
-				w.string(sprintf(nil, false, " /* with %s declared at %s */", t.obj.name, t.obj.Pos()))
+				if isTypes2 {
+					w.string(fmt.Sprintf(" /* with %s declared at %v */", t.obj.name, t.obj.Pos()))
+				} else {
+					// Can't print position information because
+					// we don't have a token.FileSet accessible.
+					w.string("/* type parameter */")
+				}
 			}
+		}
+
+	case *Alias:
+		w.typeName(t.obj)
+		if list := t.targs.list(); len(list) != 0 {
+			// instantiated type
+			w.typeList(list)
+		} else if w.ctxt == nil && t.TypeParams().Len() != 0 { // For type hashing, don't need to format the TypeParams
+			// parameterized type
+			w.tParamList(t.TypeParams().list())
+		}
+		if w.ctxt != nil {
+			// TODO(gri) do we need to print the alias type name, too?
+			w.typ(Unalias(t.obj.typ))
 		}
 
 	default:
@@ -361,7 +374,7 @@ func (w *typeWriter) typeSet(s *_TypeSet) {
 			newTypeHasher(&buf, w.ctxt).typ(term.typ)
 			termHashes = append(termHashes, buf.String())
 		}
-		sort.Strings(termHashes)
+		slices.Sort(termHashes)
 		if !first {
 			w.byte(';')
 		}
@@ -428,22 +441,25 @@ func (w *typeWriter) tuple(tup *Tuple, variadic bool) {
 			}
 			typ := v.typ
 			if variadic && i == len(tup.vars)-1 {
-				if s, ok := typ.(*Slice); ok {
+				if slice, ok := typ.(*Slice); ok {
 					w.string("...")
-					typ = s.elem
+					w.typ(slice.elem)
 				} else {
-					// special case:
-					// append(s, "foo"...) leads to signature func([]byte, string...)
-					if t, _ := under(typ).(*Basic); t == nil || t.kind != String {
-						w.error("expected string type")
-						continue
-					}
+					// append(slice, str...) entails various special
+					// cases, especially in conjunction with generics.
+					// str may be:
+					// - a string,
+					// - a TypeParam whose typeset includes string, or
+					// - a named []byte slice type B resulting from
+					//   a client instantiating append([]byte, T) at T=B.
+					// For such cases we use the irregular notation
+					// func([]byte, T...), with the dots after the type.
 					w.typ(typ)
 					w.string("...")
-					continue
 				}
+			} else {
+				w.typ(typ)
 			}
-			w.typ(typ)
 		}
 	}
 	w.byte(')')

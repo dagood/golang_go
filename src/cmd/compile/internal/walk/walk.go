@@ -6,10 +6,11 @@ package walk
 
 import (
 	"fmt"
+	"internal/abi"
 
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
-	"cmd/compile/internal/reflectdata"
+	"cmd/compile/internal/rttype"
 	"cmd/compile/internal/ssagen"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
@@ -18,10 +19,16 @@ import (
 
 // The constant is known to runtime.
 const tmpstringbufsize = 32
-const zeroValSize = 1024 // must match value of runtime/map.go:maxZero
 
 func Walk(fn *ir.Func) {
 	ir.CurFunc = fn
+
+	// Build pre-walk analysis caches with a single AST traversal.
+	// (At some point, it might be worthwhile to have a walkState structure
+	// that gets passed everywhere where things like this can go.)
+	analyzePreWalk(fn)
+	defer func() { staticValues = nil; shapeConvSources = nil }()
+
 	errorsBefore := base.Errors()
 	order(fn)
 	if base.Errors() > errorsBefore {
@@ -33,20 +40,10 @@ func Walk(fn *ir.Func) {
 		ir.DumpList(s, ir.CurFunc.Body)
 	}
 
-	lno := base.Pos
-
-	base.Pos = lno
-	if base.Errors() > errorsBefore {
-		return
-	}
 	walkStmtList(ir.CurFunc.Body)
 	if base.Flag.W != 0 {
 		s := fmt.Sprintf("after walk %v", ir.CurFunc.Sym())
 		ir.DumpList(s, ir.CurFunc.Body)
-	}
-
-	if base.Flag.Cfg.Instrumenting {
-		instrument(fn)
 	}
 
 	// Eagerly compute sizes of all variables for SSA.
@@ -187,17 +184,15 @@ func mkmapnames(base string, ptr string) mapnames {
 	return mapnames{base, base + "_fast32", base + "_fast32" + ptr, base + "_fast64", base + "_fast64" + ptr, base + "_faststr"}
 }
 
-var mapaccess1 = mkmapnames("mapaccess1", "")
-var mapaccess2 = mkmapnames("mapaccess2", "")
+var mapaccess = mkmapnames("mapaccess2", "")
 var mapassign = mkmapnames("mapassign", "ptr")
 var mapdelete = mkmapnames("mapdelete", "")
 
 func mapfast(t *types.Type) int {
-	// Check runtime/map.go:maxElemSize before changing.
-	if t.Elem().Size() > 128 {
+	if t.Elem().Size() > abi.MapMaxElemBytes {
 		return mapslow
 	}
-	switch reflectdata.AlgType(t.Key()) {
+	switch algType(t.Key()) {
 	case types.AMEM32:
 		if !t.Key().HasPointers() {
 			return mapfast32
@@ -219,6 +214,35 @@ func mapfast(t *types.Type) int {
 		return mapfaststr
 	}
 	return mapslow
+}
+
+// algType returns the fixed-width AMEMxx variants instead of the general
+// AMEM kind when possible.
+func algType(t *types.Type) types.AlgKind {
+	a := types.AlgType(t)
+	if a == types.AMEM {
+		if t.Alignment() < int64(base.Ctxt.Arch.Alignment) && t.Alignment() < t.Size() {
+			// For example, we can't treat [2]int16 as an int32 if int32s require
+			// 4-byte alignment. See issue 46283.
+			return a
+		}
+		switch t.Size() {
+		case 0:
+			return types.AMEM0
+		case 1:
+			return types.AMEM8
+		case 2:
+			return types.AMEM16
+		case 4:
+			return types.AMEM32
+		case 8:
+			return types.AMEM64
+		case 16:
+			return types.AMEM128
+		}
+	}
+
+	return a
 }
 
 func walkAppendArgs(n *ir.CallExpr, init *ir.Nodes) {
@@ -278,6 +302,15 @@ func backingArrayPtrLen(n ir.Node) (ptr, length ir.Node) {
 // function calls, which could clobber function call arguments/results
 // currently on the stack.
 func mayCall(n ir.Node) bool {
+	// This is intended to avoid putting constants
+	// into temporaries with the race detector (or other
+	// instrumentation) which interferes with simple
+	// "this is a constant" tests in ssagen.
+	// Also, it will generally lead to better code.
+	if n.Op() == ir.OLITERAL {
+		return false
+	}
+
 	// When instrumenting, any expression might require function calls.
 	if base.Flag.Cfg.Instrumenting {
 		return true
@@ -333,12 +366,12 @@ func mayCall(n ir.Node) bool {
 			return n.Type().IsString() || n.Type().IsFloat()
 
 		case ir.OLITERAL, ir.ONIL, ir.ONAME, ir.OLINKSYMOFFSET, ir.OMETHEXPR,
-			ir.OAND, ir.OANDNOT, ir.OLSH, ir.OOR, ir.ORSH, ir.OXOR, ir.OCOMPLEX, ir.OEFACE,
+			ir.OAND, ir.OANDNOT, ir.OLSH, ir.OOR, ir.ORSH, ir.OXOR, ir.OCOMPLEX, ir.OMAKEFACE,
 			ir.OADDR, ir.OBITNOT, ir.ONOT, ir.OPLUS,
 			ir.OCAP, ir.OIMAG, ir.OLEN, ir.OREAL,
 			ir.OCONVNOP, ir.ODOT,
 			ir.OCFUNC, ir.OIDATA, ir.OITAB, ir.OSPTR,
-			ir.OBYTES2STRTMP, ir.OGETG, ir.OGETCALLERPC, ir.OGETCALLERSP, ir.OSLICEHEADER, ir.OSTRINGHEADER:
+			ir.OBYTES2STRTMP, ir.OGETG, ir.OGETCALLERSP, ir.OSLICEHEADER, ir.OSTRINGHEADER:
 			// ok: operations that don't require function calls.
 			// Expand as needed.
 		}
@@ -350,8 +383,8 @@ func mayCall(n ir.Node) bool {
 // itabType loads the _type field from a runtime.itab struct.
 func itabType(itab ir.Node) ir.Node {
 	if itabTypeField == nil {
-		// runtime.itab's _type field
-		itabTypeField = runtimeField("_type", int64(types.PtrSize), types.NewPtr(types.Types[types.TUINT8]))
+		// internal/abi.ITab's Type field
+		itabTypeField = runtimeField("Type", rttype.ITab.OffsetOf("Type"), types.NewPtr(types.Types[types.TUINT8]))
 	}
 	return boundedDotPtr(base.Pos, itab, itabTypeField)
 }
@@ -395,4 +428,65 @@ func ifaceData(pos src.XPos, n ir.Node, t *types.Type) ir.Node {
 	ind.SetTypecheck(1)
 	ind.SetBounded(true)
 	return ind
+}
+
+// staticValue returns the earliest expression it can find that always
+// evaluates to n, with similar semantics to [ir.StaticValue].
+//
+// It only returns results for the ir.CurFunc being processed in [Walk],
+// including its closures, and uses a cache to reduce duplicative work.
+// It can return n or nil if it does not find an earlier expression.
+//
+// The current use case is reducing OCONVIFACE allocations, and hence
+// staticValue is currently only useful when given an *ir.ConvExpr.X as n.
+func staticValue(n ir.Node) ir.Node {
+	if staticValues == nil {
+		base.Fatalf("staticValues is nil. staticValue called outside of walk.Walk?")
+	}
+	return staticValues[n]
+}
+
+// staticValues is a cache of static values for use by staticValue.
+var staticValues map[ir.Node]ir.Node
+
+// shapeConvSources maps an *ir.Name (a PAUTO interface variable) to
+// the shape type of the OCONVIFACE expression that is its single
+// static value, if any.
+var shapeConvSources map[*ir.Name]*types.Type
+
+// analyzePreWalk populates staticValues and shapeConvSources using a
+// single AST traversal. We can't use an ir.ReassignOracle or
+// ir.StaticValue in the middle of walk because they don't currently
+// handle transformed assignments (e.g., will complain about
+// 'RHS == nil'). So we build these maps before walk begins.
+func analyzePreWalk(fn *ir.Func) {
+	ro := &ir.ReassignOracle{}
+	ro.Init(fn)
+	sv := make(map[ir.Node]ir.Node)
+	scs := make(map[*ir.Name]*types.Type)
+	ir.Visit(fn, func(n ir.Node) {
+		switch n.Op() {
+		case ir.OCONVIFACE:
+			x := n.(*ir.ConvExpr).X
+			v := ro.StaticValue(x)
+			if v != nil && v != x {
+				sv[x] = v
+			}
+		case ir.ONAME:
+			name := n.(*ir.Name).Canonical()
+			if name.Class != ir.PAUTO || name.Type() == nil || !name.Type().IsInterface() {
+				return
+			}
+			val := ro.StaticValue(name)
+			if val == nil || val.Op() != ir.OCONVIFACE {
+				return
+			}
+			srcType := val.(*ir.ConvExpr).X.Type()
+			if srcType != nil && !srcType.IsInterface() && srcType.IsShape() {
+				scs[name] = srcType
+			}
+		}
+	})
+	staticValues = sv
+	shapeConvSources = scs
 }

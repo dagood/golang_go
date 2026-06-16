@@ -200,12 +200,22 @@ var mulRangesZ = []struct {
 			"638952175999932299156089414639761565182862536979208272237582" +
 			"511852109168640000000000000000000000", // -99!
 	},
+
+	// overflow situations
+	{math.MaxInt64 - 0, math.MaxInt64, "9223372036854775807"},
+	{math.MaxInt64 - 1, math.MaxInt64, "85070591730234615838173535747377725442"},
+	{math.MaxInt64 - 2, math.MaxInt64, "784637716923335094969050127519550606919189611815754530810"},
+	{math.MaxInt64 - 3, math.MaxInt64, "7237005577332262206126809393809643289012107973151163787181513908099760521240"},
 }
 
 func TestMulRangeZ(t *testing.T) {
 	var tmp Int
 	// test entirely positive ranges
 	for i, r := range mulRangesN {
+		// skip mulRangesN entries that overflow int64
+		if int64(r.a) < 0 || int64(r.b) < 0 {
+			continue
+		}
 		prod := tmp.MulRange(int64(r.a), int64(r.b)).String()
 		if prod != r.prod {
 			t.Errorf("#%da: got %s; want %s", i, prod, r.prod)
@@ -245,6 +255,7 @@ func TestBinomial(t *testing.T) {
 		{100, 90, "17310309456440"},
 		{1000, 10, "263409560461970212832400"},
 		{1000, 990, "263409560461970212832400"},
+		{5, -1, "0"},
 	} {
 		if got := z.Binomial(test.n, test.k).String(); got != test.want {
 			t.Errorf("Binomial(%d, %d) = %s; want %s", test.n, test.k, got, test.want)
@@ -491,6 +502,74 @@ func BenchmarkQuoRem(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		q.QuoRem(y, x, r)
+	}
+}
+
+func TestIntDivide(t *testing.T) {
+	x := new(Int)
+	y := new(Int)
+	q := new(Int)
+	r := new(Int)
+	f := new(Int)
+	qGot := new(Int)
+	rGot := new(Int)
+
+	check := func(i, j, q_ int64, mode RoundingMode, modeName string) {
+		x.SetInt64(i)
+		y.SetInt64(j)
+		q.SetInt64(q_)
+		r.SetInt64(i - j*q_)
+
+		// The quotient remains the same irrespective of scaling factor f,
+		// everything else gets scaled by f; f is set by the caller.
+		x.Mul(x, f)
+		y.Mul(y, f)
+		r.Mul(r, f)
+
+		qGot, rGot = qGot.Divide(x, y, rGot, mode)
+		if qGot.Cmp(q) != 0 || rGot.Cmp(r) != 0 {
+			t.Errorf("%v(%v/%v): got q = %v, r = %v; want q = %v, r = %v", modeName, x, y, qGot, rGot, q, r)
+		}
+
+		// nil remainder result
+		qGot, _ = qGot.Divide(x, y, nil, mode)
+		if qGot.Cmp(q) != 0 {
+			t.Errorf("%v(%v/%v): got q = %v; want q = %v", modeName, x, y, qGot, q)
+		}
+
+		// nil quotient result
+		_, rGot = (*Int)(nil).Divide(x, y, rGot, mode)
+		if rGot.Cmp(r) != 0 {
+			t.Errorf("%v(%v/%v): got r = %v; want r = %v", modeName, x, y, rGot, r)
+		}
+
+		// nil quotient and remainder must not panic
+		(*Int)(nil).Divide(x, y, nil, mode)
+	}
+
+	// test each case with different scaling factors f
+	for _, s := range []string{
+		"1",
+		"1234",
+		"99991",
+		"1234567890",
+		"12345678901234567890",
+	} {
+		f.SetString(s, 10)
+		const n int64 = 10
+		for i := -n; i <= n; i++ {
+			for j := -n; j <= n; j++ {
+				if j == 0 {
+					continue
+				}
+				z := float64(i) / float64(j)
+				check(i, j, i/j, Trunc, "trunc") // T-division is regular Go integer division
+				check(i, j, int64(math.Trunc(z)), Trunc, "trunc")
+				check(i, j, int64(math.Floor(z)), Floor, "floor")
+				check(i, j, int64(math.Ceil(z)), Ceil, "ceil")
+				check(i, j, int64(math.RoundToEven(z)), Round, "round")
+			}
+		}
 	}
 }
 
@@ -1604,7 +1683,7 @@ func TestModInverse(t *testing.T) {
 
 func BenchmarkModInverse(b *testing.B) {
 	p := new(Int).SetInt64(1) // Mersenne prime 2**1279 -1
-	p.abs = p.abs.shl(p.abs, 1279)
+	p.abs = p.abs.lsh(p.abs, 1279)
 	p.Sub(p, intOne)
 	x := new(Int).Sub(p, intOne)
 	z := new(Int)
@@ -1899,7 +1978,7 @@ func TestFillBytes(t *testing.T) {
 		"0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
 	} {
 		t.Run(n, func(t *testing.T) {
-			t.Logf(n)
+			t.Log(n)
 			x, ok := new(Int).SetString(n, 0)
 			if !ok {
 				panic("invalid test entry")

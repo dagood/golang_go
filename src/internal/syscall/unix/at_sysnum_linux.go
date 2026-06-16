@@ -6,8 +6,15 @@ package unix
 
 import "syscall"
 
-const unlinkatTrap uintptr = syscall.SYS_UNLINKAT
-const openatTrap uintptr = syscall.SYS_OPENAT
+const (
+	unlinkatTrap   uintptr = syscall.SYS_UNLINKAT
+	openatTrap     uintptr = syscall.SYS_OPENAT
+	readlinkatTrap uintptr = syscall.SYS_READLINKAT
+	mkdiratTrap    uintptr = syscall.SYS_MKDIRAT
+	fchownatTrap   uintptr = syscall.SYS_FCHOWNAT
+	linkatTrap     uintptr = syscall.SYS_LINKAT
+	symlinkatTrap  uintptr = syscall.SYS_SYMLINKAT
+)
 
 const (
 	AT_EACCESS          = 0x200
@@ -16,4 +23,6 @@ const (
 	AT_SYMLINK_NOFOLLOW = 0x100
 
 	UTIME_OMIT = 0x3ffffffe
+
+	O_PATH = 0x200000
 )

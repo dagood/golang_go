@@ -19,8 +19,9 @@ package runtime
 
 import (
 	"internal/abi"
-	"runtime/internal/atomic"
-	"runtime/internal/math"
+	"internal/runtime/atomic"
+	"internal/runtime/math"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -36,11 +37,13 @@ type hchan struct {
 	buf      unsafe.Pointer // points to an array of dataqsiz elements
 	elemsize uint16
 	closed   uint32
+	timer    *timer // timer feeding this chan
 	elemtype *_type // element type
 	sendx    uint   // send index
 	recvx    uint   // receive index
 	recvq    waitq  // list of recv waiters
 	sendq    waitq  // list of send waiters
+	bubble   *synctestBubble
 
 	// lock protects all fields in hchan, as well as several
 	// fields in sudogs blocked on this channel.
@@ -96,7 +99,7 @@ func makechan(t *chantype, size int) *hchan {
 		c = (*hchan)(mallocgc(hchanSize, nil, true))
 		// Race detector uses this location for synchronization.
 		c.buf = c.raceaddr()
-	case elem.PtrBytes == 0:
+	case !elem.Pointers():
 		// Elements do not contain pointers.
 		// Allocate hchan and buf in one call.
 		c = (*hchan)(mallocgc(hchanSize+mem, nil, true))
@@ -110,6 +113,9 @@ func makechan(t *chantype, size int) *hchan {
 	c.elemsize = uint16(elem.Size_)
 	c.elemtype = elem
 	c.dataqsiz = uint(size)
+	if b := getg().bubble; b != nil {
+		c.bubble = b
+	}
 	lockInit(&c.lock, lockRankHchan)
 
 	if debugChan {
@@ -119,6 +125,16 @@ func makechan(t *chantype, size int) *hchan {
 }
 
 // chanbuf(c, i) is pointer to the i'th slot in the buffer.
+//
+// chanbuf should be an internal detail,
+// but widely used packages access it using linkname.
+// Notable members of the hall of shame include:
+//   - github.com/fjl/memsize
+//
+// Do not remove or change the type signature.
+// See go.dev/issue/67401.
+//
+//go:linkname chanbuf
 func chanbuf(c *hchan, i uint) unsafe.Pointer {
 	return add(c.buf, uintptr(i)*uintptr(c.elemsize))
 }
@@ -142,7 +158,7 @@ func full(c *hchan) bool {
 //
 //go:nosplit
 func chansend1(c *hchan, elem unsafe.Pointer) {
-	chansend(c, elem, true, getcallerpc())
+	chansend(c, elem, true, sys.GetCallerPC())
 }
 
 /*
@@ -172,6 +188,10 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 
 	if raceenabled {
 		racereadpc(c.raceaddr(), callerpc, abi.FuncPCABIInternal(chansend))
+	}
+
+	if c.bubble != nil && getg().bubble != c.bubble {
+		fatal("send on synctest channel from outside bubble")
 	}
 
 	// Fast path: check for failed non-blocking operation without acquiring the lock.
@@ -243,11 +263,11 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	}
 	// No stack splits between assigning elem and enqueuing mysg
 	// on gp.waiting where copystack can find it.
-	mysg.elem = ep
+	mysg.elem.set(ep)
 	mysg.waitlink = nil
 	mysg.g = gp
 	mysg.isSelect = false
-	mysg.c = c
+	mysg.c.set(c)
 	gp.waiting = mysg
 	gp.param = nil
 	c.sendq.enqueue(mysg)
@@ -256,7 +276,11 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	// changes and when we set gp.activeStackChans is not safe for
 	// stack shrinking.
 	gp.parkingOnChan.Store(true)
-	gopark(chanparkcommit, unsafe.Pointer(&c.lock), waitReasonChanSend, traceBlockChanSend, 2)
+	reason := waitReasonChanSend
+	if c.bubble != nil {
+		reason = waitReasonSynctestChanSend
+	}
+	gopark(chanparkcommit, unsafe.Pointer(&c.lock), reason, traceBlockChanSend, 2)
 	// Ensure the value being sent is kept alive until the
 	// receiver copies it out. The sudog has a pointer to the
 	// stack object, but sudogs aren't considered as roots of the
@@ -274,7 +298,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	if mysg.releasetime > 0 {
 		blockevent(mysg.releasetime-t0, 2)
 	}
-	mysg.c = nil
+	mysg.c.set(nil)
 	releaseSudog(mysg)
 	if closed {
 		if c.closed == 0 {
@@ -292,6 +316,10 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 // sg must already be dequeued from c.
 // ep must be non-nil and point to the heap or the caller's stack.
 func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
+	if c.bubble != nil && getg().bubble != c.bubble {
+		unlockf()
+		fatal("send on synctest channel from outside bubble")
+	}
 	if raceenabled {
 		if c.dataqsiz == 0 {
 			racesync(c, sg)
@@ -308,9 +336,9 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 			c.sendx = c.recvx // c.sendx = (c.sendx+1) % c.dataqsiz
 		}
 	}
-	if sg.elem != nil {
+	if sg.elem.get() != nil {
 		sendDirect(c.elemtype, sg, ep)
-		sg.elem = nil
+		sg.elem.set(nil)
 	}
 	gp := sg.g
 	unlockf()
@@ -320,6 +348,35 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		sg.releasetime = cputicks()
 	}
 	goready(gp, skip+1)
+}
+
+// timerchandrain removes all elements in channel c's buffer.
+// It reports whether any elements were removed.
+// Because it is only intended for timers, it does not
+// handle waiting senders at all (all timer channels
+// use non-blocking sends to fill the buffer).
+func timerchandrain(c *hchan) bool {
+	// Note: Cannot use empty(c) because we are called
+	// while holding c.timer.sendLock, and empty(c) will
+	// call c.timer.maybeRunChan, which will deadlock.
+	// We are emptying the channel, so we only care about
+	// the count, not about potentially filling it up.
+	if atomic.Loaduint(&c.qcount) == 0 {
+		return false
+	}
+	lock(&c.lock)
+	any := false
+	for c.qcount > 0 {
+		any = true
+		typedmemclr(c.elemtype, chanbuf(c, c.recvx))
+		c.recvx++
+		if c.recvx == c.dataqsiz {
+			c.recvx = 0
+		}
+		c.qcount--
+	}
+	unlock(&c.lock)
+	return any
 }
 
 // Sends and receives on unbuffered or empty-buffered channels are the
@@ -338,7 +395,7 @@ func sendDirect(t *_type, sg *sudog, src unsafe.Pointer) {
 	// Once we read sg.elem out of sg, it will no longer
 	// be updated if the destination's stack gets copied (shrunk).
 	// So make sure that no preemption points can happen between read & use.
-	dst := sg.elem
+	dst := sg.elem.get()
 	typeBitsBulkBarrier(t, uintptr(dst), uintptr(src), t.Size_)
 	// No need for cgo write barrier checks because dst is always
 	// Go memory.
@@ -349,7 +406,7 @@ func recvDirect(t *_type, sg *sudog, dst unsafe.Pointer) {
 	// dst is on our stack or the heap, src is on another stack.
 	// The channel is locked, so src will not move during this
 	// operation.
-	src := sg.elem
+	src := sg.elem.get()
 	typeBitsBulkBarrier(t, uintptr(dst), uintptr(src), t.Size_)
 	memmove(dst, src, t.Size_)
 }
@@ -357,6 +414,9 @@ func recvDirect(t *_type, sg *sudog, dst unsafe.Pointer) {
 func closechan(c *hchan) {
 	if c == nil {
 		panic(plainError("close of nil channel"))
+	}
+	if c.bubble != nil && getg().bubble != c.bubble {
+		fatal("close of synctest channel from outside bubble")
 	}
 
 	lock(&c.lock)
@@ -366,7 +426,7 @@ func closechan(c *hchan) {
 	}
 
 	if raceenabled {
-		callerpc := getcallerpc()
+		callerpc := sys.GetCallerPC()
 		racewritepc(c.raceaddr(), callerpc, abi.FuncPCABIInternal(closechan))
 		racerelease(c.raceaddr())
 	}
@@ -381,9 +441,9 @@ func closechan(c *hchan) {
 		if sg == nil {
 			break
 		}
-		if sg.elem != nil {
-			typedmemclr(c.elemtype, sg.elem)
-			sg.elem = nil
+		if sg.elem.get() != nil {
+			typedmemclr(c.elemtype, sg.elem.get())
+			sg.elem.set(nil)
 		}
 		if sg.releasetime != 0 {
 			sg.releasetime = cputicks()
@@ -403,7 +463,7 @@ func closechan(c *hchan) {
 		if sg == nil {
 			break
 		}
-		sg.elem = nil
+		sg.elem.set(nil)
 		if sg.releasetime != 0 {
 			sg.releasetime = cputicks()
 		}
@@ -426,11 +486,18 @@ func closechan(c *hchan) {
 }
 
 // empty reports whether a read from c would block (that is, the channel is
-// empty).  It uses a single atomic read of mutable state.
+// empty).  It is atomically correct and sequentially consistent at the moment
+// it returns, but since the channel is unlocked, the channel may become
+// non-empty immediately afterward.
 func empty(c *hchan) bool {
 	// c.dataqsiz is immutable.
 	if c.dataqsiz == 0 {
 		return atomic.Loadp(unsafe.Pointer(&c.sendq.first)) == nil
+	}
+	// c.timer is also immutable (it is set after make(chan) but before any channel operations).
+	// All timer channels have dataqsiz > 0.
+	if c.timer != nil {
+		c.timer.maybeRunChan(c)
 	}
 	return atomic.Loaduint(&c.qcount) == 0
 }
@@ -468,6 +535,14 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 		}
 		gopark(nil, nil, waitReasonChanReceiveNilChan, traceBlockForever, 2)
 		throw("unreachable")
+	}
+
+	if c.bubble != nil && getg().bubble != c.bubble {
+		fatal("receive on synctest channel from outside bubble")
+	}
+
+	if c.timer != nil {
+		c.timer.maybeRunChan(c)
 	}
 
 	// Fast path: check for failed non-blocking operation without acquiring the lock.
@@ -567,24 +642,36 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	}
 	// No stack splits between assigning elem and enqueuing mysg
 	// on gp.waiting where copystack can find it.
-	mysg.elem = ep
+	mysg.elem.set(ep)
 	mysg.waitlink = nil
 	gp.waiting = mysg
+
 	mysg.g = gp
 	mysg.isSelect = false
-	mysg.c = c
+	mysg.c.set(c)
 	gp.param = nil
 	c.recvq.enqueue(mysg)
+	if c.timer != nil {
+		blockTimerChan(c)
+	}
+
 	// Signal to anyone trying to shrink our stack that we're about
 	// to park on a channel. The window between when this G's status
 	// changes and when we set gp.activeStackChans is not safe for
 	// stack shrinking.
 	gp.parkingOnChan.Store(true)
-	gopark(chanparkcommit, unsafe.Pointer(&c.lock), waitReasonChanReceive, traceBlockChanRecv, 2)
+	reason := waitReasonChanReceive
+	if c.bubble != nil {
+		reason = waitReasonSynctestChanReceive
+	}
+	gopark(chanparkcommit, unsafe.Pointer(&c.lock), reason, traceBlockChanRecv, 2)
 
 	// someone woke us up
 	if mysg != gp.waiting {
 		throw("G waiting list is corrupted")
+	}
+	if c.timer != nil {
+		unblockTimerChan(c)
 	}
 	gp.waiting = nil
 	gp.activeStackChans = false
@@ -593,7 +680,7 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	}
 	success := mysg.success
 	gp.param = nil
-	mysg.c = nil
+	mysg.c.set(nil)
 	releaseSudog(mysg)
 	return true, success
 }
@@ -613,6 +700,10 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 // sg must already be dequeued from c.
 // A non-nil ep must point to the heap or the caller's stack.
 func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
+	if c.bubble != nil && getg().bubble != c.bubble {
+		unlockf()
+		fatal("receive on synctest channel from outside bubble")
+	}
 	if c.dataqsiz == 0 {
 		if raceenabled {
 			racesync(c, sg)
@@ -636,14 +727,14 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 			typedmemmove(c.elemtype, ep, qp)
 		}
 		// copy data from sender to queue
-		typedmemmove(c.elemtype, qp, sg.elem)
+		typedmemmove(c.elemtype, qp, sg.elem.get())
 		c.recvx++
 		if c.recvx == c.dataqsiz {
 			c.recvx = 0
 		}
 		c.sendx = c.recvx // c.sendx = (c.sendx+1) % c.dataqsiz
 	}
-	sg.elem = nil
+	sg.elem.set(nil)
 	gp := sg.g
 	unlockf()
 	gp.param = unsafe.Pointer(sg)
@@ -691,7 +782,7 @@ func chanparkcommit(gp *g, chanLock unsafe.Pointer) bool {
 //		... bar
 //	}
 func selectnbsend(c *hchan, elem unsafe.Pointer) (selected bool) {
-	return chansend(c, elem, false, getcallerpc())
+	return chansend(c, elem, false, sys.GetCallerPC())
 }
 
 // compiler implements
@@ -716,7 +807,7 @@ func selectnbrecv(elem unsafe.Pointer, c *hchan) (selected, received bool) {
 
 //go:linkname reflect_chansend reflect.chansend0
 func reflect_chansend(c *hchan, elem unsafe.Pointer, nb bool) (selected bool) {
-	return chansend(c, elem, !nb, getcallerpc())
+	return chansend(c, elem, !nb, sys.GetCallerPC())
 }
 
 //go:linkname reflect_chanrecv reflect.chanrecv
@@ -724,28 +815,39 @@ func reflect_chanrecv(c *hchan, nb bool, elem unsafe.Pointer) (selected bool, re
 	return chanrecv(c, elem, !nb)
 }
 
-//go:linkname reflect_chanlen reflect.chanlen
-func reflect_chanlen(c *hchan) int {
-	if c == nil {
+func chanlen(c *hchan) int {
+	if c == nil || c.timer != nil {
+		// timer channels have a buffered implementation
+		// but present to users as unbuffered, so that we can
+		// undo sends without users noticing.
 		return 0
 	}
 	return int(c.qcount)
+}
+
+func chancap(c *hchan) int {
+	if c == nil || c.timer != nil {
+		// timer channels have a buffered implementation
+		// but present to users as unbuffered, so that we can
+		// undo sends without users noticing.
+		return 0
+	}
+	return int(c.dataqsiz)
+}
+
+//go:linkname reflect_chanlen reflect.chanlen
+func reflect_chanlen(c *hchan) int {
+	return chanlen(c)
 }
 
 //go:linkname reflectlite_chanlen internal/reflectlite.chanlen
 func reflectlite_chanlen(c *hchan) int {
-	if c == nil {
-		return 0
-	}
-	return int(c.qcount)
+	return chanlen(c)
 }
 
 //go:linkname reflect_chancap reflect.chancap
 func reflect_chancap(c *hchan) int {
-	if c == nil {
-		return 0
-	}
-	return int(c.dataqsiz)
+	return chancap(c)
 }
 
 //go:linkname reflect_chanclose reflect.chanclose
@@ -791,8 +893,11 @@ func (q *waitq) dequeue() *sudog {
 		// We use a flag in the G struct to tell us when someone
 		// else has won the race to signal this goroutine but the goroutine
 		// hasn't removed itself from the queue yet.
-		if sgp.isSelect && !sgp.g.selectDone.CompareAndSwap(0, 1) {
-			continue
+		if sgp.isSelect {
+			if !sgp.g.selectDone.CompareAndSwap(0, 1) {
+				// We lost the race to wake this goroutine.
+				continue
+			}
 		}
 
 		return sgp

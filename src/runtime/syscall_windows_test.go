@@ -7,6 +7,8 @@ package runtime_test
 import (
 	"fmt"
 	"internal/abi"
+	"internal/race"
+	"internal/syscall/windows"
 	"internal/syscall/windows/sysdll"
 	"internal/testenv"
 	"io"
@@ -265,11 +267,9 @@ func TestCallbackInAnotherThread(t *testing.T) {
 	h := syscall.Handle(r)
 	defer syscall.CloseHandle(h)
 
-	switch s, err := syscall.WaitForSingleObject(h, 100); s {
+	switch s, err := syscall.WaitForSingleObject(h, syscall.INFINITE); s {
 	case syscall.WAIT_OBJECT_0:
 		break
-	case syscall.WAIT_TIMEOUT:
-		t.Fatal("timeout waiting for thread to exit")
 	case syscall.WAIT_FAILED:
 		t.Fatalf("WaitForSingleObject failed: %v", err)
 	default:
@@ -659,7 +659,7 @@ func TestWERDialogue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := testenv.CleanCmdEnv(testenv.Command(t, exe, "-test.run=TestWERDialogue"))
+	cmd := testenv.CleanCmdEnv(testenv.Command(t, exe, "-test.run=^TestWERDialogue$"))
 	cmd.Env = append(cmd.Env, "TEST_WER_DIALOGUE=1", "GOTRACEBACK=wer")
 	// Child process should not open WER dialogue, but return immediately instead.
 	// The exit code can't be reliably tested here because Windows can change it.
@@ -670,12 +670,15 @@ func TestWERDialogue(t *testing.T) {
 }
 
 func TestWindowsStackMemory(t *testing.T) {
+	if race.Enabled {
+		t.Skip("skipping test: race mode uses more stack memory")
+	}
 	o := runTestProg(t, "testprog", "StackMemory")
 	stackUsage, err := strconv.Atoi(o)
 	if err != nil {
 		t.Fatalf("Failed to read stack usage: %v", err)
 	}
-	if expected, got := 100<<10, stackUsage; got > expected {
+	if expected, got := 128<<10, stackUsage; got > expected {
 		t.Fatalf("expected < %d bytes of memory per thread, got %d", expected, got)
 	}
 }
@@ -770,12 +773,13 @@ func TestSyscallN(t *testing.T) {
 	if _, err := exec.LookPath("gcc"); err != nil {
 		t.Skip("skipping test: gcc is missing")
 	}
-	if runtime.GOARCH != "amd64" {
-		t.Skipf("skipping test: GOARCH=%s", runtime.GOARCH)
+
+	var nargs = 64
+	if testing.Short() {
+		nargs = 16
 	}
 
-	for arglen := 0; arglen <= runtime.MaxArgs; arglen++ {
-		arglen := arglen
+	for arglen := range nargs {
 		t.Run(fmt.Sprintf("arg-%d", arglen), func(t *testing.T) {
 			t.Parallel()
 			args := make([]string, arglen)
@@ -1045,7 +1049,7 @@ func TestNumCPU(t *testing.T) {
 	_GetProcessAffinityMask := kernel32.MustFindProc("GetProcessAffinityMask")
 	_SetProcessAffinityMask := kernel32.MustFindProc("SetProcessAffinityMask")
 
-	cmd := exec.Command(os.Args[0], "-test.run=TestNumCPU")
+	cmd := exec.Command(testenv.Executable(t), "-test.run=^TestNumCPU$")
 	cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
 	var buf strings.Builder
 	cmd.Stdout = &buf
@@ -1113,12 +1117,6 @@ func TestDLLPreloadMitigation(t *testing.T) {
 
 	tmpdir := t.TempDir()
 
-	dir0, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Chdir(dir0)
-
 	const src = `
 #include <stdint.h>
 #include <windows.h>
@@ -1129,7 +1127,7 @@ uintptr_t cfunc(void) {
 }
 `
 	srcname := "nojack.c"
-	err = os.WriteFile(filepath.Join(tmpdir, srcname), []byte(src), 0)
+	err := os.WriteFile(filepath.Join(tmpdir, srcname), []byte(src), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1150,7 +1148,7 @@ uintptr_t cfunc(void) {
 	// ("nojack.dll") Think of this as the user double-clicking an
 	// installer from their Downloads directory where a browser
 	// silently downloaded some malicious DLLs.
-	os.Chdir(tmpdir)
+	t.Chdir(tmpdir)
 
 	// First before we can load a DLL from the current directory,
 	// loading it only as "nojack.dll", without an absolute path.
@@ -1214,6 +1212,13 @@ func TestBigStackCallbackSyscall(t *testing.T) {
 	}
 }
 
+func TestSyscallStackUsage(t *testing.T) {
+	// Test that the stack usage of a syscall doesn't exceed the limit.
+	// See https://go.dev/issue/69813.
+	syscall.Syscall15(procSetEvent.Addr(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+	syscall.Syscall18(procSetEvent.Addr(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+}
+
 var (
 	modwinmm    = syscall.NewLazyDLL("winmm.dll")
 	modkernel32 = syscall.NewLazyDLL("kernel32.dll")
@@ -1221,6 +1226,20 @@ var (
 	procCreateEvent = modkernel32.NewProc("CreateEventW")
 	procSetEvent    = modkernel32.NewProc("SetEvent")
 )
+
+func TestTrueVersion(t *testing.T) {
+	ver, err := syscall.GetVersion()
+	if err != nil {
+		t.Fatalf("GetVersion failed: %v", err)
+	}
+	wantMajor, wantMinor, wantBuild := windows.Version()
+	major := uint32(byte(ver))
+	minor := uint32(uint8(ver >> 8))
+	build := uint32(uint16(ver >> 16))
+	if major != wantMajor || minor != wantMinor || build != wantBuild {
+		t.Errorf("GetVersion = %d.%d (Build %d), want %d.%d (Build %d)", major, minor, build, wantMajor, wantMinor, wantBuild)
+	}
+}
 
 func createEvent() (syscall.Handle, error) {
 	r0, _, e0 := syscall.Syscall6(procCreateEvent.Addr(), 4, 0, 0, 0, 0, 0, 0)

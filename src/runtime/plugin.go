@@ -4,7 +4,10 @@
 
 package runtime
 
-import "unsafe"
+import (
+	"internal/abi"
+	"unsafe"
+)
 
 //go:linkname plugin_lastmoduleinit plugin.lastmoduleinit
 func plugin_lastmoduleinit() (path string, syms map[string]any, initTasks []*initTask, errstr string) {
@@ -63,9 +66,7 @@ func plugin_lastmoduleinit() (path string, syms map[string]any, initTasks []*ini
 	moduledataverify1(md)
 
 	lock(&itabLock)
-	for _, i := range md.itablinks {
-		itabAdd(i)
-	}
+	addModuleItabs(md)
 	unlock(&itabLock)
 
 	// Build a map of symbol names to symbols. Here in the runtime
@@ -85,7 +86,7 @@ func plugin_lastmoduleinit() (path string, syms map[string]any, initTasks []*ini
 		(*valp)[0] = unsafe.Pointer(t)
 
 		name := symName.Name()
-		if t.Kind_&kindMask == kindFunc {
+		if t.Kind() == abi.Func {
 			name = "." + name
 		}
 		syms[name] = val

@@ -79,11 +79,11 @@ func (s *Scope) String() string {
 // refers to a field of T, whereas for the other types it refers to a
 // value in the environment.
 //
-// New programs should set the [parser.SkipObjectResolution] parser
+// New programs should set the [go/parser.SkipObjectResolution] parser
 // flag to disable syntactic object resolution (which also saves CPU
 // and memory), and instead use the type checker [go/types] if object
 // resolution is desired. See the Defs, Uses, and Implicits fields of
-// the [types.Info] struct for details.
+// the [go/types.Info] struct for details.
 type Object struct {
 	Kind ObjKind
 	Name string // declared name
@@ -144,10 +144,10 @@ func (obj *Object) Pos() token.Pos {
 	return token.NoPos
 }
 
-// ObjKind describes what an object represents.
+// ObjKind describes what an [Object] represents.
 type ObjKind int
 
-// The list of possible Object kinds.
+// The list of possible [Object] kinds.
 const (
 	Bad ObjKind = iota // for error handling
 	Pkg                // package

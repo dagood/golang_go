@@ -11,6 +11,7 @@
 package runtime
 
 import (
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -182,10 +183,10 @@ func syscall0(fn *libFunc) (r, err uintptr) {
 	resetLibcall := true
 	if mp.libcallsp == 0 {
 		mp.libcallg.set(gp)
-		mp.libcallpc = getcallerpc()
+		mp.libcallpc = sys.GetCallerPC()
 		// sp must be the last, because once async cpu profiler finds
 		// all three values to be non-zero, it will use them
-		mp.libcallsp = getcallersp()
+		mp.libcallsp = sys.GetCallerSP()
 	} else {
 		resetLibcall = false // See comment in sys_darwin.go:libcCall
 	}
@@ -213,10 +214,10 @@ func syscall1(fn *libFunc, a0 uintptr) (r, err uintptr) {
 	resetLibcall := true
 	if mp.libcallsp == 0 {
 		mp.libcallg.set(gp)
-		mp.libcallpc = getcallerpc()
+		mp.libcallpc = sys.GetCallerPC()
 		// sp must be the last, because once async cpu profiler finds
 		// all three values to be non-zero, it will use them
-		mp.libcallsp = getcallersp()
+		mp.libcallsp = sys.GetCallerSP()
 	} else {
 		resetLibcall = false // See comment in sys_darwin.go:libcCall
 	}
@@ -245,10 +246,10 @@ func syscall2(fn *libFunc, a0, a1 uintptr) (r, err uintptr) {
 	resetLibcall := true
 	if mp.libcallsp == 0 {
 		mp.libcallg.set(gp)
-		mp.libcallpc = getcallerpc()
+		mp.libcallpc = sys.GetCallerPC()
 		// sp must be the last, because once async cpu profiler finds
 		// all three values to be non-zero, it will use them
-		mp.libcallsp = getcallersp()
+		mp.libcallsp = sys.GetCallerSP()
 	} else {
 		resetLibcall = false // See comment in sys_darwin.go:libcCall
 	}
@@ -277,10 +278,10 @@ func syscall3(fn *libFunc, a0, a1, a2 uintptr) (r, err uintptr) {
 	resetLibcall := true
 	if mp.libcallsp == 0 {
 		mp.libcallg.set(gp)
-		mp.libcallpc = getcallerpc()
+		mp.libcallpc = sys.GetCallerPC()
 		// sp must be the last, because once async cpu profiler finds
 		// all three values to be non-zero, it will use them
-		mp.libcallsp = getcallersp()
+		mp.libcallsp = sys.GetCallerSP()
 	} else {
 		resetLibcall = false // See comment in sys_darwin.go:libcCall
 	}
@@ -309,10 +310,10 @@ func syscall4(fn *libFunc, a0, a1, a2, a3 uintptr) (r, err uintptr) {
 	resetLibcall := true
 	if mp.libcallsp == 0 {
 		mp.libcallg.set(gp)
-		mp.libcallpc = getcallerpc()
+		mp.libcallpc = sys.GetCallerPC()
 		// sp must be the last, because once async cpu profiler finds
 		// all three values to be non-zero, it will use them
-		mp.libcallsp = getcallersp()
+		mp.libcallsp = sys.GetCallerSP()
 	} else {
 		resetLibcall = false // See comment in sys_darwin.go:libcCall
 	}
@@ -341,10 +342,10 @@ func syscall5(fn *libFunc, a0, a1, a2, a3, a4 uintptr) (r, err uintptr) {
 	resetLibcall := true
 	if mp.libcallsp == 0 {
 		mp.libcallg.set(gp)
-		mp.libcallpc = getcallerpc()
+		mp.libcallpc = sys.GetCallerPC()
 		// sp must be the last, because once async cpu profiler finds
 		// all three values to be non-zero, it will use them
-		mp.libcallsp = getcallersp()
+		mp.libcallsp = sys.GetCallerSP()
 	} else {
 		resetLibcall = false // See comment in sys_darwin.go:libcCall
 	}
@@ -373,10 +374,10 @@ func syscall6(fn *libFunc, a0, a1, a2, a3, a4, a5 uintptr) (r, err uintptr) {
 	resetLibcall := true
 	if mp.libcallsp == 0 {
 		mp.libcallg.set(gp)
-		mp.libcallpc = getcallerpc()
+		mp.libcallpc = sys.GetCallerPC()
 		// sp must be the last, because once async cpu profiler finds
 		// all three values to be non-zero, it will use them
-		mp.libcallsp = getcallersp()
+		mp.libcallsp = sys.GetCallerSP()
 	} else {
 		resetLibcall = false // See comment in sys_darwin.go:libcCall
 	}
@@ -428,7 +429,6 @@ func write1(fd uintptr, p unsafe.Pointer, n int32) int32 {
 	}
 	// Note that in this case we can't return a valid errno value.
 	return write2(fd, uintptr(p), n)
-
 }
 
 //go:nosplit
@@ -641,7 +641,6 @@ func sysconf(name int32) uintptr {
 		throw("syscall sysconf")
 	}
 	return r
-
 }
 
 // pthread functions returns its error code in the main return value
@@ -716,17 +715,17 @@ func pthread_attr_setstacksize(attr *pthread_attr, size uint64) int32 {
 func pthread_create1(tid, attr, fn, arg uintptr) int32
 
 //go:nosplit
-func pthread_create(tid *pthread, attr *pthread_attr, fn *funcDescriptor, arg unsafe.Pointer) int32 {
+func pthread_create(tid *pthread, attr *pthread_attr, fn unsafe.Pointer, arg unsafe.Pointer) int32 {
 	gp := getg()
 
 	// Check the validity of g because without a g during
 	// newosproc0.
 	if gp != nil {
-		r, _ := syscall4(&libpthread_create, uintptr(unsafe.Pointer(tid)), uintptr(unsafe.Pointer(attr)), uintptr(unsafe.Pointer(fn)), uintptr(arg))
+		r, _ := syscall4(&libpthread_create, uintptr(unsafe.Pointer(tid)), uintptr(unsafe.Pointer(attr)), uintptr(fn), uintptr(arg))
 		return int32(r)
 	}
 
-	return pthread_create1(uintptr(unsafe.Pointer(tid)), uintptr(unsafe.Pointer(attr)), uintptr(unsafe.Pointer(fn)), uintptr(arg))
+	return pthread_create1(uintptr(unsafe.Pointer(tid)), uintptr(unsafe.Pointer(attr)), uintptr(fn), uintptr(arg))
 }
 
 // On multi-thread program, sigprocmask must not be called.

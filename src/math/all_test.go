@@ -899,14 +899,56 @@ var vfceilSC = []float64{
 	0,
 	Inf(1),
 	NaN(),
+	1<<52 - 1,
+	1<<52 - 0.5, // largest fractional float64
+	1 << 52,
+	-1 << 52,
+	-1<<52 + 0.5, // smallest fractional float64
+	-1<<52 + 1,
+	1 << 53,
+	-1 << 53,
 }
-var ceilSC = []float64{
+
+var ceilBaseSC = []float64{
 	Inf(-1),
 	Copysign(0, -1),
 	0,
 	Inf(1),
 	NaN(),
 }
+
+var ceilSC = append(ceilBaseSC,
+	1<<52-1,
+	1<<52,
+	1<<52,
+	-1<<52,
+	-1<<52+1,
+	-1<<52+1,
+	1<<53,
+	-1<<53,
+)
+
+var floorSC = append(ceilBaseSC,
+	1<<52-1,
+	1<<52-1,
+	1<<52,
+	-1<<52,
+	-1<<52,
+	-1<<52+1,
+	1<<53,
+	-1<<53,
+)
+
+var truncSC = append(ceilBaseSC,
+	1<<52-1,
+	1<<52-1,
+	1<<52,
+	-1<<52,
+	-1<<52+1,
+	-1<<52+1,
+	1<<53,
+	-1<<53,
+)
 
 var vfcopysignSC = []float64{
 	Inf(-1),
@@ -2084,6 +2126,11 @@ var fmaC = []struct{ x, y, z, want float64 }{
 	// Issue #61130
 	{-1, 1, 1, 0},
 	{1, 1, -1, 0},
+
+	// Issue #73757
+	{0x1p-1022, -0x1p-1022, 0, Copysign(0, -1)},
+	{Copysign(0, -1), 1, 0, 0},
+	{1, Copysign(0, -1), 0, 0},
 }
 
 var sqrt32 = []float32{
@@ -2489,8 +2536,8 @@ func TestFloor(t *testing.T) {
 		}
 	}
 	for i := 0; i < len(vfceilSC); i++ {
-		if f := Floor(vfceilSC[i]); !alike(ceilSC[i], f) {
-			t.Errorf("Floor(%g) = %g, want %g", vfceilSC[i], f, ceilSC[i])
+		if f := Floor(vfceilSC[i]); !alike(floorSC[i], f) {
+			t.Errorf("Floor(%g) = %g, want %g", vfceilSC[i], f, floorSC[i])
 		}
 	}
 }
@@ -3034,8 +3081,8 @@ func TestTrunc(t *testing.T) {
 		}
 	}
 	for i := 0; i < len(vfceilSC); i++ {
-		if f := Trunc(vfceilSC[i]); !alike(ceilSC[i], f) {
-			t.Errorf("Trunc(%g) = %g, want %g", vfceilSC[i], f, ceilSC[i])
+		if f := Trunc(vfceilSC[i]); !alike(truncSC[i], f) {
+			t.Errorf("Trunc(%g) = %g, want %g", vfceilSC[i], f, truncSC[i])
 		}
 	}
 }
@@ -3289,9 +3336,10 @@ func TestFloat32Sqrt(t *testing.T) {
 // Storing the results in these variables prevents the compiler
 // from completely optimizing the benchmarked functions away.
 var (
-	GlobalI int
-	GlobalB bool
-	GlobalF float64
+	GlobalI   int
+	GlobalB   bool
+	GlobalF   float64
+	GlobalF32 float32
 )
 
 func BenchmarkAcos(b *testing.B) {
@@ -3364,6 +3412,14 @@ func BenchmarkCeil(b *testing.B) {
 		x = Ceil(.5)
 	}
 	GlobalF = x
+}
+
+func BenchmarkCeil32(b *testing.B) {
+	var x, src float32 = 0.0, 0.5
+	for i := 0; i < b.N; i++ {
+		x = float32(Ceil(float64(src)))
+	}
+	GlobalF32 = x
 }
 
 var copysignNeg = -1.0
@@ -3465,6 +3521,7 @@ func BenchmarkExp2Go(b *testing.B) {
 }
 
 var absPos = .5
+var absPos32 float32 = .5
 
 func BenchmarkAbs(b *testing.B) {
 	x := 0.0
@@ -3472,6 +3529,15 @@ func BenchmarkAbs(b *testing.B) {
 		x = Abs(absPos)
 	}
 	GlobalF = x
+
+}
+
+func BenchmarkAbs32(b *testing.B) {
+	var x float32 = 0.0
+	for i := 0; i < b.N; i++ {
+		x = float32(Abs(float64(absPos32)))
+	}
+	GlobalF32 = x
 
 }
 
@@ -3489,6 +3555,14 @@ func BenchmarkFloor(b *testing.B) {
 		x = Floor(.5)
 	}
 	GlobalF = x
+}
+
+func BenchmarkFloor32(b *testing.B) {
+	var x, src float32 = 0.0, .5
+	for i := 0; i < b.N; i++ {
+		x = float32(Floor(float64(src)))
+	}
+	GlobalF32 = x
 }
 
 func BenchmarkMax(b *testing.B) {
@@ -3702,6 +3776,7 @@ func BenchmarkPow10Neg(b *testing.B) {
 }
 
 var roundNeg = float64(-2.5)
+var roundNeg32 float32 = -2.5
 
 func BenchmarkRound(b *testing.B) {
 	x := 0.0
@@ -3711,12 +3786,28 @@ func BenchmarkRound(b *testing.B) {
 	GlobalF = x
 }
 
+func BenchmarkRound32(b *testing.B) {
+	var x float32 = 0.0
+	for i := 0; i < b.N; i++ {
+		x = float32(Round(float64(roundNeg32)))
+	}
+	GlobalF32 = x
+}
+
 func BenchmarkRoundToEven(b *testing.B) {
 	x := 0.0
 	for i := 0; i < b.N; i++ {
 		x = RoundToEven(roundNeg)
 	}
 	GlobalF = x
+}
+
+func BenchmarkRoundToEven32(b *testing.B) {
+	var x float32 = 0.0
+	for i := 0; i < b.N; i++ {
+		x = float32(RoundToEven(float64(roundNeg32)))
+	}
+	GlobalF32 = x
 }
 
 func BenchmarkRemainder(b *testing.B) {
@@ -3780,6 +3871,14 @@ func BenchmarkSqrtLatency(b *testing.B) {
 	GlobalF = x
 }
 
+func BenchmarkSqrt32Latency(b *testing.B) {
+	var x float32 = 10.0
+	for i := 0; i < b.N; i++ {
+		x = float32(Sqrt(float64(x)))
+	}
+	GlobalF32 = x
+}
+
 func BenchmarkSqrtIndirectLatency(b *testing.B) {
 	x := 10.0
 	f := Sqrt
@@ -3840,6 +3939,14 @@ func BenchmarkTrunc(b *testing.B) {
 		x = Trunc(.5)
 	}
 	GlobalF = x
+}
+
+func BenchmarkTrunc32(b *testing.B) {
+	var x, src float32 = 0.0, .5
+	for i := 0; i < b.N; i++ {
+		x = float32(Trunc(float64(src)))
+	}
+	GlobalF32 = x
 }
 
 func BenchmarkY0(b *testing.B) {

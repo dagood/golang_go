@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"text/scanner"
 	"unicode/utf8"
 
@@ -20,32 +21,35 @@ import (
 	"cmd/asm/internal/lex"
 	"cmd/internal/obj"
 	"cmd/internal/obj/arm64"
+	"cmd/internal/obj/riscv"
 	"cmd/internal/obj/x86"
+	"cmd/internal/objabi"
 	"cmd/internal/src"
 	"cmd/internal/sys"
 )
 
 type Parser struct {
-	lex              lex.TokenReader
-	lineNum          int   // Line number in source file.
-	errorLine        int   // Line number of last error.
-	errorCount       int   // Number of errors.
-	sawCode          bool  // saw code in this file (as opposed to comments and blank lines)
-	pc               int64 // virtual PC; count of Progs; doesn't advance for GLOBL or DATA.
-	input            []lex.Token
-	inputPos         int
-	pendingLabels    []string // Labels to attach to next instruction.
-	labels           map[string]*obj.Prog
-	toPatch          []Patch
-	addr             []obj.Addr
-	arch             *arch.Arch
-	ctxt             *obj.Link
-	firstProg        *obj.Prog
-	lastProg         *obj.Prog
-	dataAddr         map[string]int64 // Most recent address for DATA for this symbol.
-	isJump           bool             // Instruction being assembled is a jump.
-	compilingRuntime bool
-	errorWriter      io.Writer
+	lex           lex.TokenReader
+	lineNum       int   // Line number in source file.
+	errorLine     int   // Line number of last error.
+	errorCount    int   // Number of errors.
+	sawCode       bool  // saw code in this file (as opposed to comments and blank lines)
+	pc            int64 // virtual PC; count of Progs; doesn't advance for GLOBL or DATA.
+	input         []lex.Token
+	inputPos      int
+	pendingLabels []string // Labels to attach to next instruction.
+	labels        map[string]*obj.Prog
+	toPatch       []Patch
+	addr          []obj.Addr
+	arch          *arch.Arch
+	ctxt          *obj.Link
+	firstProg     *obj.Prog
+	lastProg      *obj.Prog
+	dataAddr      map[string]int64 // Most recent address for DATA for this symbol.
+	isJump        bool             // Instruction being assembled is a jump.
+	allowABI      bool             // Whether ABI selectors are allowed.
+	pkgPrefix     string           // Prefix to add to local symbols.
+	errorWriter   io.Writer
 }
 
 type Patch struct {
@@ -53,15 +57,20 @@ type Patch struct {
 	label string
 }
 
-func NewParser(ctxt *obj.Link, ar *arch.Arch, lexer lex.TokenReader, compilingRuntime bool) *Parser {
+func NewParser(ctxt *obj.Link, ar *arch.Arch, lexer lex.TokenReader) *Parser {
+	pkgPrefix := obj.UnlinkablePkg
+	if ctxt != nil {
+		pkgPrefix = objabi.PathToPrefix(ctxt.Pkgpath)
+	}
 	return &Parser{
-		ctxt:             ctxt,
-		arch:             ar,
-		lex:              lexer,
-		labels:           make(map[string]*obj.Prog),
-		dataAddr:         make(map[string]int64),
-		errorWriter:      os.Stderr,
-		compilingRuntime: compilingRuntime,
+		ctxt:        ctxt,
+		arch:        ar,
+		lex:         lexer,
+		labels:      make(map[string]*obj.Prog),
+		dataAddr:    make(map[string]int64),
+		errorWriter: os.Stderr,
+		allowABI:    ctxt != nil && objabi.LookupPkgSpecial(ctxt.Pkgpath).AllowAsmABI,
+		pkgPrefix:   pkgPrefix,
 	}
 }
 
@@ -69,7 +78,7 @@ func NewParser(ctxt *obj.Link, ar *arch.Arch, lexer lex.TokenReader, compilingRu
 // and turn it into a recoverable panic.
 var panicOnError bool
 
-func (p *Parser) errorf(format string, args ...interface{}) {
+func (p *Parser) errorf(format string, args ...any) {
 	if panicOnError {
 		panic(fmt.Errorf(format, args...))
 	}
@@ -81,7 +90,7 @@ func (p *Parser) errorf(format string, args ...interface{}) {
 	if p.lex != nil {
 		// Put file and line information on head of message.
 		format = "%s:%d: " + format + "\n"
-		args = append([]interface{}{p.lex.File(), p.lineNum}, args...)
+		args = append([]any{p.lex.File(), p.lineNum}, args...)
 	}
 	fmt.Fprintf(p.errorWriter, format, args...)
 	p.errorCount++
@@ -209,8 +218,8 @@ next:
 		for {
 			tok = p.nextToken()
 			if len(operands) == 0 && len(items) == 0 {
-				if p.arch.InFamily(sys.ARM, sys.ARM64, sys.AMD64, sys.I386) && tok == '.' {
-					// Suffixes: ARM conditionals or x86 modifiers.
+				if p.arch.InFamily(sys.ARM, sys.ARM64, sys.AMD64, sys.I386, sys.Loong64, sys.RISCV64) && tok == '.' {
+					// Suffixes: ARM conditionals, Loong64 vector instructions, RISCV rounding mode or x86 modifiers.
 					tok = p.nextToken()
 					str := p.lex.Text()
 					if tok != scanner.Ident {
@@ -390,22 +399,91 @@ func (p *Parser) operand(a *obj.Addr) {
 	tok := p.next()
 	name := tok.String()
 	if tok.ScanToken == scanner.Ident && !p.atStartOfRegister(name) {
+		// See if this is an architecture specific special operand.
 		switch p.arch.Family {
 		case sys.ARM64:
-			// arm64 special operands.
-			if opd := arch.GetARM64SpecialOperand(name); opd != arm64.SPOP_END {
+			if opd := arch.ARM64SpecialOperand(name); opd != arm64.SPOP_END {
 				a.Type = obj.TYPE_SPECIAL
 				a.Offset = int64(opd)
-				break
 			}
-			fallthrough
-		default:
+		case sys.RISCV64:
+			if opd := arch.RISCV64SpecialOperand(name); opd != riscv.SPOP_END {
+				a.Type = obj.TYPE_SPECIAL
+				a.Offset = int64(opd)
+			}
+		}
+
+		if a.Type != obj.TYPE_SPECIAL {
 			// We have a symbol. Parse $sym±offset(symkind)
-			p.symbolReference(a, name, prefix)
+			p.symbolReference(a, p.qualifySymbol(name), prefix)
 		}
 		// fmt.Printf("SYM %s\n", obj.Dconv(&emptyProg, 0, a))
 		if p.peek() == scanner.EOF {
 			return
+		}
+	}
+
+	// Detect AC_PREGSEL operand syntax: [selreg, $idximm](preg.T2)
+	if tok.ScanToken == '[' && p.arch.Family == sys.ARM64 {
+		pos := p.inputPos
+		if pos+5 < len(p.input) && p.input[pos].ScanToken == scanner.Ident &&
+			p.input[pos+1].ScanToken == ',' && p.input[pos+2].ScanToken == '$' &&
+			p.input[pos+3].ScanToken == scanner.Int && p.input[pos+4].ScanToken == ']' &&
+			p.input[pos+5].ScanToken == '(' {
+
+			selregStr := p.input[pos].String()
+			immStr := p.input[pos+3].String()
+
+			pos += 6 // past '('
+			if pos < len(p.input) && p.input[pos].ScanToken == scanner.Ident {
+				pregStr := p.input[pos].String()
+				pos++
+				ext := ""
+				if pos < len(p.input) && p.input[pos].ScanToken == '.' {
+					pos++
+					if pos < len(p.input) && p.input[pos].ScanToken == scanner.Ident {
+						ext = p.input[pos].String()
+						pos++
+					}
+				}
+				if pos < len(p.input) && p.input[pos].ScanToken == ')' {
+					// Matches AC_PREGSEL syntax!
+					p.inputPos = pos + 1 // consume the parsed tokens
+
+					// Encode components
+					selreg, ok1 := p.registerReference(selregStr)
+					preg, ok2 := p.registerReference(pregStr)
+					idximm := int64(p.atoi(immStr))
+
+					if !ok1 || !ok2 {
+						p.errorf("invalid registers in pregsel operand")
+						return
+					}
+
+					var arng2 int
+					switch ext {
+					case "B":
+						arng2 = arm64.ARNG_B
+					case "H":
+						arng2 = arm64.ARNG_H
+					case "S":
+						arng2 = arm64.ARNG_S
+					case "D":
+						arng2 = arm64.ARNG_D
+					case "Q":
+						arng2 = arm64.ARNG_Q
+					default:
+						p.errorf("invalid P register arrangement: %s", ext)
+						return
+					}
+
+					// Pack values into a.Offset
+					a.Type = obj.TYPE_REG
+					a.Offset = int64(preg&31) | int64((arng2&15)<<5) | int64((selreg&31)<<9) | (idximm << 14) | (int64(1) << 62)
+					p.expectOperandEnd()
+					return
+				}
+			}
 		}
 	}
 
@@ -456,6 +534,30 @@ func (p *Parser) operand(a *obj.Addr) {
 		// fmt.Printf("REG %s\n", obj.Dconv(&emptyProg, 0, a))
 		p.expectOperandEnd()
 		return
+	}
+
+	// Detect (VL*imm) or (-VL*imm) pattern in ARM64
+	if p.arch.Family == sys.ARM64 && len(p.input) >= 5 && p.input[0].ScanToken == '(' {
+		pos := 1
+		sign := int64(1)
+		if p.input[pos].ScanToken == '-' {
+			sign = -1
+			pos++
+		} else if p.input[pos].ScanToken == '+' {
+			pos++
+		}
+		if pos+3 < len(p.input) && p.input[pos].String() == "VL" && p.input[pos+1].ScanToken == '*' && p.input[pos+2].ScanToken == scanner.Int && p.input[pos+3].ScanToken == ')' {
+			imm := int64(p.atoi(p.input[pos+2].String()))
+			imm *= sign
+			a.Offset = imm
+			a.Scale = -32768 // bit 15 signals multiple of Vector Length
+
+			// Remove the (VL*imm) tokens and let operand parse the remaining sequence (reg.T)
+			p.input = p.input[pos+4:]
+			p.inputPos = 0
+			p.operand(a)
+			return
+		}
 	}
 
 	// Constant.
@@ -562,12 +664,13 @@ func (p *Parser) atRegisterShift() bool {
 // atRegisterExtension reports whether we are at the start of an ARM64 extended register.
 // We have consumed the register or R prefix.
 func (p *Parser) atRegisterExtension() bool {
-	// ARM64 only.
-	if p.arch.Family != sys.ARM64 {
+	switch p.arch.Family {
+	case sys.ARM64, sys.Loong64:
+		// R1.xxx
+		return p.peek() == '.' || p.peek() == '['
+	default:
 		return false
 	}
-	// R1.xxx
-	return p.peek() == '.'
 }
 
 // registerReference parses a register given either the name, R10, or a parenthesized form, SPR(10).
@@ -700,7 +803,7 @@ func (p *Parser) registerShift(name string, prefix rune) int64 {
 	if p.arch.Family == sys.ARM64 {
 		off, err := arch.ARM64RegisterShift(r1, op, count)
 		if err != nil {
-			p.errorf(err.Error())
+			p.errorf("%v", err)
 		}
 		return off
 	} else {
@@ -728,7 +831,7 @@ func (p *Parser) registerExtension(a *obj.Addr, name string, prefix rune) {
 	if p.peek() == lex.LSH {
 		// (Rn)(Rm<<2), the shifted offset register.
 		ext = "LSL"
-	} else {
+	} else if p.peek() == '.' {
 		// (Rn)(Rm.UXTW<1), the extended offset register.
 		// Rm.UXTW<<3, the extended register.
 		p.get('.')
@@ -760,13 +863,28 @@ func (p *Parser) registerExtension(a *obj.Addr, name string, prefix rune) {
 
 	switch p.arch.Family {
 	case sys.ARM64:
-		err := arch.ARM64RegisterExtension(a, ext, reg, num, isAmount, isIndex)
+		err := arm64.EncodeRegisterExtension(a, ext, reg, num, isAmount, isIndex)
 		if err != nil {
-			p.errorf(err.Error())
+			p.errorf("%v", err)
+		}
+	case sys.Loong64:
+		err := arch.Loong64RegisterExtension(a, ext, reg, num, isAmount, isIndex)
+		if err != nil {
+			p.errorf("%v", err)
 		}
 	default:
 		p.errorf("register extension not supported on this architecture")
 	}
+}
+
+// qualifySymbol returns name as a package-qualified symbol name. If
+// name starts with a period, qualifySymbol prepends the package
+// prefix. Otherwise it returns name unchanged.
+func (p *Parser) qualifySymbol(name string) string {
+	if strings.HasPrefix(name, ".") {
+		name = p.pkgPrefix + name
+	}
+	return name
 }
 
 // symbolReference parses a symbol that is known not to be a register.
@@ -864,7 +982,7 @@ func (p *Parser) symRefAttrs(name string, issueError bool) (bool, obj.ABI) {
 		isStatic = true
 	} else if tok == scanner.Ident {
 		abistr := p.get(scanner.Ident).String()
-		if !p.compilingRuntime {
+		if !p.allowABI {
 			if issueError {
 				p.errorf("ABI selector only permitted when compiling runtime, reference was to %q", name)
 			}
@@ -901,6 +1019,7 @@ func (p *Parser) funcAddress() (string, obj.ABI, bool) {
 	if tok.ScanToken != scanner.Ident || p.atStartOfRegister(name) {
 		return "", obj.ABI0, false
 	}
+	name = p.qualifySymbol(name)
 	// Parse optional <> (indicates a static symbol) or
 	// <ABIxxx> (selecting text symbol with specific ABI).
 	noErrMsg := false
@@ -940,8 +1059,133 @@ func (p *Parser) registerIndirect(a *obj.Addr, prefix rune) {
 	if !ok {
 		p.errorf("indirect through non-register %s", tok)
 	}
+	// SVE extended addressing support
+	var ext string
+	var mod int64
+	var amount int64
+	isSVEMemExt := false
+
+	if p.arch.Family == sys.ARM64 && (p.peek() == '.' || p.peek() == lex.LSH) {
+		// The index is a vector register, or contains a shift, then this is SVE extended addressing.
+		isSVEMemExt = true
+		if p.peek() == '.' {
+			p.get('.')
+			tok2 := p.next()
+			str := tok2.String()
+			if str == "UXTW" || str == "SXTW" {
+				switch str {
+				case "UXTW":
+					mod = 1
+				case "SXTW":
+					mod = 2
+				}
+			} else {
+				ext = str
+				if p.peek() == '.' {
+					p.get('.')
+					tok3 := p.next()
+					modStr := tok3.String()
+					switch modStr {
+					case "UXTW":
+						mod = 1
+					case "SXTW":
+						mod = 2
+					default:
+						p.errorf("unknown modifier %s", modStr)
+					}
+				}
+			}
+		}
+		if p.peek() == lex.LSH {
+			p.get(lex.LSH)
+			tok4 := p.get(scanner.Int)
+			amount, _ = strconv.ParseInt(tok4.String(), 10, 16)
+		}
+	}
 	p.get(')')
 	a.Type = obj.TYPE_MEM
+
+	if isSVEMemExt {
+		encodedR1 := r1
+		if ext != "" {
+			if r1 >= arm64.REG_Z0 && r1 <= arm64.REG_Z31 {
+				var arng int
+				switch ext {
+				case "B":
+					arng = arm64.ARNG_B
+				case "H":
+					arng = arm64.ARNG_H
+				case "S":
+					arng = arm64.ARNG_S
+				case "D":
+					arng = arm64.ARNG_D
+				case "Q":
+					arng = arm64.ARNG_Q
+				default:
+					p.errorf("unknown arrangement %s", ext)
+				}
+				if arng != 0 {
+					encodedR1 = arm64.REG_ZARNG + (r1 & 31) + int16((arng&15)<<5)
+				}
+			} else {
+				p.errorf("arrangement not allowed for this register")
+			}
+		}
+
+		if p.peek() != '(' {
+			a.Reg = encodedR1
+			return
+		}
+		p.get('(')
+		tok5 := p.next()
+		r2, ok := p.registerReference(tok5.String())
+		if !ok {
+			p.errorf("expected register")
+		}
+		var ext2 string
+		if p.peek() == '.' {
+			p.get('.')
+			tok6 := p.next()
+			ext2 = tok6.String()
+		}
+		p.get(')')
+
+		encodedR2 := r2
+		if ext2 != "" {
+			if r2 >= arm64.REG_Z0 && r2 <= arm64.REG_Z31 {
+				var arng int
+				switch ext2 {
+				case "B":
+					arng = arm64.ARNG_B
+				case "H":
+					arng = arm64.ARNG_H
+				case "S":
+					arng = arm64.ARNG_S
+				case "D":
+					arng = arm64.ARNG_D
+				case "Q":
+					arng = arm64.ARNG_Q
+				default:
+					p.errorf("unknown arrangement %s", ext2)
+				}
+				if arng != 0 {
+					encodedR2 = arm64.REG_ZARNG + (r2 & 31) + int16((arng&15)<<5)
+				}
+			} else {
+				p.errorf("arrangement not allowed for this register")
+			}
+		}
+
+		a.Index = encodedR2 // Base
+		a.Reg = encodedR1   // Index
+		a.Offset = 0        // Ensure offset is 0
+
+		var scaleValue int16 = -32768 // Bit 15 set
+		scaleValue |= int16(amount << 12)
+		scaleValue |= int16(mod << 9)
+		a.Scale = scaleValue
+		return
+	}
 	if r1 < 0 {
 		// Pseudo-register reference.
 		if r2 != 0 {
@@ -1086,19 +1330,32 @@ ListLoop:
 		}
 		switch p.arch.Family {
 		case sys.ARM64:
-			// Vn.T
+			// Vn.T, Zn.T, Pn.T
 			name := tok.String()
 			r, ok := p.registerReference(name)
 			if !ok {
 				p.errorf("invalid register: %s", name)
 			}
-			reg := r - p.arch.Register["V0"]
+			var registerBase int16
+			registerCntMask := 31
+			switch name[0] {
+			case 'V':
+				registerBase = p.arch.Register["V0"]
+			case 'Z':
+				registerBase = p.arch.Register["Z0"]
+			case 'P':
+				registerBase = p.arch.Register["P0"]
+				registerCntMask = 15
+			default:
+				p.errorf("invalid register in register list: %s", name)
+			}
+			reg := r - registerBase
 			p.get('.')
 			tok := p.next()
 			ext := tok.String()
 			curArrangement, err := arch.ARM64RegisterArrangement(reg, name, ext)
 			if err != nil {
-				p.errorf(err.Error())
+				p.errorf("%v", err)
 			}
 			if firstReg == -1 {
 				// only record the first register and arrangement
@@ -1110,8 +1367,33 @@ ListLoop:
 			} else if nextReg != int(reg) {
 				p.errorf("incontiguous register in ARM64 register list: %s", name)
 			}
-			regCnt++
-			nextReg = (nextReg + 1) % 32
+			if p.peek() == '-' && name[0] == 'Z' {
+				// register range in SVE
+				p.next()
+				nameHi := p.next().String()
+				if nameHi[0] != 'Z' {
+					p.errorf("invalid register in register range: %s", nameHi)
+				}
+				rHi, ok2 := p.registerReference(nameHi)
+				if !ok2 {
+					p.errorf("invalid register: %s", nameHi)
+				}
+				regHi := rHi - registerBase
+				p.get('.')
+				extHi := p.next().String()
+				hiArrangement, err := arch.ARM64RegisterArrangement(regHi, nameHi, extHi)
+				if err != nil {
+					p.errorf("%v", err)
+				}
+				if hiArrangement != arrangement {
+					p.errorf("inconsistent arrangement in ARM64 register list range")
+				}
+				// Scale stores the range size - 1.
+				a.Scale = regHi - reg
+			} else {
+				regCnt++
+				nextReg = (nextReg + 1) & registerCntMask
+			}
 		case sys.ARM:
 			// Parse the upper and lower bounds.
 			lo := p.registerNumber(tok.String())
@@ -1143,9 +1425,9 @@ ListLoop:
 	case sys.ARM:
 		a.Offset = int64(bits)
 	case sys.ARM64:
-		offset, err := arch.ARM64RegisterListOffset(firstReg, regCnt, arrangement)
+		offset, err := arm64.RegisterListOffset(firstReg, regCnt, arrangement, a.Scale)
 		if err != nil {
-			p.errorf(err.Error())
+			p.errorf("%v", err)
 		}
 		a.Offset = offset
 	default:

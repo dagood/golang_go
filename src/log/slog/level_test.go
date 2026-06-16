@@ -5,6 +5,7 @@
 package slog
 
 import (
+	"bytes"
 	"flag"
 	"strings"
 	"testing"
@@ -50,11 +51,15 @@ func TestLevelVar(t *testing.T) {
 
 }
 
-func TestMarshalJSON(t *testing.T) {
+func TestLevelMarshalJSON(t *testing.T) {
 	want := LevelWarn - 3
+	wantData := []byte(`"INFO+1"`)
 	data, err := want.MarshalJSON()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !bytes.Equal(data, wantData) {
+		t.Errorf("got %s, want %s", string(data), string(wantData))
 	}
 	var got Level
 	if err := got.UnmarshalJSON(data); err != nil {
@@ -67,9 +72,13 @@ func TestMarshalJSON(t *testing.T) {
 
 func TestLevelMarshalText(t *testing.T) {
 	want := LevelWarn - 3
+	wantData := []byte("INFO+1")
 	data, err := want.MarshalText()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !bytes.Equal(data, wantData) {
+		t.Errorf("got %s, want %s", string(data), string(wantData))
 	}
 	var got Level
 	if err := got.UnmarshalText(data); err != nil {
@@ -77,6 +86,19 @@ func TestLevelMarshalText(t *testing.T) {
 	}
 	if got != want {
 		t.Errorf("got %s, want %s", got, want)
+	}
+}
+
+func TestLevelAppendText(t *testing.T) {
+	buf := make([]byte, 4, 16)
+	want := LevelWarn - 3
+	wantData := []byte("\x00\x00\x00\x00INFO+1")
+	data, err := want.AppendText(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, wantData) {
+		t.Errorf("got %s, want %s", string(data), string(wantData))
 	}
 }
 
@@ -153,6 +175,23 @@ func TestLevelVarMarshalText(t *testing.T) {
 	}
 }
 
+func TestLevelVarAppendText(t *testing.T) {
+	var v LevelVar
+	v.Set(LevelWarn)
+	buf := make([]byte, 4, 16)
+	data, err := v.AppendText(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v2 LevelVar
+	if err := v2.UnmarshalText(data[4:]); err != nil {
+		t.Fatal(err)
+	}
+	if g, w := v2.Level(), LevelWarn; g != w {
+		t.Errorf("got %s, want %s", g, w)
+	}
+}
+
 func TestLevelVarFlag(t *testing.T) {
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	v := &LevelVar{}
@@ -174,5 +213,26 @@ func TestLevelVarString(t *testing.T) {
 	want := "LevelVar(ERROR)"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func BenchmarkLevelString(b *testing.B) {
+	levels := []Level{
+		0,
+		LevelError,
+		LevelError + 2,
+		LevelError - 2,
+		LevelWarn,
+		LevelWarn - 1,
+		LevelInfo,
+		LevelInfo + 1,
+		LevelInfo - 3,
+		LevelDebug,
+		LevelDebug - 2,
+	}
+	for b.Loop() {
+		for _, level := range levels {
+			_ = level.String()
+		}
 	}
 }

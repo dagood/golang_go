@@ -5,14 +5,15 @@
 package main_test
 
 import (
-	"cmd/go/internal/script"
-	"cmd/go/internal/script/scripttest"
 	"cmd/go/internal/work"
+	"cmd/internal/script"
+	"cmd/internal/script/scripttest"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -53,7 +54,8 @@ func scriptCC(cmdExec script.Cmd) script.Cmd {
 			Args:    "args...",
 		},
 		func(s *script.State, args ...string) (script.WaitFunc, error) {
-			b := work.NewBuilder(s.Getwd())
+			fakeVendorDirProvider := func() string { return "" }
+			b := work.NewBuilder(s.Getwd(), fakeVendorDirProvider)
 			wait, err := cmdExec.Run(s, append(b.GccCmd(".", ""), args...)...)
 			if err != nil {
 				return wait, err
@@ -69,9 +71,23 @@ func scriptCC(cmdExec script.Cmd) script.Cmd {
 		})
 }
 
+var scriptGoInvoked sync.Map // testing.TB → go command was invoked
+
 // scriptGo runs the go command.
 func scriptGo(cancel func(*exec.Cmd) error, waitDelay time.Duration) script.Cmd {
-	return script.Program(testGo, cancel, waitDelay)
+	cmd := script.Program(testGo, cancel, waitDelay)
+	// Inject code to update scriptGoInvoked before invoking the Go command.
+	return script.Command(*cmd.Usage(), func(state *script.State, s ...string) (script.WaitFunc, error) {
+		t, ok := tbFromContext(state.Context())
+		if !ok {
+			return nil, errors.New("script Context unexpectedly missing testing.TB key")
+		}
+		_, dup := scriptGoInvoked.LoadOrStore(t, true)
+		if !dup {
+			t.Cleanup(func() { scriptGoInvoked.Delete(t) })
+		}
+		return cmd.Run(state, s...)
+	})
 }
 
 // scriptStale checks that the named build targets are stale.

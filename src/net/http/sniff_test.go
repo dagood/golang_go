@@ -10,7 +10,7 @@ import (
 	"io"
 	"log"
 	. "net/http"
-	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -144,7 +144,7 @@ func testServerIssue5953(t *testing.T, mode testMode) {
 
 	got := resp.Header["Content-Type"]
 	want := []string{""}
-	if !reflect.DeepEqual(got, want) {
+	if !slices.Equal(got, want) {
 		t.Errorf("Content-Type = %q; want %q", got, want)
 	}
 	resp.Body.Close()
@@ -238,7 +238,8 @@ func testContentTypeWithVariousSources(t *testing.T, mode testMode) {
 			if ct := resp.Header.Get("Content-Type"); ct != expected {
 				t.Errorf("Content-Type = %q, want %q", ct, expected)
 			}
-			if want, got := resp.Header.Get("Content-Length"), fmt.Sprint(len(input)); want != got {
+			// HTTP/3 does not populate Content-Length automatically.
+			if want, got := resp.Header.Get("Content-Length"), fmt.Sprint(len(input)); want != got && mode != http3Mode {
 				t.Errorf("Content-Length = %q, want %q", want, got)
 			}
 			data, err := io.ReadAll(resp.Body)

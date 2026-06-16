@@ -222,7 +222,7 @@ func ignoreTwoUints(i *decInstr, state *decoderState, v reflect.Value) {
 // decAlloc takes a value and returns a settable value that can
 // be assigned to. If the value is a pointer, decAlloc guarantees it points to storage.
 // The callers to the individual decoders are expected to have used decAlloc.
-// The individual decoders don't need to it.
+// The individual decoders don't need it.
 func decAlloc(v reflect.Value) reflect.Value {
 	for v.Kind() == reflect.Pointer {
 		if v.IsNil() {
@@ -370,7 +370,7 @@ func decUint8Slice(i *decInstr, state *decoderState, value reflect.Value) {
 		errorf("bad %s slice length: %d", value.Type(), n)
 	}
 	if value.Cap() < n {
-		safe := saferio.SliceCap((*byte)(nil), uint64(n))
+		safe := saferio.SliceCap[byte](uint64(n))
 		if safe < 0 {
 			errorf("%s slice too big: %d elements", value.Type(), n)
 		}
@@ -395,7 +395,7 @@ func decUint8Slice(i *decInstr, state *decoderState, value reflect.Value) {
 			value.SetLen(ln)
 			sub := value.Slice(i, ln)
 			if _, err := state.b.Read(sub.Bytes()); err != nil {
-				errorf("error decoding []byte at %d: %s", err, i)
+				errorf("error decoding []byte at %d: %s", i, err)
 			}
 			i = ln
 		}
@@ -594,7 +594,13 @@ func decodeIntoValue(state *decoderState, op decOp, isPtr bool, value reflect.Va
 func (dec *Decoder) decodeMap(mtyp reflect.Type, state *decoderState, value reflect.Value, keyOp, elemOp decOp, ovfl error) {
 	n := int(state.decodeUint())
 	if value.IsNil() {
-		value.Set(reflect.MakeMapWithSize(mtyp, n))
+		// This is a map, not a slice, but capping the
+		// size works either way.
+		safe := saferio.SliceCapWithSize(uint64(mtyp.Elem().Size()), uint64(n))
+		if safe < 0 {
+			safe = 1
+		}
+		value.Set(reflect.MakeMapWithSize(mtyp, safe))
 	}
 	keyIsPtr := mtyp.Key().Kind() == reflect.Pointer
 	elemIsPtr := mtyp.Elem().Kind() == reflect.Pointer
@@ -656,7 +662,7 @@ func (dec *Decoder) decodeSlice(state *decoderState, value reflect.Value, elemOp
 		errorf("%s slice too big: %d elements of %d bytes", typ.Elem(), u, size)
 	}
 	if value.Cap() < n {
-		safe := saferio.SliceCap(reflect.Zero(reflect.PointerTo(typ.Elem())).Interface(), uint64(n))
+		safe := saferio.SliceCapWithSize(size, uint64(n))
 		if safe < 0 {
 			errorf("%s slice too big: %d elements of %d bytes", typ.Elem(), u, size)
 		}
@@ -768,11 +774,14 @@ func (dec *Decoder) decodeGobDecoder(ut *userTypeInfo, state *decoderState, valu
 	// We know it's one of these.
 	switch ut.externalDec {
 	case xGob:
-		err = value.Interface().(GobDecoder).GobDecode(b)
+		gobDecoder, _ := reflect.TypeAssert[GobDecoder](value)
+		err = gobDecoder.GobDecode(b)
 	case xBinary:
-		err = value.Interface().(encoding.BinaryUnmarshaler).UnmarshalBinary(b)
+		binaryUnmarshaler, _ := reflect.TypeAssert[encoding.BinaryUnmarshaler](value)
+		err = binaryUnmarshaler.UnmarshalBinary(b)
 	case xText:
-		err = value.Interface().(encoding.TextUnmarshaler).UnmarshalText(b)
+		textUnmarshaler, _ := reflect.TypeAssert[encoding.TextUnmarshaler](value)
+		err = textUnmarshaler.UnmarshalText(b)
 	}
 	if err != nil {
 		error_(err)
@@ -911,8 +920,11 @@ func (dec *Decoder) decOpFor(wireId typeId, rt reflect.Type, name string, inProg
 var maxIgnoreNestingDepth = 10000
 
 // decIgnoreOpFor returns the decoding op for a field that has no destination.
-func (dec *Decoder) decIgnoreOpFor(wireId typeId, inProgress map[typeId]*decOp, depth int) *decOp {
-	if depth > maxIgnoreNestingDepth {
+func (dec *Decoder) decIgnoreOpFor(wireId typeId, inProgress map[typeId]*decOp) *decOp {
+	// Track how deep we've recursed trying to skip nested ignored fields.
+	dec.ignoreDepth++
+	defer func() { dec.ignoreDepth-- }()
+	if dec.ignoreDepth > maxIgnoreNestingDepth {
 		error_(errors.New("invalid nesting depth"))
 	}
 	// If this type is already in progress, it's a recursive type (e.g. map[string]*T).
@@ -938,7 +950,7 @@ func (dec *Decoder) decIgnoreOpFor(wireId typeId, inProgress map[typeId]*decOp, 
 			errorf("bad data: undefined type %s", wireId.string())
 		case wire.ArrayT != nil:
 			elemId := wire.ArrayT.Elem
-			elemOp := dec.decIgnoreOpFor(elemId, inProgress, depth+1)
+			elemOp := dec.decIgnoreOpFor(elemId, inProgress)
 			op = func(i *decInstr, state *decoderState, value reflect.Value) {
 				state.dec.ignoreArray(state, *elemOp, wire.ArrayT.Len)
 			}
@@ -946,15 +958,15 @@ func (dec *Decoder) decIgnoreOpFor(wireId typeId, inProgress map[typeId]*decOp, 
 		case wire.MapT != nil:
 			keyId := dec.wireType[wireId].MapT.Key
 			elemId := dec.wireType[wireId].MapT.Elem
-			keyOp := dec.decIgnoreOpFor(keyId, inProgress, depth+1)
-			elemOp := dec.decIgnoreOpFor(elemId, inProgress, depth+1)
+			keyOp := dec.decIgnoreOpFor(keyId, inProgress)
+			elemOp := dec.decIgnoreOpFor(elemId, inProgress)
 			op = func(i *decInstr, state *decoderState, value reflect.Value) {
 				state.dec.ignoreMap(state, *keyOp, *elemOp)
 			}
 
 		case wire.SliceT != nil:
 			elemId := wire.SliceT.Elem
-			elemOp := dec.decIgnoreOpFor(elemId, inProgress, depth+1)
+			elemOp := dec.decIgnoreOpFor(elemId, inProgress)
 			op = func(i *decInstr, state *decoderState, value reflect.Value) {
 				state.dec.ignoreSlice(state, *elemOp)
 			}
@@ -1115,7 +1127,7 @@ func (dec *Decoder) compileSingle(remoteId typeId, ut *userTypeInfo) (engine *de
 func (dec *Decoder) compileIgnoreSingle(remoteId typeId) *decEngine {
 	engine := new(decEngine)
 	engine.instr = make([]decInstr, 1) // one item
-	op := dec.decIgnoreOpFor(remoteId, make(map[typeId]*decOp), 0)
+	op := dec.decIgnoreOpFor(remoteId, make(map[typeId]*decOp))
 	ovfl := overflow(dec.typeString(remoteId))
 	engine.instr[0] = decInstr{*op, 0, nil, ovfl}
 	engine.numInstr = 1
@@ -1160,7 +1172,7 @@ func (dec *Decoder) compileDec(remoteId typeId, ut *userTypeInfo) (engine *decEn
 		localField, present := srt.FieldByName(wireField.Name)
 		// TODO(r): anonymous names
 		if !present || !isExported(wireField.Name) {
-			op := dec.decIgnoreOpFor(wireField.Id, make(map[typeId]*decOp), 0)
+			op := dec.decIgnoreOpFor(wireField.Id, make(map[typeId]*decOp))
 			engine.instr[fieldnum] = decInstr{*op, fieldnum, nil, ovfl}
 			continue
 		}

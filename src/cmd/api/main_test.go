@@ -17,6 +17,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"internal/buildcfg"
 	"internal/testenv"
 	"io"
 	"log"
@@ -25,7 +26,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -106,7 +107,7 @@ func Check(t *testing.T) {
 	}
 
 	var nextFiles []string
-	if strings.Contains(runtime.Version(), "devel") {
+	if v := runtime.Version(); strings.Contains(v, "devel") || strings.Contains(v, "beta") {
 		next, err := filepath.Glob(filepath.Join(testenv.GOROOT(t), "api/next/*.txt"))
 		if err != nil {
 			t.Fatal(err)
@@ -116,12 +117,20 @@ func Check(t *testing.T) {
 
 	for _, c := range contexts {
 		c.Compiler = build.Default.Compiler
+
+		// Include baseline goexperiment.* tool tags.
+		baseline, err := buildcfg.ParseGOEXPERIMENT(c.GOOS, c.GOARCH, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, exp := range baseline.Enabled() {
+			c.ToolTags = append(c.ToolTags, "goexperiment."+exp)
+		}
 	}
 
 	walkers := make([]*Walker, len(contexts))
 	var wg sync.WaitGroup
 	for i, context := range contexts {
-		i, context := i, context
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -232,8 +241,8 @@ func compareAPI(w io.Writer, features, required, exception []string) (ok bool) {
 	featureSet := set(features)
 	exceptionSet := set(exception)
 
-	sort.Strings(features)
-	sort.Strings(required)
+	slices.Sort(features)
+	slices.Sort(required)
 
 	take := func(sl *[]string) string {
 		s := (*sl)[0]
@@ -378,7 +387,7 @@ func (w *Walker) Features() (fs []string) {
 	for f := range w.features {
 		fs = append(fs, f)
 	}
-	sort.Strings(fs)
+	slices.Sort(fs)
 	return
 }
 
@@ -390,7 +399,7 @@ func (w *Walker) parseFile(dir, file string) (*ast.File, error) {
 		return f, nil
 	}
 
-	f, err := parser.ParseFile(fset, filename, nil, parser.ParseComments)
+	f, err := parser.ParseFile(fset, filename, nil, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		return nil, err
 	}
@@ -431,7 +440,7 @@ func tagKey(dir string, context *build.Context, tags []string) string {
 	// an indirect imported package. See https://github.com/golang/go/issues/21181
 	// for more detail.
 	tags = append(tags, context.GOOS, context.GOARCH)
-	sort.Strings(tags)
+	slices.Sort(tags)
 
 	for _, tag := range tags {
 		if ctags[tag] {
@@ -490,7 +499,8 @@ func (w *Walker) loadImports() {
 		if w.context.Dir != "" {
 			cmd.Dir = w.context.Dir
 		}
-		out, err := cmd.CombinedOutput()
+		cmd.Stderr = os.Stderr
+		out, err := cmd.Output()
 		if err != nil {
 			log.Fatalf("loading imports: %v\n%s", err, out)
 		}
@@ -534,7 +544,7 @@ func (w *Walker) loadImports() {
 			}
 		}
 
-		sort.Strings(stdPackages)
+		slices.Sort(stdPackages)
 		imports = listImports{
 			stdPackages: stdPackages,
 			importMap:   importMap,
@@ -716,7 +726,7 @@ func sortedMethodNames(typ *types.Interface) []string {
 	for i := range list {
 		list[i] = typ.Method(i).Name()
 	}
-	sort.Strings(list)
+	slices.Sort(list)
 	return list
 }
 
@@ -746,7 +756,7 @@ func (w *Walker) sortedEmbeddeds(typ *types.Interface) []string {
 			list = append(list, buf.String())
 		}
 	}
-	sort.Strings(list)
+	slices.Sort(list)
 	return list
 }
 
@@ -842,6 +852,9 @@ func (w *Walker) writeType(buf *bytes.Buffer, typ types.Type) {
 		buf.WriteString(s)
 		w.writeType(buf, typ.Elem())
 
+	case *types.Alias:
+		w.writeType(buf, types.Unalias(typ))
+
 	case *types.Named:
 		obj := typ.Obj()
 		pkg := obj.Pkg()
@@ -850,6 +863,16 @@ func (w *Walker) writeType(buf *bytes.Buffer, typ types.Type) {
 			buf.WriteByte('.')
 		}
 		buf.WriteString(typ.Obj().Name())
+		if targs := typ.TypeArgs(); targs.Len() > 0 {
+			buf.WriteByte('[')
+			for i := 0; i < targs.Len(); i++ {
+				if i > 0 {
+					buf.WriteString(", ")
+				}
+				w.writeType(buf, targs.At(i))
+			}
+			buf.WriteByte(']')
+		}
 
 	case *types.TypeParam:
 		// Type parameter names may change, so use a placeholder instead.
@@ -956,16 +979,16 @@ func (w *Walker) emitType(obj *types.TypeName) {
 	if w.isDeprecated(obj) {
 		w.emitf("type %s //deprecated", name)
 	}
+	typ := obj.Type()
+	if obj.IsAlias() {
+		w.emitf("type %s = %s", name, w.typeString(typ))
+		return
+	}
 	if tparams := obj.Type().(*types.Named).TypeParams(); tparams != nil {
 		var buf bytes.Buffer
 		buf.WriteString(name)
 		w.writeTypeParams(&buf, tparams, true)
 		name = buf.String()
-	}
-	typ := obj.Type()
-	if obj.IsAlias() {
-		w.emitf("type %s = %s", name, w.typeString(typ))
-		return
 	}
 	switch typ := typ.Underlying().(type) {
 	case *types.Struct:
@@ -1005,7 +1028,7 @@ func (w *Walker) emitType(obj *types.TypeName) {
 
 func (w *Walker) emitStructType(name string, typ *types.Struct) {
 	typeStruct := fmt.Sprintf("type %s struct", name)
-	w.emitf(typeStruct)
+	w.emitf("%s", typeStruct)
 	defer w.pushScope(typeStruct)()
 
 	for i := 0; i < typ.NumFields(); i++ {
@@ -1044,7 +1067,7 @@ func (w *Walker) emitIfaceType(name string, typ *types.Interface) {
 		if w.isDeprecated(m) {
 			w.emitf("%s //deprecated", m.Name())
 		}
-		w.emitf("%s%s", m.Name(), w.signatureString(m.Type().(*types.Signature)))
+		w.emitf("%s%s", m.Name(), w.signatureString(m.Signature()))
 	}
 
 	if !complete {
@@ -1069,12 +1092,12 @@ func (w *Walker) emitIfaceType(name string, typ *types.Interface) {
 		return
 	}
 
-	sort.Strings(methodNames)
+	slices.Sort(methodNames)
 	w.emitf("type %s interface { %s }", name, strings.Join(methodNames, ", "))
 }
 
 func (w *Walker) emitFunc(f *types.Func) {
-	sig := f.Type().(*types.Signature)
+	sig := f.Signature()
 	if sig.Recv() != nil {
 		panic("method considered a regular function: " + f.String())
 	}
@@ -1140,14 +1163,15 @@ func needApproval(filename string) bool {
 
 func (w *Walker) collectDeprecated() {
 	isDeprecated := func(doc *ast.CommentGroup) bool {
-		if doc != nil {
-			for _, c := range doc.List {
-				if strings.HasPrefix(c.Text, "// Deprecated:") {
-					return true
-				}
-			}
-		}
-		return false
+		// Look for "Deprecated:" (case-sensitive) at the beginning (not middle) of a paragraph.
+		// It's typically found in the last paragraph, but it's not required to be the last one.
+		// The colon is typically followed by a space, but it can also be a newline, as was the
+		// case at https://go.dev/pkg/go/build#AllowBinary for example.
+		//
+		// See https://go.dev/wiki/Deprecated and https://go.dev/ref/mod#go-mod-file-module-deprecation.
+		text := doc.Text()
+		return strings.HasPrefix(text, "Deprecated: ") || strings.Contains(text, "\n\nDeprecated: ") ||
+			strings.HasPrefix(text, "Deprecated:\n") || strings.Contains(text, "\n\nDeprecated:\n")
 	}
 
 	w.deprecated = make(map[token.Pos]bool)

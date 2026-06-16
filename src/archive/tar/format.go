@@ -33,7 +33,7 @@ import "strings"
 //	sub-second times  |     no |       yes |        no
 //	sparse files      |     no |       yes |       yes
 //
-// The table's upper portion shows the Header fields, where each format reports
+// The table's upper portion shows the [Header] fields, where each format reports
 // the maximum number of bytes allowed for each string field and
 // the integer type used to store each numeric field
 // (where timestamps are stored as the number of seconds since the Unix epoch).
@@ -147,6 +147,12 @@ const (
 	// Max length of a special file (PAX header, GNU long name or link).
 	// This matches the limit used by libarchive.
 	maxSpecialFileSize = 1 << 20
+
+	// Maximum number of sparse file entries.
+	// We should never actually hit this limit
+	// (every sparse encoding will first be limited by maxSpecialFileSize),
+	// but this adds an additional layer of defense.
+	maxSparseFileEntries = 1 << 20
 )
 
 // blockPadding computes the number of bytes needed to pad offset up to the

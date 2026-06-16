@@ -44,6 +44,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"cmd/internal/telemetry/counter"
 )
 
 func usage() {
@@ -67,8 +69,11 @@ var (
 func main() {
 	log.SetPrefix("distpack: ")
 	log.SetFlags(0)
+	counter.Open()
 	flag.Usage = usage
 	flag.Parse()
+	counter.Inc("distpack/invocations")
+	counter.CountFlags("distpack/flag:", *flag.CommandLine)
 	if flag.NArg() != 0 {
 		usage()
 	}
@@ -127,7 +132,7 @@ func main() {
 		// Generated during cmd/dist. See ../dist/build.go:/gentab.
 		"src/cmd/go/internal/cfg/zdefaultcc.go",
 		"src/go/build/zcgo.go",
-		"src/runtime/internal/sys/zversion.go",
+		"src/internal/runtime/sys/zversion.go",
 		"src/time/tzdata/zzipdata.go",
 
 		// Generated during cmd/dist by bootstrapBuildTools.
@@ -162,10 +167,12 @@ func main() {
 			if !strings.HasPrefix(name, "pkg/tool/"+goosUnderGoarch+"/") {
 				return false
 			}
-			// Inside pkg/tool/$GOOS_$GOARCH, discard helper tools.
+			// Inside pkg/tool/$GOOS_$GOARCH, keep only tools needed for build actions.
 			switch strings.TrimSuffix(path.Base(name), ".exe") {
-			case "api", "dist", "distpack", "metadata":
+			default:
 				return false
+			// Keep in sync with toolsIncludedInDistpack in cmd/dist/build.go.
+			case "asm", "cgo", "compile", "cover", "fix", "link", "preprofile", "vet":
 			}
 		}
 		return true
@@ -173,6 +180,7 @@ func main() {
 
 	// Add go and gofmt to bin, using cross-compiled binaries
 	// if this is a cross-compiled distribution.
+	// Keep in sync with binExesIncludedInDistpack in cmd/dist/build.go.
 	binExes := []string{
 		"go",
 		"gofmt",
@@ -263,7 +271,7 @@ func readVERSION(goroot string) (version string, t time.Time) {
 		log.Fatal(err)
 	}
 	version, rest, _ := strings.Cut(string(data), "\n")
-	for _, line := range strings.Split(rest, "\n") {
+	for line := range strings.SplitSeq(rest, "\n") {
 		f := strings.Fields(line)
 		if len(f) == 0 {
 			continue

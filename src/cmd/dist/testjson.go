@@ -80,7 +80,8 @@ func (f *testJSONFilter) process(line []byte) {
 		// struct, or other additions outside of it. If humans are ever looking
 		// at the output, it's really nice to keep field order because it
 		// preserves a lot of regularity in the output.
-		dec := json.NewDecoder(bytes.NewBuffer(line))
+		lineBuf := bytes.NewBuffer(line)
+		dec := json.NewDecoder(lineBuf)
 		dec.UseNumber()
 		val, err := decodeJSONValue(dec)
 		if err == nil && val.atom == json.Delim('{') {
@@ -99,12 +100,13 @@ func (f *testJSONFilter) process(line []byte) {
 				data, err := json.Marshal(val)
 				if err != nil {
 					// Should never happen.
-					panic(fmt.Sprintf("failed to round-trip JSON %q: %s", string(line), err))
+					panic(fmt.Sprintf("failed to round-trip JSON %q: %s", line, err))
 				}
 				f.w.Write(data)
 				// Copy any trailing text. We expect at most a "\n" here, but
 				// there could be other text and we want to feed that through.
 				io.Copy(f.w, dec.Buffered())
+				io.Copy(f.w, lineBuf)
 				return
 			}
 		}

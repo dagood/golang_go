@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build dragonfly || netbsd || (openbsd && mips64)
+//go:build dragonfly || netbsd
 
 package syscall
 
@@ -64,7 +64,7 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 		ngroups, groups uintptr
 	)
 
-	rlim, rlimOK := origRlimitNofile.Load().(Rlimit)
+	rlim := origRlimitNofile.Load()
 
 	// guard against side effects of shuffling fds below.
 	// Make sure that nextfd is beyond any currently open files so
@@ -187,7 +187,7 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 	// Pass 1: look for fd[i] < i and move those up above len(fd)
 	// so that pass 2 won't stomp on an fd it needs later.
 	if pipe < nextfd {
-		if runtime.GOOS == "netbsd" || (runtime.GOOS == "openbsd" && runtime.GOARCH == "mips64") {
+		if runtime.GOOS == "netbsd" {
 			_, _, err1 = RawSyscall(_SYS_DUP3, uintptr(pipe), uintptr(nextfd), O_CLOEXEC)
 		} else if runtime.GOOS == "dragonfly" {
 			_, _, err1 = RawSyscall(SYS_FCNTL, uintptr(pipe), _F_DUP2FD_CLOEXEC, uintptr(nextfd))
@@ -209,7 +209,7 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 			if nextfd == pipe { // don't stomp on pipe
 				nextfd++
 			}
-			if runtime.GOOS == "netbsd" || (runtime.GOOS == "openbsd" && runtime.GOARCH == "mips64") {
+			if runtime.GOOS == "netbsd" {
 				_, _, err1 = RawSyscall(_SYS_DUP3, uintptr(fd[i]), uintptr(nextfd), O_CLOEXEC)
 			} else if runtime.GOOS == "dragonfly" {
 				_, _, err1 = RawSyscall(SYS_FCNTL, uintptr(fd[i]), _F_DUP2FD_CLOEXEC, uintptr(nextfd))
@@ -276,8 +276,8 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 	}
 
 	// Restore original rlimit.
-	if rlimOK && rlim.Cur != 0 {
-		RawSyscall(SYS_SETRLIMIT, uintptr(RLIMIT_NOFILE), uintptr(unsafe.Pointer(&rlim)), 0)
+	if rlim != nil {
+		RawSyscall(SYS_SETRLIMIT, uintptr(RLIMIT_NOFILE), uintptr(unsafe.Pointer(rlim)), 0)
 	}
 
 	// Time to exec.
@@ -292,4 +292,9 @@ childerror:
 	for {
 		RawSyscall(SYS_EXIT, 253, 0, 0)
 	}
+}
+
+// forkAndExecFailureCleanup cleans up after an exec failure.
+func forkAndExecFailureCleanup(attr *ProcAttr, sys *SysProcAttr) {
+	// Nothing to do.
 }

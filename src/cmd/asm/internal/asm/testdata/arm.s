@@ -870,10 +870,13 @@ jmp_label_3:
 	BIC.S	R0@>R1, R2           // 7021d2e1
 
 // SRL
+	SRL	$0, R5, R6           // 0560a0e1
+	SRL	$1, R5, R6           // a560a0e1
 	SRL	$14, R5, R6          // 2567a0e1
 	SRL	$15, R5, R6          // a567a0e1
 	SRL	$30, R5, R6          // 256fa0e1
 	SRL	$31, R5, R6          // a56fa0e1
+	SRL	$32, R5, R6          // 2560a0e1
 	SRL.S	$14, R5, R6          // 2567b0e1
 	SRL.S	$15, R5, R6          // a567b0e1
 	SRL.S	$30, R5, R6          // 256fb0e1
@@ -892,10 +895,13 @@ jmp_label_3:
 	SRL.S	R5, R7               // 3775b0e1
 
 // SRA
+	SRA	$0, R5, R6           // 0560a0e1
+	SRA	$1, R5, R6           // c560a0e1
 	SRA	$14, R5, R6          // 4567a0e1
 	SRA	$15, R5, R6          // c567a0e1
 	SRA	$30, R5, R6          // 456fa0e1
 	SRA	$31, R5, R6          // c56fa0e1
+	SRA	$32, R5, R6          // 4560a0e1
 	SRA.S	$14, R5, R6          // 4567b0e1
 	SRA.S	$15, R5, R6          // c567b0e1
 	SRA.S	$30, R5, R6          // 456fb0e1
@@ -914,6 +920,8 @@ jmp_label_3:
 	SRA.S	R5, R7               // 5775b0e1
 
 // SLL
+	SLL	$0, R5, R6           // 0560a0e1
+	SLL	$1, R5, R6           // 8560a0e1
 	SLL	$14, R5, R6          // 0567a0e1
 	SLL	$15, R5, R6          // 8567a0e1
 	SLL	$30, R5, R6          // 056fa0e1
@@ -934,6 +942,20 @@ jmp_label_3:
 	SLL.S	R5, R6, R7           // 1675b0e1
 	SLL	R5, R7               // 1775a0e1
 	SLL.S	R5, R7               // 1775b0e1
+
+// Ops with zero shifts should encode as left shifts
+	ADD	R0<<0, R1, R2	     // 002081e0
+	ADD	R0>>0, R1, R2	     // 002081e0
+	ADD	R0->0, R1, R2	     // 002081e0
+	ADD	R0@>0, R1, R2	     // 002081e0
+	MOVW	R0<<0(R1), R2        // 002091e7
+	MOVW	R0>>0(R1), R2        // 002091e7
+	MOVW	R0->0(R1), R2        // 002091e7
+	MOVW	R0@>0(R1), R2        // 002091e7
+	MOVW	R0, R1<<0(R2)        // 010082e7
+	MOVW	R0, R1>>0(R2)        // 010082e7
+	MOVW	R0, R1->0(R2)        // 010082e7
+	MOVW	R0, R1@>0(R2)        // 010082e7
 
 // MULA / MULS
 	MULAWT		R1, R2, R3, R4       // c23124e1
@@ -1067,10 +1089,23 @@ jmp_label_3:
 	RSC	$0xffffff4b, R5     // RSC $4294967115, R5       // b4b0e0e30b50e5e0
 	RSC.S	$0xffffffb5, R2, R3 // RSC.S $4294967221, R2, R3 // 4ab0e0e30b30f2e0
 	RSC.S	$0xffffff4a, R5     // RSC.S $4294967114, R5     // b5b0e0e30b50f5e0
-	AND	$0xffffffaa, R2, R3 // AND $4294967210, R2, R3   // 55b0e0e30b3002e0
-	AND	$0xffffff55, R5     // AND $4294967125, R5       // aab0e0e30b5005e0
-	AND.S	$0xffffffab, R2, R3 // AND.S $4294967211, R2, R3 // 54b0e0e30b3012e0
-	AND.S	$0xffffff54, R5     // AND.S $4294967124, R5     // abb0e0e30b5015e0
+	AND	$0xffffffaa, R2, R3 // AND $4294967210, R2, R3   // 5530c2e3
+	AND	$0xffffff55, R5     // AND $4294967125, R5       // aa50c5e3
+	AND.S	$0xffffffab, R2, R3 // AND.S $4294967211, R2, R3 // 5430d2e3
+	AND.S	$0xffffff54, R5     // AND.S $4294967124, R5     // ab50d5e3
+	// AND with a negative-rotated immediate: emit a single BIC,
+	// not the two-instruction MVN+AND synthesis (which clobbers R11).
+	AND	$0xfffffffc, R0, R1 // AND $4294967292, R0, R1   // 0310c0e3
+	AND	$0xfffffff0, R0, R1 // AND $4294967280, R0, R1   // 0f10c0e3
+	AND	$0xffffff00, R0, R1 // AND $4294967040, R0, R1   // ff10c0e3
+	AND	$0xfffffffc, R8     // AND $4294967292, R8       // 0380c8e3
+	AND.S	$0xfffffffc, R0, R1 // AND.S $4294967292, R0, R1 // 0310d0e3
+	// AND with an irregular immediate (neither rot8 nor ~rot8 fit)
+	// still goes through the literal-pool synthesis: MOVW pool(PC),
+	// R11; AND R11, Rn, Rd. Encoded form depends on pool placement,
+	// so just round-trip the disassembly.
+	AND	$0xaaaaaaaa, R0, R1 // AND $2863311530, R0, R1
+	AND.S	$0xaaaaaaaa, R0, R1 // AND.S $2863311530, R0, R1
 	ORR	$0xffffffaa, R2, R3 // ORR $4294967210, R2, R3   // 55b0e0e30b3082e1
 	ORR	$0xffffff55, R5     // ORR $4294967125, R5       // aab0e0e30b5085e1
 	ORR.S	$0xffffffab, R2, R3 // ORR.S $4294967211, R2, R3 // 54b0e0e30b3092e1

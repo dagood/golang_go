@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"internal/goexperiment"
 	"io"
 	"log/slog/internal/buffer"
 	"strconv"
@@ -18,13 +19,13 @@ import (
 	"unicode/utf8"
 )
 
-// JSONHandler is a Handler that writes Records to an io.Writer as
+// JSONHandler is a [Handler] that writes Records to an [io.Writer] as
 // line-delimited JSON objects.
 type JSONHandler struct {
 	*commonHandler
 }
 
-// NewJSONHandler creates a JSONHandler that writes to w,
+// NewJSONHandler creates a [JSONHandler] that writes to w,
 // using the given options.
 // If opts is nil, the default options are used.
 func NewJSONHandler(w io.Writer, opts *HandlerOptions) *JSONHandler {
@@ -47,7 +48,7 @@ func (h *JSONHandler) Enabled(_ context.Context, level Level) bool {
 	return h.commonHandler.enabled(level)
 }
 
-// WithAttrs returns a new JSONHandler whose attributes consists
+// WithAttrs returns a new [JSONHandler] whose attributes consists
 // of h's attributes followed by attrs.
 func (h *JSONHandler) WithAttrs(attrs []Attr) Handler {
 	return &JSONHandler{commonHandler: h.commonHandler.withAttrs(attrs)}
@@ -57,15 +58,13 @@ func (h *JSONHandler) WithGroup(name string) Handler {
 	return &JSONHandler{commonHandler: h.commonHandler.withGroup(name)}
 }
 
-// Handle formats its argument Record as a JSON object on a single line.
+// Handle formats its argument [Record] as a JSON object on a single line.
 //
 // If the Record's time is zero, the time is omitted.
 // Otherwise, the key is "time"
 // and the value is output as with json.Marshal.
 //
-// If the Record's level is zero, the level is omitted.
-// Otherwise, the key is "level"
-// and the value of [Level.String] is output.
+// The level's key is "level" and its value is the result of calling [Level.String].
 //
 // If the AddSource option is set and source information is available,
 // the key is "source", and the value is a record of type [Source].
@@ -81,7 +80,7 @@ func (h *JSONHandler) WithGroup(name string) Handler {
 // First, an Attr whose Value is of type error is formatted as a string, by
 // calling its Error method. Only errors in Attrs receive this special treatment,
 // not errors embedded in structs, slices, maps or other data structures that
-// are processed by the encoding/json package.
+// are processed by the [encoding/json] package.
 //
 // Second, an encoding failure does not cause Handle to return an error.
 // Instead, the error message is formatted as a string.
@@ -97,6 +96,7 @@ func appendJSONTime(s *handleState, t time.Time) {
 		// RFC 3339 is clear that years are 4 digits exactly.
 		// See golang.org/issue/4556#c15 for more discussion.
 		s.appendError(errors.New("time.Time year outside of range [0,9999]"))
+		return
 	}
 	s.buf.WriteByte('"')
 	*s.buf = t.AppendFormat(*s.buf, time.RFC3339Nano)
@@ -139,15 +139,40 @@ func appendJSONValue(s *handleState, v Value) error {
 	return nil
 }
 
-func appendJSONMarshal(buf *buffer.Buffer, v any) error {
+type jsonEncoder struct {
+	buf *bytes.Buffer
 	// Use a json.Encoder to avoid escaping HTML.
-	var bb bytes.Buffer
-	enc := json.NewEncoder(&bb)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
+	json *json.Encoder
+}
+
+var jsonEncoderPool = &sync.Pool{
+	New: func() any {
+		enc := &jsonEncoder{
+			buf: new(bytes.Buffer),
+		}
+		enc.json = json.NewEncoder(enc.buf)
+		enc.json.SetEscapeHTML(false)
+		return enc
+	},
+}
+
+func appendJSONMarshal(buf *buffer.Buffer, v any) error {
+	j := jsonEncoderPool.Get().(*jsonEncoder)
+	defer func() {
+		// To reduce peak allocation, return only smaller buffers to the pool.
+		const maxBufferSize = 16 << 10
+		if j.buf.Cap() > maxBufferSize {
+			return
+		}
+		j.buf.Reset()
+		jsonEncoderPool.Put(j)
+	}()
+
+	if err := j.json.Encode(v); err != nil {
 		return err
 	}
-	bs := bb.Bytes()
+
+	bs := j.buf.Bytes()
 	buf.Write(bs[:len(bs)-1]) // remove final newline
 	return nil
 }
@@ -196,7 +221,11 @@ func appendEscapedJSONString(buf []byte, s string) []byte {
 			if start < i {
 				str(s[start:i])
 			}
-			str(`\ufffd`)
+			if goexperiment.JSONv2 {
+				str("\ufffd") // see https://go.dev/cl/687116
+			} else {
+				str(`\ufffd`)
+			}
 			i += size
 			start = i
 			continue
@@ -226,7 +255,7 @@ func appendEscapedJSONString(buf []byte, s string) []byte {
 	return buf
 }
 
-var hex = "0123456789abcdef"
+const hex = "0123456789abcdef"
 
 // Copied from encoding/json/tables.go.
 //

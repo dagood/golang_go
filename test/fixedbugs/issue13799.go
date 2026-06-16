@@ -51,7 +51,7 @@ func test1(iter int) {
 		// var fn func() // this makes it work, because fn stays off heap
 		j := 0        // ERROR "moved to heap: j$"
 		fn = func() { // ERROR "func literal escapes to heap$"
-			m[i] = append(m[i], 0)
+			m[i] = append(m[i], 0) // ERROR "append escapes to heap"
 			if j < 25 {
 				j++
 				fn()
@@ -61,7 +61,7 @@ func test1(iter int) {
 	}
 
 	if len(m) != maxI {
-		panic(fmt.Sprintf("iter %d: maxI = %d, len(m) = %d", iter, maxI, len(m))) // ERROR "iter escapes to heap$" "len\(m\) escapes to heap$" "maxI escapes to heap$" "... argument does not escape$" "fmt.Sprintf\(.*\) escapes to heap"
+		panic(fmt.Sprintf("iter %d: maxI = %d, len(m) = %d", iter, maxI, len(m))) // ERROR "iter escapes to heap$" "len\(m\) escapes to heap$" "500 escapes to heap$" "... argument does not escape$" "fmt.Sprintf\(.*\) escapes to heap"
 	}
 }
 
@@ -75,7 +75,7 @@ func test2(iter int) {
 		var fn func() // this makes it work, because fn stays off heap
 		j := 0
 		fn = func() { // ERROR "func literal does not escape$"
-			m[i] = append(m[i], 0)
+			m[i] = append(m[i], 0) // ERROR "append escapes to heap"
 			if j < 25 {
 				j++
 				fn()
@@ -85,7 +85,7 @@ func test2(iter int) {
 	}
 
 	if len(m) != maxI {
-		panic(fmt.Sprintf("iter %d: maxI = %d, len(m) = %d", iter, maxI, len(m))) // ERROR "iter escapes to heap$" "len\(m\) escapes to heap$" "maxI escapes to heap$" "... argument does not escape$" "fmt.Sprintf\(.*\) escapes to heap"
+		panic(fmt.Sprintf("iter %d: maxI = %d, len(m) = %d", iter, maxI, len(m))) // ERROR "iter escapes to heap$" "len\(m\) escapes to heap$" "500 escapes to heap$" "... argument does not escape$" "fmt.Sprintf\(.*\) escapes to heap"
 	}
 }
 
@@ -111,7 +111,7 @@ func test3(iter int) {
 	}
 
 	if *m != maxI {
-		panic(fmt.Sprintf("iter %d: maxI = %d, *m = %d", iter, maxI, *m)) // ERROR "\*m escapes to heap$" "iter escapes to heap$" "maxI escapes to heap$" "... argument does not escape$" "fmt.Sprintf\(.*\) escapes to heap"
+		panic(fmt.Sprintf("iter %d: maxI = %d, *m = %d", iter, maxI, *m)) // ERROR "\*m escapes to heap$" "iter escapes to heap$" "500 escapes to heap$" "... argument does not escape$" "fmt.Sprintf\(.*\) escapes to heap"
 	}
 }
 
@@ -137,7 +137,7 @@ func test4(iter int) {
 	}
 
 	if *m != maxI {
-		panic(fmt.Sprintf("iter %d: maxI = %d, *m = %d", iter, maxI, *m)) // ERROR "\*m escapes to heap$" "iter escapes to heap$" "maxI escapes to heap$" "... argument does not escape$" "fmt.Sprintf\(.*\) escapes to heap"
+		panic(fmt.Sprintf("iter %d: maxI = %d, *m = %d", iter, maxI, *m)) // ERROR "\*m escapes to heap$" "iter escapes to heap$" "500 escapes to heap$" "... argument does not escape$" "fmt.Sprintf\(.*\) escapes to heap"
 	}
 }
 
@@ -168,7 +168,7 @@ func test5(iter int) {
 	}
 
 	if *m != maxI {
-		panic(fmt.Sprintf("iter %d: maxI = %d, *m = %d", iter, maxI, *m)) // ERROR "\*m escapes to heap$" "iter escapes to heap$" "maxI escapes to heap$" "... argument does not escape$" "fmt.Sprintf\(.*\) escapes to heap"
+		panic(fmt.Sprintf("iter %d: maxI = %d, *m = %d", iter, maxI, *m)) // ERROR "\*m escapes to heap$" "iter escapes to heap$" "500 escapes to heap$" "... argument does not escape$" "fmt.Sprintf\(.*\) escapes to heap"
 	}
 }
 
@@ -186,6 +186,6 @@ func test6(iter int) {
 	}
 
 	if *m != maxI {
-		panic(fmt.Sprintf("iter %d: maxI = %d, *m = %d", iter, maxI, *m)) // ERROR "\*m escapes to heap$" "iter escapes to heap$" "maxI escapes to heap$" "... argument does not escape$" "fmt.Sprintf\(.*\) escapes to heap"
+		panic(fmt.Sprintf("iter %d: maxI = %d, *m = %d", iter, maxI, *m)) // ERROR "\*m escapes to heap$" "iter escapes to heap$" "500 escapes to heap$" "... argument does not escape$" "fmt.Sprintf\(.*\) escapes to heap"
 	}
 }

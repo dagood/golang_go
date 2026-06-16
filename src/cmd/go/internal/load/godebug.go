@@ -5,14 +5,18 @@
 package load
 
 import (
-	"cmd/go/internal/modload"
 	"errors"
 	"fmt"
 	"go/build"
 	"internal/godebugs"
+	"maps"
 	"sort"
 	"strconv"
 	"strings"
+
+	"cmd/go/internal/fips140"
+	"cmd/go/internal/gover"
+	"cmd/go/internal/modload"
 )
 
 var ErrNotGoDebug = errors.New("not //go:debug line")
@@ -32,46 +36,57 @@ func ParseGoDebug(text string) (key, value string, err error) {
 	if !ok {
 		return "", "", fmt.Errorf("missing key=value")
 	}
-	if strings.ContainsAny(k, " \t") {
-		return "", "", fmt.Errorf("key contains space")
+	if err := modload.CheckGodebug("//go:debug setting", k, v); err != nil {
+		return "", "", err
 	}
-	if strings.ContainsAny(v, " \t") {
-		return "", "", fmt.Errorf("value contains space")
-	}
-	if strings.ContainsAny(k, ",") {
-		return "", "", fmt.Errorf("key contains comma")
-	}
-	if strings.ContainsAny(v, ",") {
-		return "", "", fmt.Errorf("value contains comma")
-	}
+	return k, v, nil
+}
 
-	for _, info := range godebugs.All {
-		if k == info.Name {
-			return k, v, nil
-		}
+func defaultGODEBUGGoVersion(ld *modload.Loader, p *Package) string {
+	if !ld.Enabled() {
+		// GOPATH mode. Use Go 1.20.
+		return "1.20"
 	}
-	return "", "", fmt.Errorf("unknown //go:debug setting %q", k)
+	if ld.RootMode == modload.NoRoot && p.Module != nil {
+		// This is go install pkg@version or go run pkg@version.
+		// Use the Go version from the package.
+		// If there isn't one, then assume Go 1.20, the last
+		// version before GODEBUGs were introduced (#56986).
+		if goVersion := p.Module.GoVersion; goVersion != "" {
+			return goVersion
+		}
+		return "1.20"
+	}
+	return ld.MainModules.GoVersion(ld)
 }
 
 // defaultGODEBUG returns the default GODEBUG setting for the main package p.
 // When building a test binary, directives, testDirectives, and xtestDirectives
 // list additional directives from the package under test.
-func defaultGODEBUG(p *Package, directives, testDirectives, xtestDirectives []build.Directive) string {
+func defaultGODEBUG(ld *modload.Loader, p *Package, directives, testDirectives, xtestDirectives []build.Directive) string {
 	if p.Name != "main" {
 		return ""
 	}
-	goVersion := modload.MainModules.GoVersion()
-	if modload.RootMode == modload.NoRoot && p.Module != nil {
-		// This is go install pkg@version or go run pkg@version.
-		// Use the Go version from the package.
-		// If there isn't one, then
-		goVersion = p.Module.GoVersion
-		if goVersion == "" {
-			goVersion = "1.20"
-		}
+
+	goVersion := defaultGODEBUGGoVersion(ld, p)
+
+	var m map[string]string
+
+	// If GOFIPS140 is set to anything but "off",
+	// default to GODEBUG=fips140=on.
+	if fips140.Enabled() {
+		m = map[string]string{"fips140": "on"}
 	}
 
-	m := godebugForGoVersion(goVersion)
+	// Add directives from main module go.mod.
+	for _, g := range ld.MainModules.Godebugs(ld) {
+		if m == nil {
+			m = make(map[string]string)
+		}
+		m[g.Key] = g.Value
+	}
+
+	// Add directives from packages.
 	for _, list := range [][]build.Directive{p.Internal.Build.Directives, directives, testDirectives, xtestDirectives} {
 		for _, d := range list {
 			k, v, err := ParseGoDebug(d.Text)
@@ -84,7 +99,22 @@ func defaultGODEBUG(p *Package, directives, testDirectives, xtestDirectives []bu
 			m[k] = v
 		}
 	}
-	var keys []string
+	if v, ok := m["default"]; ok {
+		delete(m, "default")
+		v = strings.TrimPrefix(v, "go")
+		if gover.IsValid(v) {
+			goVersion = v
+		}
+	}
+
+	defaults := godebugForGoVersion(goVersion)
+	if defaults != nil {
+		// Apply m on top of defaults.
+		maps.Copy(defaults, m)
+		m = defaults
+	}
+
+	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
 	}

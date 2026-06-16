@@ -15,7 +15,9 @@ import (
 	"cmd/asm/internal/flags"
 	"cmd/asm/internal/lex"
 	"cmd/internal/obj"
+	"cmd/internal/obj/arm64"
 	"cmd/internal/obj/ppc64"
+	"cmd/internal/obj/riscv"
 	"cmd/internal/obj/x86"
 	"cmd/internal/sys"
 )
@@ -46,7 +48,11 @@ func (p *Parser) append(prog *obj.Prog, cond string, doLabel bool) {
 				p.errorf("%v", err)
 				return
 			}
-
+		case sys.RISCV64:
+			if err := riscv.ParseSuffix(prog, cond); err != nil {
+				p.errorf("unrecognized suffix .%q", cond)
+				return
+			}
 		default:
 			p.errorf("unrecognized suffix .%q", cond)
 			return
@@ -243,7 +249,7 @@ func (p *Parser) asmData(operands [][]lex.Token) {
 	case obj.TYPE_CONST:
 		switch sz {
 		case 1, 2, 4, 8:
-			nameAddr.Sym.WriteInt(p.ctxt, nameAddr.Offset, int(sz), valueAddr.Offset)
+			nameAddr.Sym.WriteInt(p.ctxt, nameAddr.Offset, sz, valueAddr.Offset)
 		default:
 			p.errorf("bad int size for DATA argument: %d", sz)
 		}
@@ -257,10 +263,10 @@ func (p *Parser) asmData(operands [][]lex.Token) {
 			p.errorf("bad float size for DATA argument: %d", sz)
 		}
 	case obj.TYPE_SCONST:
-		nameAddr.Sym.WriteString(p.ctxt, nameAddr.Offset, int(sz), valueAddr.Val.(string))
+		nameAddr.Sym.WriteString(p.ctxt, nameAddr.Offset, sz, valueAddr.Val.(string))
 	case obj.TYPE_ADDR:
 		if sz == p.arch.PtrSize {
-			nameAddr.Sym.WriteAddr(p.ctxt, nameAddr.Offset, int(sz), valueAddr.Sym, valueAddr.Offset)
+			nameAddr.Sym.WriteAddr(p.ctxt, nameAddr.Offset, sz, valueAddr.Sym, valueAddr.Offset)
 		} else {
 			p.errorf("bad addr size for DATA argument: %d", sz)
 		}
@@ -348,6 +354,7 @@ func (p *Parser) asmPCAlign(operands [][]lex.Token) {
 	prog := &obj.Prog{
 		Ctxt: p.ctxt,
 		As:   obj.APCALIGN,
+		Pos:  p.pos(),
 		From: key,
 	}
 	p.append(prog, "", true)
@@ -587,6 +594,10 @@ func (p *Parser) branch(addr *obj.Addr, target *obj.Prog) {
 	addr.Val = target
 }
 
+func isARM64SVE(op obj.As) bool {
+	return op > arm64.ASVESTART
+}
+
 // asmInstruction assembles an instruction.
 // MOVW R9, (R10)
 func (p *Parser) asmInstruction(op obj.As, cond string, a []obj.Addr) {
@@ -637,12 +648,6 @@ func (p *Parser) asmInstruction(op obj.As, cond string, a []obj.Addr) {
 				break
 			}
 		} else if p.arch.Family == sys.Loong64 {
-			if arch.IsLoong64CMP(op) {
-				prog.From = a[0]
-				prog.Reg = p.getRegister(prog, op, &a[1])
-				break
-			}
-
 			if arch.IsLoong64RDTIME(op) {
 				// The Loong64 RDTIME family of instructions is a bit special,
 				// in that both its register operands are outputs
@@ -652,6 +657,31 @@ func (p *Parser) asmInstruction(op obj.As, cond string, a []obj.Addr) {
 					return
 				}
 				prog.RegTo2 = a[1].Reg
+				break
+			}
+
+			if arch.IsLoong64PRELD(op) {
+				prog.From = a[0]
+				prog.AddRestSource(a[1])
+				break
+			}
+		} else if p.arch.Family == sys.RISCV64 {
+			// RISCV64 pseudo instructions that reference CSRs with symbolic names.
+			if isImm, specialIndex, ok := arch.IsRISCV64PseudoCSRO(op); ok {
+				if a[0].Type != obj.TYPE_CONST && isImm {
+					p.errorf("invalid value for first operand to %s instruction, must be a 5 bit unsigned immediate", op)
+					return
+				}
+				if a[specialIndex].Type != obj.TYPE_SPECIAL {
+					p.errorf("invalid value for first or second operand to %s instruction, must be a CSR name", op)
+					return
+				}
+				prog.AddRestSourceArgs([]obj.Addr{a[specialIndex]})
+				if specialIndex == 0 {
+					prog.To = a[1]
+				} else {
+					prog.From = a[0]
+				}
 				break
 			}
 		}
@@ -664,9 +694,22 @@ func (p *Parser) asmInstruction(op obj.As, cond string, a []obj.Addr) {
 			prog.Reg = p.getRegister(prog, op, &a[1])
 			prog.To = a[2]
 		case sys.Loong64:
-			prog.From = a[0]
-			prog.Reg = p.getRegister(prog, op, &a[1])
-			prog.To = a[2]
+			switch {
+			// Loong64 atomic instructions with one input and two outputs.
+			case arch.IsLoong64AMO(op):
+				prog.From = a[0]
+				prog.To = a[1]
+				prog.RegTo2 = a[2].Reg
+
+			case arch.IsLoong64PRELD(op):
+				prog.From = a[0]
+				prog.AddRestSourceArgs([]obj.Addr{a[1], a[2]})
+
+			default:
+				prog.From = a[0]
+				prog.Reg = p.getRegister(prog, op, &a[1])
+				prog.To = a[2]
+			}
 		case sys.ARM:
 			// Special cases.
 			if arch.IsARMSTREX(op) {
@@ -722,6 +765,11 @@ func (p *Parser) asmInstruction(op obj.As, cond string, a []obj.Addr) {
 				// For ARM64 CASP-like instructions, its 2nd destination operand is register pair(Rt, Rt+1) that can
 				// not fit into prog.RegTo2, so save it to the prog.RestArgs.
 				prog.AddRestDest(a[2])
+			case isARM64SVE(op):
+				// SVE instructions, see arm64/goops_gen.go
+				prog.From = a[0]
+				prog.AddRestSource(a[1])
+				prog.To = a[2]
 			default:
 				prog.From = a[0]
 				prog.Reg = p.getRegister(prog, op, &a[1])
@@ -761,6 +809,21 @@ func (p *Parser) asmInstruction(op obj.As, cond string, a []obj.Addr) {
 					return
 				}
 				prog.RegTo2 = a[2].Reg
+				break
+			}
+			// RISCV64 instructions that reference CSRs with symbolic names.
+			if isImm, ok := arch.IsRISCV64CSRO(op); ok {
+				if a[0].Type != obj.TYPE_CONST && isImm {
+					p.errorf("invalid value for first operand to %s instruction, must be a 5 bit unsigned immediate", op)
+					return
+				}
+				if a[1].Type != obj.TYPE_SPECIAL {
+					p.errorf("invalid value for second operand to %s instruction, must be a CSR name", op)
+					return
+				}
+				prog.AddRestSourceArgs([]obj.Addr{a[1]})
+				prog.From = a[0]
+				prog.To = a[2]
 				break
 			}
 			prog.From = a[0]
@@ -809,6 +872,20 @@ func (p *Parser) asmInstruction(op obj.As, cond string, a []obj.Addr) {
 			break
 		}
 		if p.arch.Family == sys.ARM64 {
+			if isARM64SVE(op) {
+				// SVE instructions, see arm64/goops_gen.go
+				prog.From = a[0]
+				prog.AddRestSourceArgs([]obj.Addr{a[1], a[2]})
+				prog.To = a[3]
+				break
+			}
+			prog.From = a[0]
+			prog.Reg = p.getRegister(prog, op, &a[1])
+			prog.AddRestSource(a[2])
+			prog.To = a[3]
+			break
+		}
+		if p.arch.Family == sys.Loong64 {
 			prog.From = a[0]
 			prog.Reg = p.getRegister(prog, op, &a[1])
 			prog.AddRestSource(a[2])
@@ -850,6 +927,13 @@ func (p *Parser) asmInstruction(op obj.As, cond string, a []obj.Addr) {
 		p.errorf("can't handle %s instruction with 4 operands", op)
 		return
 	case 5:
+		if p.arch.Family == sys.ARM64 && isARM64SVE(op) {
+			// SVE instructions, see arm64/goops_gen.go
+			prog.From = a[0]
+			prog.AddRestSourceArgs([]obj.Addr{a[1], a[2], a[3]})
+			prog.To = a[4]
+			break
+		}
 		if p.arch.Family == sys.PPC64 {
 			prog.From = a[0]
 			// Second arg is always a register type on ppc64.
@@ -873,6 +957,13 @@ func (p *Parser) asmInstruction(op obj.As, cond string, a []obj.Addr) {
 		p.errorf("can't handle %s instruction with 5 operands", op)
 		return
 	case 6:
+		if p.arch.Family == sys.ARM64 && isARM64SVE(op) {
+			// SVE instructions, see arm64/goops_gen.go
+			prog.From = a[0]
+			prog.AddRestSourceArgs([]obj.Addr{a[1], a[2], a[3], a[4]})
+			prog.To = a[5]
+			break
+		}
 		if p.arch.Family == sys.ARM && arch.IsARMMRC(op) {
 			// Strange special case: MCR, MRC.
 			prog.To.Type = obj.TYPE_CONST
@@ -897,6 +988,19 @@ func (p *Parser) asmInstruction(op obj.As, cond string, a []obj.Addr) {
 			// Second arg is always a register type on ppc64.
 			prog.Reg = p.getRegister(prog, op, &a[1])
 			prog.AddRestSourceArgs([]obj.Addr{a[2], a[3], a[4]})
+			prog.To = a[5]
+			break
+		}
+		if p.arch.Family == sys.RISCV64 && arch.IsRISCV64VTypeI(op) {
+			prog.From = a[0]
+			vsew := p.getSpecial(prog, op, &a[1])
+			vlmul := p.getSpecial(prog, op, &a[2])
+			vtail := p.getSpecial(prog, op, &a[3])
+			vmask := p.getSpecial(prog, op, &a[4])
+			if err := arch.RISCV64ValidateVectorType(vsew, vlmul, vtail, vmask); err != nil {
+				p.errorf("invalid vtype: %v", err)
+			}
+			prog.AddRestSourceArgs([]obj.Addr{a[1], a[2], a[3], a[4]})
 			prog.To = a[5]
 			break
 		}
@@ -935,18 +1039,18 @@ func (p *Parser) getConstant(prog *obj.Prog, op obj.As, addr *obj.Addr) int64 {
 	return addr.Offset
 }
 
-// getImmediate checks that addr represents an immediate constant and returns its value.
-func (p *Parser) getImmediate(prog *obj.Prog, op obj.As, addr *obj.Addr) int64 {
-	if addr.Type != obj.TYPE_CONST || addr.Name != 0 || addr.Reg != 0 || addr.Index != 0 {
-		p.errorf("%s: expected immediate constant; found %s", op, obj.Dconv(prog, addr))
-	}
-	return addr.Offset
-}
-
 // getRegister checks that addr represents a register and returns its value.
 func (p *Parser) getRegister(prog *obj.Prog, op obj.As, addr *obj.Addr) int16 {
 	if addr.Type != obj.TYPE_REG || addr.Offset != 0 || addr.Name != 0 || addr.Index != 0 {
 		p.errorf("%s: expected register; found %s", op, obj.Dconv(prog, addr))
 	}
 	return addr.Reg
+}
+
+// getSpecial checks that addr represents a special operand and returns its value.
+func (p *Parser) getSpecial(prog *obj.Prog, op obj.As, addr *obj.Addr) int64 {
+	if addr.Type != obj.TYPE_SPECIAL || addr.Name != 0 || addr.Reg != 0 || addr.Index != 0 {
+		p.errorf("%s: expected special operand; found %s", op, obj.Dconv(prog, addr))
+	}
+	return addr.Offset
 }

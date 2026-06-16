@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -24,15 +25,16 @@ var tmp = flag.String("tmp", "", "use `dir` for temporary files and do not clean
 
 // ptrTest is the tests without the boilerplate.
 type ptrTest struct {
-	name      string   // for reporting
-	c         string   // the cgo comment
-	c1        string   // cgo comment forced into non-export cgo file
-	imports   []string // a list of imports
-	support   string   // supporting functions
-	body      string   // the body of the main function
-	extra     []extra  // extra files
-	fail      bool     // whether the test should fail
-	expensive bool     // whether the test requires the expensive check
+	name          string   // for reporting
+	c             string   // the cgo comment
+	c1            string   // cgo comment forced into non-export cgo file
+	imports       []string // a list of imports
+	support       string   // supporting functions
+	body          string   // the body of the main function
+	extra         []extra  // extra files
+	fail          bool     // whether the test should fail
+	expensive     bool     // whether the test requires the expensive check
+	errTextRegexp string   // error text regexp; if empty, use the pattern `.*unpinned Go.*`
 }
 
 type extra struct {
@@ -472,6 +474,44 @@ var ptrTests = []ptrTest{
 		body:    `s := struct { a [4]byte; p *int }{p: new(int)}; C.f43(unsafe.Pointer(unsafe.SliceData(s.a[:])))`,
 		fail:    false,
 	},
+	{
+		// Passing the address of an element of a pointer-to-array.
+		name:    "arraypointer",
+		c:       `void f44(void* p) {}`,
+		imports: []string{"unsafe"},
+		body:    `a := new([10]byte); C.f44(unsafe.Pointer(&a[0]))`,
+		fail:    false,
+	},
+	{
+		// Passing the address of an element of a pointer-to-array
+		// that contains a Go pointer.
+		name:    "arraypointer2",
+		c:       `void f45(void** p) {}`,
+		imports: []string{"unsafe"},
+		body:    `i := 0; a := &[2]unsafe.Pointer{nil, unsafe.Pointer(&i)}; C.f45(&a[0])`,
+		fail:    true,
+	},
+	{
+		// Passing a Go map as argument to C.
+		name:          "argmap",
+		c:             `void f46(void* p) {}`,
+		imports:       []string{"unsafe"},
+		body:          `m := map[int]int{0: 1,}; C.f46(unsafe.Pointer(&m))`,
+		fail:          true,
+		errTextRegexp: `.*argument of cgo function has Go pointer to unpinned Go map`,
+	},
+	{
+		// Returning a Go map to C.
+		name: "retmap",
+		c:    `extern void f47();`,
+		support: `//export GoMap47
+		          func GoMap47() map[int]int { return map[int]int{0: 1,} }`,
+		body: `C.f47()`,
+		c1: `extern void* GoMap47();
+		     void f47() { GoMap47(); }`,
+		fail:          true,
+		errTextRegexp: `.*result of Go function GoMap47 called from cgo is unpinned Go map or points to unpinned Go map.*`,
+	},
 }
 
 func TestPointerChecks(t *testing.T) {
@@ -502,7 +542,6 @@ func TestPointerChecks(t *testing.T) {
 	// after testOne finishes.
 	var pending int32
 	for _, pt := range ptrTests {
-		pt := pt
 		t.Run(pt.name, func(t *testing.T) {
 			atomic.AddInt32(&pending, +1)
 			defer func() {
@@ -592,7 +631,7 @@ func buildPtrTests(t *testing.T, gopath string, cgocheck2 bool) (exe string) {
 	if cgocheck2 {
 		exeName = "ptrtest2.exe"
 	}
-	cmd := exec.Command("go", "build", "-o", exeName)
+	cmd := exec.Command(testenv.GoToolPath(t), "build", "-o", exeName)
 	cmd.Dir = src
 	cmd.Env = append(os.Environ(), "GOPATH="+gopath)
 
@@ -607,7 +646,7 @@ func buildPtrTests(t *testing.T, gopath string, cgocheck2 bool) (exe string) {
 		goexperiment = append(goexperiment, "cgocheck2")
 		changed = true
 	} else if !cgocheck2 && i >= 0 {
-		goexperiment = append(goexperiment[:i], goexperiment[i+1:]...)
+		goexperiment = slices.Delete(goexperiment, i, i+1)
 		changed = true
 	}
 	if changed {
@@ -673,11 +712,17 @@ func testOne(t *testing.T, pt ptrTest, exe, exe2 string) {
 	}
 
 	buf, err := runcmd(cgocheck)
+
+	var pattern string = pt.errTextRegexp
+	if pt.errTextRegexp == "" {
+		pattern = `.*unpinned Go.*`
+	}
+
 	if pt.fail {
 		if err == nil {
 			t.Logf("%s", buf)
 			t.Fatalf("did not fail as expected")
-		} else if !bytes.Contains(buf, []byte("Go pointer")) {
+		} else if ok, _ := regexp.Match(pattern, buf); !ok {
 			t.Logf("%s", buf)
 			t.Fatalf("did not print expected error (failed with %v)", err)
 		}

@@ -12,11 +12,11 @@ import (
 	"cmd/internal/dwarf"
 	"cmd/internal/obj"
 	"cmd/internal/src"
-	"encoding/hex"
+	"cmp"
 	"fmt"
 	"internal/buildcfg"
 	"math/bits"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -34,15 +34,30 @@ type FuncDebug struct {
 	// The slots that make up each variable, indexed by VarID.
 	VarSlots [][]SlotID
 	// The location list data, indexed by VarID. Must be processed by PutLocationList.
-	LocationLists [][]byte
+	LocationLists [][]LocListEntry
 	// Register-resident output parameters for the function. This is filled in at
 	// SSA generation time.
 	RegOutputParams []*ir.Name
 	// Variable declarations that were removed during optimization
 	OptDcl []*ir.Name
+	// The ssa.Func.EntryID value, used to build location lists for
+	// return values promoted to heap in later DWARF generation.
+	EntryID ID
 
 	// Filled in by the user. Translates Block and Value ID to PC.
-	GetPC func(ID, ID) int64
+	//
+	// NOTE: block is only used if value is BlockStart.ID or BlockEnd.ID.
+	// Otherwise, it is ignored.
+	GetPC func(block, value ID) int64
+}
+
+// LocListEntry represents a single entry in a location list.
+// StartBlock/StartValue and EndBlock/EndValue are SSA coordinates
+// that get resolved to PCs during final encoding.
+type LocListEntry struct {
+	StartBlock, StartValue ID
+	EndBlock, EndValue     ID
+	Expr                   []byte // DWARF location expression (DW_OP_*)
 }
 
 type BlockDebug struct {
@@ -70,10 +85,6 @@ func (ls *liveSlot) String() string {
 	return fmt.Sprintf("0x%x.%d.%d", ls.Registers, ls.stackOffsetValue(), int32(ls.StackOffset)&1)
 }
 
-func (loc liveSlot) absent() bool {
-	return loc.Registers == 0 && !loc.onStack()
-}
-
 // StackOffset encodes whether a value is on the stack and if so, where.
 // It is a 31-bit integer followed by a presence flag at the low-order
 // bit.
@@ -98,9 +109,7 @@ type stateAtPC struct {
 // reset fills state with the live variables from live.
 func (state *stateAtPC) reset(live abt.T) {
 	slots, registers := state.slots, state.registers
-	for i := range slots {
-		slots[i] = VarLoc{}
-	}
+	clear(slots)
 	for i := range registers {
 		registers[i] = registers[i][:0]
 	}
@@ -194,7 +203,7 @@ type RegisterSet uint64
 // logf prints debug-specific logging to stdout (always stdout) if the
 // current function is tagged by GOSSAFUNC (for ssa output directed
 // either to stdout or html).
-func (s *debugState) logf(msg string, args ...interface{}) {
+func (s *debugState) logf(msg string, args ...any) {
 	if s.f.PrintOrHtmlSSA {
 		fmt.Printf(msg, args...)
 	}
@@ -205,7 +214,7 @@ type debugState struct {
 	slots    []LocalSlot
 	vars     []*ir.Name
 	varSlots [][]SlotID
-	lists    [][]byte
+	lists    [][]LocListEntry
 
 	// The user variable that each slot rolls up to, indexed by SlotID.
 	slotVars []VarID
@@ -228,10 +237,9 @@ type debugState struct {
 	// The pending location list entry for each user variable, indexed by VarID.
 	pendingEntries []pendingEntry
 
-	varParts         map[*ir.Name][]SlotID
-	blockDebug       []BlockDebug
-	pendingSlotLocs  []VarLoc
-	partsByVarOffset sort.Interface
+	varParts        map[*ir.Name][]SlotID
+	blockDebug      []BlockDebug
+	pendingSlotLocs []VarLoc
 }
 
 func (state *debugState) initializeCache(f *Func, numVars, numSlots int) {
@@ -239,12 +247,7 @@ func (state *debugState) initializeCache(f *Func, numVars, numSlots int) {
 	if cap(state.blockDebug) < f.NumBlocks() {
 		state.blockDebug = make([]BlockDebug, f.NumBlocks())
 	} else {
-		// This local variable, and the ones like it below, enable compiler
-		// optimizations. Don't inline them.
-		b := state.blockDebug[:f.NumBlocks()]
-		for i := range b {
-			b[i] = BlockDebug{}
-		}
+		clear(state.blockDebug[:f.NumBlocks()])
 	}
 
 	// A list of slots per Value. Reuse the previous child slices.
@@ -282,10 +285,7 @@ func (state *debugState) initializeCache(f *Func, numVars, numSlots int) {
 	if cap(state.pendingSlotLocs) < numPieces {
 		state.pendingSlotLocs = make([]VarLoc, numPieces)
 	} else {
-		psl := state.pendingSlotLocs[:numPieces]
-		for i := range psl {
-			psl[i] = VarLoc{}
-		}
+		clear(state.pendingSlotLocs[:numPieces])
 	}
 	if cap(state.pendingEntries) < numVars {
 		state.pendingEntries = make([]pendingEntry, numVars)
@@ -301,12 +301,10 @@ func (state *debugState) initializeCache(f *Func, numVars, numSlots int) {
 	state.pendingEntries = pe
 
 	if cap(state.lists) < numVars {
-		state.lists = make([][]byte, numVars)
+		state.lists = make([][]LocListEntry, numVars)
 	} else {
 		state.lists = state.lists[:numVars]
-		for i := range state.lists {
-			state.lists[i] = nil
-		}
+		clear(state.lists)
 	}
 }
 
@@ -519,7 +517,7 @@ func PopulateABIInRegArgOps(f *Func) {
 		if !isNamedRegParam(inp) {
 			continue
 		}
-		n := inp.Name.(*ir.Name)
+		n := inp.Name
 
 		// Param is spread across one or more registers. Walk through
 		// each piece to see whether we've seen an arg reg op for it.
@@ -554,7 +552,7 @@ func PopulateABIInRegArgOps(f *Func) {
 	f.Entry.Values = append(newValues, f.Entry.Values...)
 }
 
-// BuildFuncDebug debug information for f, placing the results
+// BuildFuncDebug builds debug information for f, placing the results
 // in "rval". f must be fully processed, so that each Value is where it
 // will be when machine code is emitted.
 func BuildFuncDebug(ctxt *obj.Link, f *Func, loggingLevel int, stackOffset func(LocalSlot) int32, rval *FuncDebug) {
@@ -585,9 +583,7 @@ func BuildFuncDebug(ctxt *obj.Link, f *Func, loggingLevel int, stackOffset func(
 	if state.varParts == nil {
 		state.varParts = make(map[*ir.Name][]SlotID)
 	} else {
-		for n := range state.varParts {
-			delete(state.varParts, n)
-		}
+		clear(state.varParts)
 	}
 
 	// Recompose any decomposed variables, and establish the canonical
@@ -597,7 +593,7 @@ func BuildFuncDebug(ctxt *obj.Link, f *Func, loggingLevel int, stackOffset func(
 	state.vars = state.vars[:0]
 	for i, slot := range f.Names {
 		state.slots = append(state.slots, *slot)
-		if ir.IsSynthetic(slot.N) {
+		if ir.IsSynthetic(slot.N) || !IsVarWantedForDebug(slot.N) {
 			continue
 		}
 
@@ -617,7 +613,7 @@ func BuildFuncDebug(ctxt *obj.Link, f *Func, loggingLevel int, stackOffset func(
 		for _, v := range b.Values {
 			if v.Op == OpVarDef {
 				n := v.Aux.(*ir.Name)
-				if ir.IsSynthetic(n) {
+				if ir.IsSynthetic(n) || !IsVarWantedForDebug(n) {
 					continue
 				}
 
@@ -646,23 +642,22 @@ func BuildFuncDebug(ctxt *obj.Link, f *Func, loggingLevel int, stackOffset func(
 		state.slotVars = state.slotVars[:len(state.slots)]
 	}
 
-	if state.partsByVarOffset == nil {
-		state.partsByVarOffset = &partsByVarOffset{}
-	}
 	for varID, n := range state.vars {
 		parts := state.varParts[n]
+		slices.SortFunc(parts, func(a, b SlotID) int {
+			return cmp.Compare(varOffset(state.slots[a]), varOffset(state.slots[b]))
+		})
+
 		state.varSlots[varID] = parts
 		for _, slotID := range parts {
 			state.slotVars[slotID] = VarID(varID)
 		}
-		*state.partsByVarOffset.(*partsByVarOffset) = partsByVarOffset{parts, state.slots}
-		sort.Sort(state.partsByVarOffset)
 	}
 
 	state.initializeCache(f, len(state.varParts), len(state.slots))
 
 	for i, slot := range f.Names {
-		if ir.IsSynthetic(slot.N) {
+		if ir.IsSynthetic(slot.N) || !IsVarWantedForDebug(slot.N) {
 			continue
 		}
 		for _, value := range f.NamedValues[*slot] {
@@ -1056,13 +1051,13 @@ func (state *debugState) processValue(v *Value, vSlots []SlotID, vReg *Register)
 	// Handle any register clobbering. Call operations, for example,
 	// clobber all registers even though they don't explicitly write to
 	// them.
-	clobbers := uint64(opcodeTable[v.Op].reg.clobbers)
+	clobbers := opcodeTable[v.Op].reg.clobbers
 	for {
-		if clobbers == 0 {
+		if clobbers.empty() {
 			break
 		}
-		reg := uint8(bits.TrailingZeros64(clobbers))
-		clobbers &^= 1 << reg
+		reg := clobbers.pickReg()
+		clobbers = clobbers.removeReg(reg)
 
 		for _, slot := range locs.registers[reg] {
 			if state.loggingLevel > 1 {
@@ -1084,7 +1079,7 @@ func (state *debugState) processValue(v *Value, vSlots []SlotID, vReg *Register)
 	switch {
 	case v.Op == OpVarDef:
 		n := v.Aux.(*ir.Name)
-		if ir.IsSynthetic(n) {
+		if ir.IsSynthetic(n) || !IsVarWantedForDebug(n) {
 			break
 		}
 
@@ -1177,17 +1172,6 @@ func varOffset(slot LocalSlot) int64 {
 	return offset
 }
 
-type partsByVarOffset struct {
-	slotIDs []SlotID
-	slots   []LocalSlot
-}
-
-func (a partsByVarOffset) Len() int { return len(a.slotIDs) }
-func (a partsByVarOffset) Less(i, j int) bool {
-	return varOffset(a.slots[a.slotIDs[i]]) < varOffset(a.slots[a.slotIDs[j]])
-}
-func (a partsByVarOffset) Swap(i, j int) { a.slotIDs[i], a.slotIDs[j] = a.slotIDs[j], a.slotIDs[i] }
-
 // A pendingEntry represents the beginning of a location list entry, missing
 // only its end coordinate.
 type pendingEntry struct {
@@ -1202,9 +1186,7 @@ func (e *pendingEntry) clear() {
 	e.present = false
 	e.startBlock = 0
 	e.startValue = 0
-	for i := range e.pieces {
-		e.pieces[i] = VarLoc{}
-	}
+	clear(e.pieces)
 }
 
 // canMerge reports whether a new location description is a superset
@@ -1368,13 +1350,13 @@ func (state *debugState) buildLocationLists(blockLocs []*BlockDebug) {
 
 	// Flush any leftover entries live at the end of the last block.
 	for varID := range state.lists {
-		state.writePendingEntry(VarID(varID), state.f.Blocks[len(state.f.Blocks)-1].ID, FuncEnd.ID)
+		state.writePendingEntry(VarID(varID), -1, FuncEnd.ID)
 		list := state.lists[varID]
 		if state.loggingLevel > 0 {
 			if len(list) == 0 {
 				state.logf("\t%v : empty list\n", state.vars[varID])
 			} else {
-				state.logf("\t%v : %q\n", state.vars[varID], hex.EncodeToString(state.lists[varID]))
+				state.logf("\t%v : %d entries\n", state.vars[varID], len(list))
 			}
 		}
 	}
@@ -1431,31 +1413,13 @@ func (state *debugState) writePendingEntry(varID VarID, endBlock, endValue ID) {
 		return
 	}
 
-	// Pack the start/end coordinates into the start/end addresses
-	// of the entry, for decoding by PutLocationList.
-	start, startOK := encodeValue(state.ctxt, pending.startBlock, pending.startValue)
-	end, endOK := encodeValue(state.ctxt, endBlock, endValue)
-	if !startOK || !endOK {
-		// If someone writes a function that uses >65K values,
-		// they get incomplete debug info on 32-bit platforms.
-		return
-	}
-	if start == end {
+	// Skip zero-width entries where start and end coordinates are identical.
+	if pending.startBlock == endBlock && pending.startValue == endValue {
 		if state.loggingLevel > 1 {
-			// Printf not logf so not gated by GOSSAFUNC; this should fire very rarely.
-			// TODO this fires a lot, need to figure out why.
 			state.logf("Skipping empty location list for %v in %s\n", state.vars[varID], state.f.Name)
 		}
 		return
 	}
-
-	list := state.lists[varID]
-	list = appendPtr(state.ctxt, list, start)
-	list = appendPtr(state.ctxt, list, end)
-	// Where to write the length of the location description once
-	// we know how big it is.
-	sizeIdx := len(list)
-	list = list[:len(list)+2]
 
 	if state.loggingLevel > 1 {
 		var partStrs []string
@@ -1465,6 +1429,8 @@ func (state *debugState) writePendingEntry(varID VarID, endBlock, endValue ID) {
 		state.logf("Add entry for %v: \tb%vv%v-b%vv%v = \t%v\n", state.vars[varID], pending.startBlock, pending.startValue, endBlock, endValue, strings.Join(partStrs, " "))
 	}
 
+	// Build the DWARF location expression.
+	var expr []byte
 	for i, slotID := range state.varSlots[varID] {
 		loc := pending.pieces[i]
 		slot := state.slots[slotID]
@@ -1472,33 +1438,86 @@ func (state *debugState) writePendingEntry(varID VarID, endBlock, endValue ID) {
 		if !loc.absent() {
 			if loc.onStack() {
 				if loc.stackOffsetValue() == 0 {
-					list = append(list, dwarf.DW_OP_call_frame_cfa)
+					expr = append(expr, dwarf.DW_OP_call_frame_cfa)
 				} else {
-					list = append(list, dwarf.DW_OP_fbreg)
-					list = dwarf.AppendSleb128(list, int64(loc.stackOffsetValue()))
+					expr = append(expr, dwarf.DW_OP_fbreg)
+					expr = dwarf.AppendSleb128(expr, int64(loc.stackOffsetValue()))
 				}
 			} else {
 				regnum := state.ctxt.Arch.DWARFRegisters[state.registers[firstReg(loc.Registers)].ObjNum()]
 				if regnum < 32 {
-					list = append(list, dwarf.DW_OP_reg0+byte(regnum))
+					expr = append(expr, dwarf.DW_OP_reg0+byte(regnum))
 				} else {
-					list = append(list, dwarf.DW_OP_regx)
-					list = dwarf.AppendUleb128(list, uint64(regnum))
+					expr = append(expr, dwarf.DW_OP_regx)
+					expr = dwarf.AppendUleb128(expr, uint64(regnum))
 				}
 			}
 		}
 
 		if len(state.varSlots[varID]) > 1 {
-			list = append(list, dwarf.DW_OP_piece)
-			list = dwarf.AppendUleb128(list, uint64(slot.Type.Size()))
+			expr = append(expr, dwarf.DW_OP_piece)
+			expr = dwarf.AppendUleb128(expr, uint64(slot.Type.Size()))
 		}
 	}
-	state.ctxt.Arch.ByteOrder.PutUint16(list[sizeIdx:], uint16(len(list)-sizeIdx-2))
-	state.lists[varID] = list
+
+	entry := LocListEntry{
+		StartBlock: pending.startBlock,
+		StartValue: pending.startValue,
+		EndBlock:   endBlock,
+		EndValue:   endValue,
+		Expr:       expr,
+	}
+	state.lists[varID] = append(state.lists[varID], entry)
 }
 
-// PutLocationList adds list (a location list in its intermediate representation) to listSym.
-func (debugInfo *FuncDebug) PutLocationList(list []byte, ctxt *obj.Link, listSym, startPC *obj.LSym) {
+// PutLocationList adds entries (a location list in structured form)
+// to listSym, encoding it in the appropriate DWARF format.
+func (debugInfo *FuncDebug) PutLocationList(entries []LocListEntry, ctxt *obj.Link, listSym, startPC *obj.LSym) {
+	if buildcfg.Experiment.Dwarf5 {
+		debugInfo.PutLocationListDwarf5(entries, ctxt, listSym, startPC)
+	} else {
+		debugInfo.PutLocationListDwarf4(entries, ctxt, listSym, startPC)
+	}
+}
+
+// PutLocationListDwarf5 adds entries (a location list in structured form)
+// to listSym in DWARF 5 format.
+func (debugInfo *FuncDebug) PutLocationListDwarf5(entries []LocListEntry, ctxt *obj.Link, listSym, startPC *obj.LSym) {
+	getPC := debugInfo.GetPC
+
+	// base address entry
+	listSym.WriteInt(ctxt, listSym.Size, 1, dwarf.DW_LLE_base_addressx)
+	listSym.WriteDwTxtAddrx(ctxt, listSym.Size, startPC, ctxt.DwTextCount*2)
+
+	var stbuf, enbuf [10]byte
+	for _, entry := range entries {
+		begin := getPC(entry.StartBlock, entry.StartValue)
+		end := getPC(entry.EndBlock, entry.EndValue)
+
+		// Write LLE_offset_pair tag followed by payload (ULEB for start
+		// and then end).
+		listSym.WriteInt(ctxt, listSym.Size, 1, dwarf.DW_LLE_offset_pair)
+		stb := stbuf[:0]
+		enb := enbuf[:0]
+		stb = dwarf.AppendUleb128(stb, uint64(begin))
+		enb = dwarf.AppendUleb128(enb, uint64(end))
+		listSym.WriteBytes(ctxt, listSym.Size, stb)
+		listSym.WriteBytes(ctxt, listSym.Size, enb)
+
+		// DWARF5 uses ULEB128-encoded length for the location expression.
+		stb = stbuf[:0]
+		stb = dwarf.AppendUleb128(stb, uint64(len(entry.Expr)))
+		listSym.WriteBytes(ctxt, listSym.Size, stb)
+		listSym.WriteBytes(ctxt, listSym.Size, entry.Expr)
+	}
+
+	// Terminator
+	listSym.WriteInt(ctxt, listSym.Size, 1, dwarf.DW_LLE_end_of_list)
+}
+
+// PutLocationListDwarf4 adds entries (a location list in structured form)
+// to listSym in DWARF 4 format.
+func (debugInfo *FuncDebug) PutLocationListDwarf4(entries []LocListEntry, ctxt *obj.Link, listSym, startPC *obj.LSym) {
 	getPC := debugInfo.GetPC
 
 	if ctxt.UseBASEntries {
@@ -1506,10 +1525,9 @@ func (debugInfo *FuncDebug) PutLocationList(list []byte, ctxt *obj.Link, listSym
 		listSym.WriteAddr(ctxt, listSym.Size, ctxt.Arch.PtrSize, startPC, 0)
 	}
 
-	// Re-read list, translating its address from block/value ID to PC.
-	for i := 0; i < len(list); {
-		begin := getPC(decodeValue(ctxt, readPtr(ctxt, list[i:])))
-		end := getPC(decodeValue(ctxt, readPtr(ctxt, list[i+ctxt.Arch.PtrSize:])))
+	for _, entry := range entries {
+		begin := getPC(entry.StartBlock, entry.StartValue)
+		end := getPC(entry.EndBlock, entry.EndValue)
 
 		// Horrible hack. If a range contains only zero-width
 		// instructions, e.g. an Arg, and it's at the beginning of the
@@ -1520,123 +1538,28 @@ func (debugInfo *FuncDebug) PutLocationList(list []byte, ctxt *obj.Link, listSym
 		}
 
 		if ctxt.UseBASEntries {
-			listSym.WriteInt(ctxt, listSym.Size, ctxt.Arch.PtrSize, int64(begin))
-			listSym.WriteInt(ctxt, listSym.Size, ctxt.Arch.PtrSize, int64(end))
+			listSym.WriteInt(ctxt, listSym.Size, ctxt.Arch.PtrSize, begin)
+			listSym.WriteInt(ctxt, listSym.Size, ctxt.Arch.PtrSize, end)
 		} else {
-			listSym.WriteCURelativeAddr(ctxt, listSym.Size, startPC, int64(begin))
-			listSym.WriteCURelativeAddr(ctxt, listSym.Size, startPC, int64(end))
+			listSym.WriteCURelativeAddr(ctxt, listSym.Size, startPC, begin)
+			listSym.WriteCURelativeAddr(ctxt, listSym.Size, startPC, end)
 		}
 
-		i += 2 * ctxt.Arch.PtrSize
-		datalen := 2 + int(ctxt.Arch.ByteOrder.Uint16(list[i:]))
-		listSym.WriteBytes(ctxt, listSym.Size, list[i:i+datalen]) // copy datalen and location encoding
-		i += datalen
+		// Write 2-byte length prefix followed by the location expression.
+		listSym.WriteInt(ctxt, listSym.Size, 2, int64(len(entry.Expr)))
+		listSym.WriteBytes(ctxt, listSym.Size, entry.Expr)
 	}
 
-	// Location list contents, now with real PCs.
 	// End entry.
 	listSym.WriteInt(ctxt, listSym.Size, ctxt.Arch.PtrSize, 0)
 	listSym.WriteInt(ctxt, listSym.Size, ctxt.Arch.PtrSize, 0)
 }
 
-// Pack a value and block ID into an address-sized uint, returning
-// encoded value and boolean indicating whether the encoding succeeded.
-// For 32-bit architectures the process may fail for very large
-// procedures(the theory being that it's ok to have degraded debug
-// quality in this case).
-func encodeValue(ctxt *obj.Link, b, v ID) (uint64, bool) {
-	if ctxt.Arch.PtrSize == 8 {
-		result := uint64(b)<<32 | uint64(uint32(v))
-		//ctxt.Logf("b %#x (%d) v %#x (%d) -> %#x\n", b, b, v, v, result)
-		return result, true
-	}
-	if ctxt.Arch.PtrSize != 4 {
-		panic("unexpected pointer size")
-	}
-	if ID(int16(b)) != b || ID(int16(v)) != v {
-		return 0, false
-	}
-	return uint64(b)<<16 | uint64(uint16(v)), true
-}
-
-// Unpack a value and block ID encoded by encodeValue.
-func decodeValue(ctxt *obj.Link, word uint64) (ID, ID) {
-	if ctxt.Arch.PtrSize == 8 {
-		b, v := ID(word>>32), ID(word)
-		//ctxt.Logf("%#x -> b %#x (%d) v %#x (%d)\n", word, b, b, v, v)
-		return b, v
-	}
-	if ctxt.Arch.PtrSize != 4 {
-		panic("unexpected pointer size")
-	}
-	return ID(word >> 16), ID(int16(word))
-}
-
-// Append a pointer-sized uint to buf.
-func appendPtr(ctxt *obj.Link, buf []byte, word uint64) []byte {
-	if cap(buf) < len(buf)+20 {
-		b := make([]byte, len(buf), 20+cap(buf)*2)
-		copy(b, buf)
-		buf = b
-	}
-	writeAt := len(buf)
-	buf = buf[0 : len(buf)+ctxt.Arch.PtrSize]
-	writePtr(ctxt, buf[writeAt:], word)
-	return buf
-}
-
-// Write a pointer-sized uint to the beginning of buf.
-func writePtr(ctxt *obj.Link, buf []byte, word uint64) {
-	switch ctxt.Arch.PtrSize {
-	case 4:
-		ctxt.Arch.ByteOrder.PutUint32(buf, uint32(word))
-	case 8:
-		ctxt.Arch.ByteOrder.PutUint64(buf, word)
-	default:
-		panic("unexpected pointer size")
-	}
-
-}
-
-// Read a pointer-sized uint from the beginning of buf.
-func readPtr(ctxt *obj.Link, buf []byte) uint64 {
-	switch ctxt.Arch.PtrSize {
-	case 4:
-		return uint64(ctxt.Arch.ByteOrder.Uint32(buf))
-	case 8:
-		return ctxt.Arch.ByteOrder.Uint64(buf)
-	default:
-		panic("unexpected pointer size")
-	}
-
-}
-
-// setupLocList creates the initial portion of a location list for a
-// user variable. It emits the encoded start/end of the range and a
-// placeholder for the size. Return value is the new list plus the
-// slot in the list holding the size (to be updated later).
-func setupLocList(ctxt *obj.Link, f *Func, list []byte, st, en ID) ([]byte, int) {
-	start, startOK := encodeValue(ctxt, f.Entry.ID, st)
-	end, endOK := encodeValue(ctxt, f.Entry.ID, en)
-	if !startOK || !endOK {
-		// This could happen if someone writes a function that uses
-		// >65K values on a 32-bit platform. Hopefully a degraded debugging
-		// experience is ok in that case.
-		return nil, 0
-	}
-	list = appendPtr(ctxt, list, start)
-	list = appendPtr(ctxt, list, end)
-
-	// Where to write the length of the location description once
-	// we know how big it is.
-	sizeIdx := len(list)
-	list = list[:len(list)+2]
-	return list, sizeIdx
-}
-
 // locatePrologEnd walks the entry block of a function with incoming
 // register arguments and locates the last instruction in the prolog
-// that spills a register arg. It returns the ID of that instruction
+// that spills a register arg. It returns the ID of that instruction,
+// and (where appropriate) the prolog's lowered closure ptr store inst.
+//
 // Example:
 //
 //	b1:
@@ -1652,19 +1575,21 @@ func setupLocList(ctxt *obj.Link, f *Func, list []byte, st, en ID) ([]byte, int)
 // optimization turned off (e.g. "-N"). If optimization is enabled
 // we can't be assured of finding all input arguments spilled in the
 // entry block prolog.
-func locatePrologEnd(f *Func) ID {
+func locatePrologEnd(f *Func, needCloCtx bool) (ID, *Value) {
 
 	// returns true if this instruction looks like it moves an ABI
-	// register to the stack, along with the value being stored.
+	// register (or context register for rangefunc bodies) to the
+	// stack, along with the value being stored.
 	isRegMoveLike := func(v *Value) (bool, ID) {
 		n, ok := v.Aux.(*ir.Name)
 		var r ID
-		if !ok || n.Class != ir.PPARAM {
+		if (!ok || n.Class != ir.PPARAM) && !needCloCtx {
 			return false, r
 		}
 		regInputs, memInputs, spInputs := 0, 0, 0
 		for _, a := range v.Args {
-			if a.Op == OpArgIntReg || a.Op == OpArgFloatReg {
+			if a.Op == OpArgIntReg || a.Op == OpArgFloatReg ||
+				(needCloCtx && a.Op.isLoweredGetClosurePtr()) {
 				regInputs++
 				r = a.ID
 			} else if a.Type.IsMemory() {
@@ -1688,7 +1613,7 @@ func locatePrologEnd(f *Func) ID {
 	removeReg := func(r ID) bool {
 		for i := 0; i < len(regArgs); i++ {
 			if regArgs[i] == r {
-				regArgs = append(regArgs[:i], regArgs[i+1:]...)
+				regArgs = slices.Delete(regArgs, i, i+1)
 				return true
 			}
 		}
@@ -1699,9 +1624,15 @@ func locatePrologEnd(f *Func) ID {
 	// the value it produces in the regArgs list. When see a store that uses
 	// the value, remove the entry. When we hit the last store (use)
 	// then we've arrived at the end of the prolog.
+	var cloRegStore *Value
 	for k, v := range f.Entry.Values {
 		if v.Op == OpArgIntReg || v.Op == OpArgFloatReg {
 			regArgs = append(regArgs, v.ID)
+			continue
+		}
+		if needCloCtx && v.Op.isLoweredGetClosurePtr() {
+			regArgs = append(regArgs, v.ID)
+			cloRegStore = v
 			continue
 		}
 		if ok, r := isRegMoveLike(v); ok {
@@ -1712,19 +1643,19 @@ func locatePrologEnd(f *Func) ID {
 					// the last instruction in the block. If so, then
 					// return the "end of block" sentinel.
 					if k < len(f.Entry.Values)-1 {
-						return f.Entry.Values[k+1].ID
+						return f.Entry.Values[k+1].ID, cloRegStore
 					}
-					return BlockEnd.ID
+					return BlockEnd.ID, cloRegStore
 				}
 			}
 		}
 		if v.Op.IsCall() {
 			// if we hit a call, we've gone too far.
-			return v.ID
+			return v.ID, cloRegStore
 		}
 	}
 	// nothing found
-	return ID(-1)
+	return ID(-1), cloRegStore
 }
 
 // isNamedRegParam returns true if the param corresponding to "p"
@@ -1734,7 +1665,7 @@ func isNamedRegParam(p abi.ABIParamAssignment) bool {
 	if p.Name == nil {
 		return false
 	}
-	n := p.Name.(*ir.Name)
+	n := p.Name
 	if n.Sym() == nil || n.Sym().IsBlank() {
 		return false
 	}
@@ -1751,21 +1682,25 @@ func isNamedRegParam(p abi.ABIParamAssignment) bool {
 // it constructs a 2-element location list: the first element holds
 // the input register, and the second element holds the stack location
 // of the param (the assumption being that when optimization is off,
-// each input param reg will be spilled in the prolog).
+// each input param reg will be spilled in the prolog). In addition
+// to the register params, here we also build location lists (where
+// appropriate for the ".closureptr" compiler-synthesized variable
+// needed by the debugger for range func bodies.
 func BuildFuncDebugNoOptimized(ctxt *obj.Link, f *Func, loggingEnabled bool, stackOffset func(LocalSlot) int32, rval *FuncDebug) {
-
+	needCloCtx := f.CloSlot != nil
 	pri := f.ABISelf.ABIAnalyzeFuncType(f.Type)
 
-	// Look to see if we have any named register-promoted parameters.
-	// If there are none, bail early and let the caller sort things
-	// out for the remainder of the params/locals.
+	// Look to see if we have any named register-promoted parameters,
+	// and/or whether we need location info for the ".closureptr"
+	// synthetic variable; if not bail early and let the caller sort
+	// things out for the remainder of the params/locals.
 	numRegParams := 0
 	for _, inp := range pri.InParams() {
 		if isNamedRegParam(inp) {
 			numRegParams++
 		}
 	}
-	if numRegParams == 0 {
+	if numRegParams == 0 && !needCloCtx {
 		return
 	}
 
@@ -1775,27 +1710,77 @@ func BuildFuncDebugNoOptimized(ctxt *obj.Link, f *Func, loggingEnabled bool, sta
 		state.logf("generating -N reg param loc lists for func %q\n", f.Name)
 	}
 
+	// cloReg stores the obj register num that the context register
+	// appears in within the function prolog, where appropriate.
+	var cloReg int16
+
+	extraForCloCtx := 0
+	if needCloCtx {
+		extraForCloCtx = 1
+	}
+
 	// Allocate location lists.
-	rval.LocationLists = make([][]byte, numRegParams)
+	rval.LocationLists = make([][]LocListEntry, numRegParams+extraForCloCtx)
 
 	// Locate the value corresponding to the last spill of
 	// an input register.
-	afterPrologVal := locatePrologEnd(f)
+	afterPrologVal, cloRegStore := locatePrologEnd(f, needCloCtx)
 
-	// Walk the input params again and process the register-resident elements.
-	pidx := 0
+	if needCloCtx {
+		reg, _ := state.f.getHome(cloRegStore.ID).(*Register)
+		cloReg = reg.ObjNum()
+		if loggingEnabled {
+			state.logf("needCloCtx is true for func %q, cloreg=%v\n",
+				f.Name, reg)
+		}
+	}
+
+	addVarSlot := func(name *ir.Name, typ *types.Type) {
+		sl := LocalSlot{N: name, Type: typ, Off: 0}
+		rval.Vars = append(rval.Vars, name)
+		rval.Slots = append(rval.Slots, sl)
+		slid := len(rval.VarSlots)
+		rval.VarSlots = append(rval.VarSlots, []SlotID{SlotID(slid)})
+	}
+
+	// Make an initial pass to populate the vars/slots for our return
+	// value, covering first the input parameters and then (if needed)
+	// the special ".closureptr" var for rangefunc bodies.
+	params := []abi.ABIParamAssignment{}
 	for _, inp := range pri.InParams() {
 		if !isNamedRegParam(inp) {
 			// will be sorted out elsewhere
 			continue
 		}
+		if !IsVarWantedForDebug(inp.Name) {
+			continue
+		}
+		addVarSlot(inp.Name, inp.Type)
+		params = append(params, inp)
+	}
+	if needCloCtx {
+		addVarSlot(f.CloSlot, f.CloSlot.Type())
+		cloAssign := abi.ABIParamAssignment{
+			Type:      f.CloSlot.Type(),
+			Name:      f.CloSlot,
+			Registers: []abi.RegIndex{0}, // dummy
+		}
+		params = append(params, cloAssign)
+	}
 
-		n := inp.Name.(*ir.Name)
-		sl := LocalSlot{N: n, Type: inp.Type, Off: 0}
-		rval.Vars = append(rval.Vars, n)
-		rval.Slots = append(rval.Slots, sl)
-		slid := len(rval.VarSlots)
-		rval.VarSlots = append(rval.VarSlots, []SlotID{SlotID(slid)})
+	// Walk the input params again and process the register-resident elements.
+	pidx := 0
+	for _, inp := range params {
+		if !isNamedRegParam(inp) {
+			// will be sorted out elsewhere
+			continue
+		}
+		if !IsVarWantedForDebug(inp.Name) {
+			continue
+		}
+
+		sl := rval.Slots[pidx]
+		n := rval.Vars[pidx]
 
 		if afterPrologVal == ID(-1) {
 			// This can happen for degenerate functions with infinite
@@ -1812,72 +1797,92 @@ func BuildFuncDebugNoOptimized(ctxt *obj.Link, f *Func, loggingEnabled bool, sta
 		// Param is arriving in one or more registers. We need a 2-element
 		// location expression for it. First entry in location list
 		// will correspond to lifetime in input registers.
-		list, sizeIdx := setupLocList(ctxt, f, rval.LocationLists[pidx],
-			BlockStart.ID, afterPrologVal)
-		if list == nil {
-			pidx++
-			continue
-		}
 		if loggingEnabled {
 			state.logf("param %v:\n  [<entry>, %d]:\n", n, afterPrologVal)
 		}
+		var regExpr []byte
 		rtypes, _ := inp.RegisterTypesAndOffsets()
 		padding := make([]uint64, 0, 32)
 		padding = inp.ComputePadding(padding)
 		for k, r := range inp.Registers {
-			reg := ObjRegForAbiReg(r, f.Config)
+			var reg int16
+			if n == f.CloSlot {
+				reg = cloReg
+			} else {
+				reg = ObjRegForAbiReg(r, f.Config)
+			}
 			dwreg := ctxt.Arch.DWARFRegisters[reg]
 			if dwreg < 32 {
-				list = append(list, dwarf.DW_OP_reg0+byte(dwreg))
+				regExpr = append(regExpr, dwarf.DW_OP_reg0+byte(dwreg))
 			} else {
-				list = append(list, dwarf.DW_OP_regx)
-				list = dwarf.AppendUleb128(list, uint64(dwreg))
+				regExpr = append(regExpr, dwarf.DW_OP_regx)
+				regExpr = dwarf.AppendUleb128(regExpr, uint64(dwreg))
 			}
 			if loggingEnabled {
 				state.logf("    piece %d -> dwreg %d", k, dwreg)
 			}
 			if len(inp.Registers) > 1 {
-				list = append(list, dwarf.DW_OP_piece)
+				regExpr = append(regExpr, dwarf.DW_OP_piece)
 				ts := rtypes[k].Size()
-				list = dwarf.AppendUleb128(list, uint64(ts))
+				regExpr = dwarf.AppendUleb128(regExpr, uint64(ts))
 				if padding[k] > 0 {
 					if loggingEnabled {
 						state.logf(" [pad %d bytes]", padding[k])
 					}
-					list = append(list, dwarf.DW_OP_piece)
-					list = dwarf.AppendUleb128(list, padding[k])
+					regExpr = append(regExpr, dwarf.DW_OP_piece)
+					regExpr = dwarf.AppendUleb128(regExpr, padding[k])
 				}
 			}
 			if loggingEnabled {
 				state.logf("\n")
 			}
 		}
-		// fill in length of location expression element
-		ctxt.Arch.ByteOrder.PutUint16(list[sizeIdx:], uint16(len(list)-sizeIdx-2))
+		rval.LocationLists[pidx] = append(rval.LocationLists[pidx], LocListEntry{
+			StartBlock: f.Entry.ID,
+			StartValue: BlockStart.ID,
+			EndBlock:   f.Entry.ID,
+			EndValue:   afterPrologVal,
+			Expr:       regExpr,
+		})
 
 		// Second entry in the location list will be the stack home
 		// of the param, once it has been spilled.  Emit that now.
-		list, sizeIdx = setupLocList(ctxt, f, list,
-			afterPrologVal, FuncEnd.ID)
-		if list == nil {
-			pidx++
-			continue
-		}
+		var stackExpr []byte
 		soff := stackOffset(sl)
 		if soff == 0 {
-			list = append(list, dwarf.DW_OP_call_frame_cfa)
+			stackExpr = append(stackExpr, dwarf.DW_OP_call_frame_cfa)
 		} else {
-			list = append(list, dwarf.DW_OP_fbreg)
-			list = dwarf.AppendSleb128(list, int64(soff))
+			stackExpr = append(stackExpr, dwarf.DW_OP_fbreg)
+			stackExpr = dwarf.AppendSleb128(stackExpr, int64(soff))
 		}
 		if loggingEnabled {
 			state.logf("  [%d, <end>): stackOffset=%d\n", afterPrologVal, soff)
 		}
 
-		// fill in size
-		ctxt.Arch.ByteOrder.PutUint16(list[sizeIdx:], uint16(len(list)-sizeIdx-2))
+		rval.LocationLists[pidx] = append(rval.LocationLists[pidx], LocListEntry{
+			StartBlock: f.Entry.ID,
+			StartValue: afterPrologVal,
+			EndBlock:   f.Entry.ID,
+			EndValue:   FuncEnd.ID,
+			Expr:       stackExpr,
+		})
 
-		rval.LocationLists[pidx] = list
 		pidx++
 	}
+}
+
+// IsVarWantedForDebug returns true if the debug info for the node should
+// be generated.
+// For example, internal variables for range-over-func loops have little
+// value to users, so we don't generate debug info for them.
+func IsVarWantedForDebug(n ir.Node) bool {
+	name := n.Sym().Name
+	if len(name) > 0 && name[0] == '&' {
+		name = name[1:]
+	}
+	if len(name) > 0 && name[0] == '#' {
+		// #yield is used by delve.
+		return strings.HasPrefix(name, "#yield")
+	}
+	return true
 }

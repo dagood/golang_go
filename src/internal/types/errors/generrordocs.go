@@ -1,8 +1,8 @@
-//go:build ignore
-
 // Copyright 2023 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
+
+//go:build ignore
 
 // generrordocs creates a Markdown file for each (compiler) error code
 // and its associated documentation.
@@ -67,7 +67,7 @@ func main() {
 
 func walkCodes(f func(string, *ast.ValueSpec)) {
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "codes.go", nil, parser.ParseComments)
+	file, err := parser.ParseFile(fset, "codes.go", nil, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		log.Fatalf("ParseFile failed: %s", err)
 	}

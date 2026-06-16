@@ -7,8 +7,10 @@ package runtime
 import (
 	"internal/cpu"
 	"internal/goexperiment"
-	"runtime/internal/atomic"
-	_ "unsafe" // for go:linkname
+	"internal/runtime/atomic"
+	"internal/runtime/math"
+	"internal/strconv"
+	_ "unsafe"
 )
 
 const (
@@ -425,7 +427,7 @@ func (c *gcControllerState) startCycle(markStartTime int64, procs int, trigger g
 	// Clear per-P state
 	for _, p := range allp {
 		p.gcAssistTime = 0
-		p.gcFractionalMarkTime = 0
+		p.gcFractionalMarkTime.Store(0)
 	}
 
 	if trigger.kind == gcTriggerTime {
@@ -593,9 +595,7 @@ func (c *gcControllerState) revise() {
 }
 
 // endCycle computes the consMark estimate for the next cycle.
-// userForced indicates whether the current GC cycle was forced
-// by the application.
-func (c *gcControllerState) endCycle(now int64, procs int, userForced bool) {
+func (c *gcControllerState) endCycle(now int64, procs int) {
 	// Record last heap goal for the scavenger.
 	// We'll be updating the heap goal soon.
 	gcController.lastHeapGoal = c.heapGoal()
@@ -687,21 +687,42 @@ func (c *gcControllerState) endCycle(now int64, procs int, userForced bool) {
 // another P if there are spare worker slots. It is used by putfull
 // when more work is made available.
 //
+// If goexperiment.GreenTeaGC, the caller must not hold a G's scan bit,
+// otherwise this could cause a deadlock. This is already enforced by
+// the static lock ranking.
+//
 //go:nowritebarrier
 func (c *gcControllerState) enlistWorker() {
-	// If there are idle Ps, wake one so it will run an idle worker.
-	// NOTE: This is suspected of causing deadlocks. See golang.org/issue/19112.
-	//
-	//	if sched.npidle.Load() != 0 && sched.nmspinning.Load() == 0 {
-	//		wakep()
-	//		return
-	//	}
+	needDedicated := c.dedicatedMarkWorkersNeeded.Load() > 0
 
-	// There are no idle Ps. If we need more dedicated workers,
-	// try to preempt a running P so it will switch to a worker.
-	if c.dedicatedMarkWorkersNeeded.Load() <= 0 {
+	// Create new workers from idle Ps with goexperiment.GreenTeaGC.
+	//
+	// Note: with Green Tea, this places a requirement on enlistWorker
+	// that it must not be called while a G's scan bit is held.
+	if goexperiment.GreenTeaGC {
+		needIdle := c.needIdleMarkWorker()
+
+		// If we're all full on dedicated and idle workers, nothing
+		// to do.
+		if !needDedicated && !needIdle {
+			return
+		}
+
+		// If there are idle Ps, wake one so it will run a worker
+		// (the scheduler will already prefer to spin up a new
+		// dedicated worker over an idle one).
+		if sched.npidle.Load() != 0 && sched.nmspinning.Load() == 0 {
+			wakep() // Likely to consume our worker request.
+			return
+		}
+	}
+
+	// If we still need more dedicated workers, try to preempt a running P
+	// so it will switch to a worker.
+	if !needDedicated {
 		return
 	}
+
 	// Pick a random other P to preempt.
 	if gomaxprocs <= 1 {
 		return
@@ -712,7 +733,7 @@ func (c *gcControllerState) enlistWorker() {
 	}
 	myID := gp.m.p.ptr().id
 	for tries := 0; tries < 5; tries++ {
-		id := int32(fastrandn(uint32(gomaxprocs - 1)))
+		id := int32(cheaprandn(uint32(gomaxprocs - 1)))
 		if id >= myID {
 			id++
 		}
@@ -726,30 +747,44 @@ func (c *gcControllerState) enlistWorker() {
 	}
 }
 
-// findRunnableGCWorker returns a background mark worker for pp if it
-// should be run. This must only be called when gcBlackenEnabled != 0.
-func (c *gcControllerState) findRunnableGCWorker(pp *p, now int64) (*g, int64) {
+// assignWaitingGCWorker assigns a background mark worker to pp if one should
+// be run.
+//
+// If a worker is selected, it is assigned to pp.nextMarkGCWorker and the P is
+// wired as a GC mark worker. The G is still in _Gwaiting. If no worker is
+// selected, ok returns false.
+//
+// If assignedWaitingGCWorker returns true, this P must either:
+// - Mark the G as runnable and run it, clearing pp.nextMarkGCWorker.
+// - Or, call c.releaseNextGCMarkWorker.
+//
+// This must only be called when gcBlackenEnabled != 0.
+func (c *gcControllerState) assignWaitingGCWorker(pp *p, now int64) (bool, int64) {
 	if gcBlackenEnabled == 0 {
 		throw("gcControllerState.findRunnable: blackening not enabled")
 	}
 
-	// Since we have the current time, check if the GC CPU limiter
-	// hasn't had an update in a while. This check is necessary in
-	// case the limiter is on but hasn't been checked in a while and
-	// so may have left sufficient headroom to turn off again.
 	if now == 0 {
 		now = nanotime()
 	}
-	if gcCPULimiter.needUpdate(now) {
-		gcCPULimiter.update(now)
-	}
 
-	if !gcMarkWorkAvailable(pp) {
-		// No work to be done right now. This can happen at
+	if !gcShouldScheduleWorker(pp) {
+		// No good reason to schedule a worker. This can happen at
 		// the end of the mark phase when there are still
 		// assists tapering off. Don't bother running a worker
 		// now because it'll just return immediately.
-		return nil, now
+		return false, now
+	}
+
+	if c.dedicatedMarkWorkersNeeded.Load() <= 0 && c.fractionalUtilizationGoal == 0 {
+		// No current need for dedicated workers, and no need at all for
+		// fractional workers. Check before trying to acquire a worker; when
+		// GOMAXPROCS is large, that can be expensive and is often unnecessary.
+		//
+		// When a dedicated worker stops running, the gcBgMarkWorker loop notes
+		// the need for the worker before returning it to the pool. If we don't
+		// see the need now, we wouldn't have found it in the pool anyway.
+		return false, now
 	}
 
 	// Grab a worker before we commit to running below.
@@ -766,7 +801,7 @@ func (c *gcControllerState) findRunnableGCWorker(pp *p, now int64) (*g, int64) {
 		// it will always do so with queued global work. Thus, that P
 		// will be immediately eligible to re-run the worker G it was
 		// just using, ensuring work can complete.
-		return nil, now
+		return false, now
 	}
 
 	decIfPositive := func(val *atomic.Int64) bool {
@@ -789,29 +824,87 @@ func (c *gcControllerState) findRunnableGCWorker(pp *p, now int64) (*g, int64) {
 	} else if c.fractionalUtilizationGoal == 0 {
 		// No need for fractional workers.
 		gcBgMarkWorkerPool.push(&node.node)
-		return nil, now
+		return false, now
 	} else {
 		// Is this P behind on the fractional utilization
 		// goal?
 		//
 		// This should be kept in sync with pollFractionalWorkerExit.
 		delta := now - c.markStartTime
-		if delta > 0 && float64(pp.gcFractionalMarkTime)/float64(delta) > c.fractionalUtilizationGoal {
+		if delta > 0 && float64(pp.gcFractionalMarkTime.Load())/float64(delta) > c.fractionalUtilizationGoal {
 			// Nope. No need to run a fractional worker.
 			gcBgMarkWorkerPool.push(&node.node)
-			return nil, now
+			return false, now
 		}
 		// Run a fractional worker.
 		pp.gcMarkWorkerMode = gcMarkWorkerFractionalMode
 	}
 
+	pp.nextGCMarkWorker = node
+	return true, now
+}
+
+// findRunnableGCWorker returns a background mark worker for pp if it
+// should be run.
+//
+// If findRunnableGCWorker returns a G, this P is wired as a GC mark worker and
+// must run the G.
+//
+// This must only be called when gcBlackenEnabled != 0.
+//
+// This function is allowed to have write barriers because it is called from
+// the portion of findRunnable that always has a P.
+//
+//go:yeswritebarrierrec
+func (c *gcControllerState) findRunnableGCWorker(pp *p, now int64) (*g, int64) {
+	// Since we have the current time, check if the GC CPU limiter
+	// hasn't had an update in a while. This check is necessary in
+	// case the limiter is on but hasn't been checked in a while and
+	// so may have left sufficient headroom to turn off again.
+	if now == 0 {
+		now = nanotime()
+	}
+	if gcCPULimiter.needUpdate(now) {
+		gcCPULimiter.update(now)
+	}
+
+	// If a worker wasn't already assigned by procresize, assign one now.
+	if pp.nextGCMarkWorker == nil {
+		ok, now := c.assignWaitingGCWorker(pp, now)
+		if !ok {
+			return nil, now
+		}
+	}
+
+	node := pp.nextGCMarkWorker
+	pp.nextGCMarkWorker = nil
+
 	// Run the background mark worker.
 	gp := node.gp.ptr()
+	trace := traceAcquire()
 	casgstatus(gp, _Gwaiting, _Grunnable)
-	if traceEnabled() {
-		traceGoUnpark(gp, 0)
+	if trace.ok() {
+		trace.GoUnpark(gp, 0)
+		traceRelease(trace)
 	}
 	return gp, now
+}
+
+// Release an unused pp.nextGCMarkWorker, if any.
+//
+// This function is allowed to have write barriers because it is called from
+// the portion of schedule.
+//
+//go:yeswritebarrierrec
+func (c *gcControllerState) releaseNextGCMarkWorker(pp *p) {
+	node := pp.nextGCMarkWorker
+	if node == nil {
+		return
+	}
+
+	c.markWorkerStop(pp.gcMarkWorkerMode, 0)
+	gcBgMarkWorkerPool.push(&node.node)
+	pp.nextGCMarkWorker = nil
 }
 
 // resetLive sets up the controller state for the next mark phase after the end
@@ -828,8 +921,10 @@ func (c *gcControllerState) resetLive(bytesMarked uint64) {
 	c.triggered = ^uint64(0) // Reset triggered.
 
 	// heapLive was updated, so emit a trace event.
-	if traceEnabled() {
-		traceHeapAlloc(bytesMarked)
+	trace := traceAcquire()
+	if trace.ok() {
+		trace.HeapAlloc(bytesMarked)
+		traceRelease(trace)
 	}
 }
 
@@ -856,10 +951,12 @@ func (c *gcControllerState) markWorkerStop(mode gcMarkWorkerMode, duration int64
 
 func (c *gcControllerState) update(dHeapLive, dHeapScan int64) {
 	if dHeapLive != 0 {
+		trace := traceAcquire()
 		live := gcController.heapLive.Add(dHeapLive)
-		if traceEnabled() {
+		if trace.ok() {
 			// gcController.heapLive changed.
-			traceHeapAlloc(live)
+			trace.HeapAlloc(live)
+			traceRelease(trace)
 		}
 	}
 	if gcBlackenEnabled == 0 {
@@ -1119,7 +1216,7 @@ func (c *gcControllerState) trigger() (uint64, uint64) {
 	// increase in RSS. By capping us at a point >0, we're essentially
 	// saying that we're OK using more CPU during the GC to prevent
 	// this growth in RSS.
-	triggerLowerBound := uint64(((goal-c.heapMarked)/triggerRatioDen)*minTriggerRatioNum) + c.heapMarked
+	triggerLowerBound := ((goal-c.heapMarked)/triggerRatioDen)*minTriggerRatioNum + c.heapMarked
 	if minTrigger < triggerLowerBound {
 		minTrigger = triggerLowerBound
 	}
@@ -1133,13 +1230,11 @@ func (c *gcControllerState) trigger() (uint64, uint64) {
 	// to reflect the costs of a GC with no work to do. With a large heap but
 	// very little scan work to perform, this gives us exactly as much runway
 	// as we would need, in the worst case.
-	maxTrigger := uint64(((goal-c.heapMarked)/triggerRatioDen)*maxTriggerRatioNum) + c.heapMarked
+	maxTrigger := ((goal-c.heapMarked)/triggerRatioDen)*maxTriggerRatioNum + c.heapMarked
 	if goal > defaultHeapMinimum && goal-defaultHeapMinimum > maxTrigger {
 		maxTrigger = goal - defaultHeapMinimum
 	}
-	if maxTrigger < minTrigger {
-		maxTrigger = minTrigger
-	}
+	maxTrigger = max(maxTrigger, minTrigger)
 
 	// Compute the trigger from our bounds and the runway stored by commit.
 	var trigger uint64
@@ -1149,12 +1244,8 @@ func (c *gcControllerState) trigger() (uint64, uint64) {
 	} else {
 		trigger = goal - runway
 	}
-	if trigger < minTrigger {
-		trigger = minTrigger
-	}
-	if trigger > maxTrigger {
-		trigger = maxTrigger
-	}
+	trigger = max(trigger, minTrigger)
+	trigger = min(trigger, maxTrigger)
 	if trigger > goal {
 		print("trigger=", trigger, " heapGoal=", goal, "\n")
 		print("minTrigger=", minTrigger, " maxTrigger=", maxTrigger, "\n")
@@ -1279,8 +1370,8 @@ func readGOGC() int32 {
 	if p == "off" {
 		return -1
 	}
-	if n, ok := atoi32(p); ok {
-		return n
+	if n, err := strconv.ParseInt(p, 10, 32); err == nil {
+		return int32(n)
 	}
 	return 100
 }
@@ -1323,7 +1414,7 @@ func setMemoryLimit(in int64) (out int64) {
 func readGOMEMLIMIT() int64 {
 	p := gogetenv("GOMEMLIMIT")
 	if p == "" || p == "off" {
-		return maxInt64
+		return math.MaxInt64
 	}
 	n, ok := parseByteCount(p)
 	if !ok {
@@ -1377,7 +1468,7 @@ func (c *gcControllerState) needIdleMarkWorker() bool {
 	return n < max
 }
 
-// removeIdleMarkWorker must be called when an new idle mark worker stops executing.
+// removeIdleMarkWorker must be called when a new idle mark worker stops executing.
 func (c *gcControllerState) removeIdleMarkWorker() {
 	for {
 		old := c.idleMarkWorkers.Load()
@@ -1434,8 +1525,10 @@ func gcControllerCommit() {
 
 	// TODO(mknyszek): This isn't really accurate any longer because the heap
 	// goal is computed dynamically. Still useful to snapshot, but not as useful.
-	if traceEnabled() {
-		traceHeapGoal()
+	trace := traceAcquire()
+	if trace.ok() {
+		trace.HeapGoal()
+		traceRelease(trace)
 	}
 
 	trigger, heapGoal := gcController.trigger()

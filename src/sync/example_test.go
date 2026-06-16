@@ -6,6 +6,7 @@ package sync_test
 
 import (
 	"fmt"
+	"os"
 	"sync"
 )
 
@@ -18,6 +19,26 @@ var http httpPkg
 // This example fetches several URLs concurrently,
 // using a WaitGroup to block until all the fetches are complete.
 func ExampleWaitGroup() {
+	var wg sync.WaitGroup
+	var urls = []string{
+		"http://www.golang.org/",
+		"http://www.google.com/",
+		"http://www.example.com/",
+	}
+	for _, url := range urls {
+		// Launch a goroutine to fetch the URL.
+		wg.Go(func() {
+			// Fetch the URL.
+			http.Get(url)
+		})
+	}
+	// Wait for all HTTP fetches to complete.
+	wg.Wait()
+}
+
+// This example is equivalent to the main example, but uses Add/Done
+// instead of Go.
+func ExampleWaitGroup_addAndDone() {
 	var wg sync.WaitGroup
 	var urls = []string{
 		"http://www.golang.org/",
@@ -45,15 +66,68 @@ func ExampleOnce() {
 		fmt.Println("Only once")
 	}
 	done := make(chan bool)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		go func() {
 			once.Do(onceBody)
 			done <- true
 		}()
 	}
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		<-done
 	}
 	// Output:
 	// Only once
+}
+
+// This example uses OnceValue to perform an "expensive" computation just once,
+// even when used concurrently.
+func ExampleOnceValue() {
+	once := sync.OnceValue(func() int {
+		sum := 0
+		for i := range 1000 {
+			sum += i
+		}
+		fmt.Println("Computed once:", sum)
+		return sum
+	})
+	done := make(chan bool)
+	for range 10 {
+		go func() {
+			const want = 499500
+			got := once()
+			if got != want {
+				fmt.Println("want", want, "got", got)
+			}
+			done <- true
+		}()
+	}
+	for range 10 {
+		<-done
+	}
+	// Output:
+	// Computed once: 499500
+}
+
+// This example uses OnceValues to read a file just once.
+func ExampleOnceValues() {
+	once := sync.OnceValues(func() ([]byte, error) {
+		fmt.Println("Reading file once")
+		return os.ReadFile("example_test.go")
+	})
+	done := make(chan bool)
+	for range 10 {
+		go func() {
+			data, err := once()
+			if err != nil {
+				fmt.Println("error:", err)
+			}
+			_ = data // Ignore the data for this example
+			done <- true
+		}()
+	}
+	for range 10 {
+		<-done
+	}
+	// Output:
+	// Reading file once
 }

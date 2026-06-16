@@ -6,8 +6,7 @@ package typecheck
 
 import (
 	"fmt"
-	"go/constant"
-	"go/token"
+	"internal/types/errors"
 	"strings"
 
 	"cmd/compile/internal/base"
@@ -15,38 +14,6 @@ import (
 	"cmd/compile/internal/types"
 	"cmd/internal/src"
 )
-
-// tcAddr typechecks an OADDR node.
-func tcAddr(n *ir.AddrExpr) ir.Node {
-	n.X = Expr(n.X)
-	if n.X.Type() == nil {
-		n.SetType(nil)
-		return n
-	}
-
-	switch n.X.Op() {
-	case ir.OARRAYLIT, ir.OMAPLIT, ir.OSLICELIT, ir.OSTRUCTLIT:
-		n.SetOp(ir.OPTRLIT)
-
-	default:
-		checklvalue(n.X, "take the address of")
-		r := ir.OuterValue(n.X)
-		if r.Op() == ir.ONAME {
-			r := r.(*ir.Name)
-			if ir.Orig(r) != r {
-				base.Fatalf("found non-orig name node %v", r) // TODO(mdempsky): What does this mean?
-			}
-		}
-		n.X = DefaultLit(n.X, nil)
-		if n.X.Type() == nil {
-			n.SetType(nil)
-			return n
-		}
-	}
-
-	n.SetType(types.NewPtr(n.X.Type()))
-	return n
-}
 
 func tcShift(n, l, r ir.Node) (ir.Node, ir.Node, *types.Type) {
 	if l.Type() == nil || r.Type() == nil {
@@ -100,7 +67,7 @@ func tcArith(n ir.Node, op ir.Op, l, r ir.Node) (ir.Node, ir.Node, *types.Type) 
 		// The conversion allocates, so only do it if the concrete type is huge.
 		converted := false
 		if r.Type().Kind() != types.TBLANK {
-			aop, _ = Assignop(l.Type(), r.Type())
+			aop, _ = assignOp(l.Type(), r.Type())
 			if aop != ir.OXXX {
 				if r.Type().IsInterface() && !l.Type().IsInterface() && !types.IsComparable(l.Type()) {
 					base.Errorf("invalid operation: %v (operator %v not defined on %s)", n, op, typekind(l.Type()))
@@ -119,7 +86,7 @@ func tcArith(n ir.Node, op ir.Op, l, r ir.Node) (ir.Node, ir.Node, *types.Type) 
 		}
 
 		if !converted && l.Type().Kind() != types.TBLANK {
-			aop, _ = Assignop(r.Type(), l.Type())
+			aop, _ = assignOp(r.Type(), l.Type())
 			if aop != ir.OXXX {
 				if l.Type().IsInterface() && !r.Type().IsInterface() && !types.IsComparable(r.Type()) {
 					base.Errorf("invalid operation: %v (operator %v not defined on %s)", n, op, typekind(r.Type()))
@@ -201,9 +168,6 @@ func tcCompLit(n *ir.CompLitExpr) (res ir.Node) {
 		base.Pos = lno
 	}()
 
-	// Save original node (including n.Right)
-	n.SetOrig(ir.Copy(n))
-
 	ir.SetPos(n)
 
 	t := n.Type()
@@ -275,7 +239,7 @@ func tcCompLit(n *ir.CompLitExpr) (res ir.Node) {
 				// walkClosure(), because the instantiated
 				// function is compiled as if in the source
 				// package of the generic function.
-				if !(ir.CurFunc != nil && strings.Index(ir.CurFunc.Nname.Sym().Name, "[") >= 0) {
+				if !(ir.CurFunc != nil && strings.Contains(ir.CurFunc.Nname.Sym().Name, "[")) {
 					if s != nil && !types.IsExported(s.Name) && s.Pkg != types.LocalPkg {
 						base.Errorf("implicit assignment of unexported field '%s' in %v literal", s.Name, t)
 					}
@@ -348,6 +312,19 @@ func tcStructLitKey(typ *types.Type, kv *ir.KeyExpr) *ir.StructKeyExpr {
 		return ir.NewStructKeyExpr(kv.Pos(), f, kv.Value)
 	}
 
+	var f *types.Field
+	if p, ambig := dotpath(sym, typ, &f, false); p != nil {
+		if ambig {
+			base.Errorf("ambiguous promoted field '%v' in struct literal of type %v", sym, typ)
+			return nil
+		}
+		if f.IsMethod() {
+			base.Errorf("cannot use method '%v' in struct literal of type %v", sym, typ)
+			return nil
+		}
+		return ir.NewStructKeyExpr(kv.Pos(), f, kv.Value)
+	}
+
 	if ci := Lookdot1(nil, sym, typ, typ.Fields(), 2); ci != nil { // Case-insensitive lookup.
 		if visible(ci.Sym) {
 			base.Errorf("unknown field '%v' in struct literal of type %v (but does have %v)", sym, typ, ci.Sym)
@@ -359,7 +336,6 @@ func tcStructLitKey(typ *types.Type, kv *ir.KeyExpr) *ir.StructKeyExpr {
 		return nil
 	}
 
-	var f *types.Field
 	p, _ := dotpath(sym, typ, &f, true)
 	if p == nil || f.IsMethod() {
 		base.Errorf("unknown field '%v' in struct literal of type %v", sym, typ)
@@ -371,8 +347,8 @@ func tcStructLitKey(typ *types.Type, kv *ir.KeyExpr) *ir.StructKeyExpr {
 	for ei := len(p) - 1; ei >= 0; ei-- {
 		ep = append(ep, p[ei].field.Sym.Name)
 	}
-	ep = append(ep, sym.Name)
-	base.Errorf("cannot use promoted field %v in struct literal of type %v", strings.Join(ep, "."), typ)
+	ep = append(ep, f.Sym.Name)
+	base.Errorf("unknown field '%v' in struct literal of type %v (but does have %v)", sym, typ, strings.Join(ep, "."))
 	return nil
 }
 
@@ -386,9 +362,12 @@ func tcConv(n *ir.ConvExpr) ir.Node {
 		n.SetType(nil)
 		return n
 	}
-	op, why := Convertop(n.X.Op() == ir.OLITERAL, t, n.Type())
+	op, why := convertOp(n.X.Op() == ir.OLITERAL, t, n.Type())
 	if op == ir.OXXX {
-		base.Fatalf("cannot convert %L to type %v%s", n.X, n.Type(), why)
+		// Due to //go:nointerface, we may be stricter than types2 here (#63333).
+		base.ErrorfAt(n.Pos(), errors.InvalidConversion, "cannot convert %L to type %v%s", n.X, n.Type(), why)
+		n.SetType(nil)
+		return n
 	}
 
 	n.SetOp(op)
@@ -464,7 +443,7 @@ func dot(pos src.XPos, typ *types.Type, op ir.Op, x ir.Node, selection *types.Fi
 	return n
 }
 
-// XDotMethod returns an expression representing the field selection
+// XDotField returns an expression representing the field selection
 // x.sym. If any implicit field selection are necessary, those are
 // inserted too.
 func XDotField(pos src.XPos, x ir.Node, sym *types.Sym) *ir.SelectorExpr {
@@ -652,19 +631,6 @@ func tcIndex(n *ir.IndexExpr) ir.Node {
 			return n
 		}
 
-		if !n.Bounded() && ir.IsConst(n.Index, constant.Int) {
-			x := n.Index.Val()
-			if constant.Sign(x) < 0 {
-				base.Errorf("invalid %s index %v (index must be non-negative)", why, n.Index)
-			} else if t.IsArray() && constant.Compare(x, token.GEQ, constant.MakeInt64(t.NumElem())) {
-				base.Errorf("invalid array index %v (out of bounds for %d-element array)", n.Index, t.NumElem())
-			} else if ir.IsConst(n.X, constant.String) && constant.Compare(x, token.GEQ, constant.MakeInt64(int64(len(ir.StringVal(n.X))))) {
-				base.Errorf("invalid string index %v (out of bounds for %d-byte string)", n.Index, len(ir.StringVal(n.X)))
-			} else if ir.ConstOverflow(x, types.Types[types.TINT]) {
-				base.Errorf("invalid %s index %v (index too large)", why, n.Index)
-			}
-		}
-
 	case types.TMAP:
 		n.Index = AssignConv(n.Index, t.Key(), "map index")
 		n.SetType(t.Elem())
@@ -678,16 +644,16 @@ func tcIndex(n *ir.IndexExpr) ir.Node {
 func tcLenCap(n *ir.UnaryExpr) ir.Node {
 	n.X = Expr(n.X)
 	n.X = DefaultLit(n.X, nil)
-	n.X = implicitstar(n.X)
 	l := n.X
 	t := l.Type()
 	if t == nil {
 		n.SetType(nil)
 		return n
 	}
-
 	var ok bool
-	if n.Op() == ir.OLEN {
+	if t.IsPtr() && t.Elem().IsArray() {
+		ok = true
+	} else if n.Op() == ir.OLEN {
 		ok = okforlen[t.Kind()]
 	} else {
 		ok = okforcap[t.Kind()]
@@ -832,19 +798,15 @@ func tcSlice(n *ir.SliceExpr) ir.Node {
 		return n
 	}
 
-	if n.Low != nil && !checksliceindex(l, n.Low, tp) {
+	if n.Low != nil && !checksliceindex(n.Low) {
 		n.SetType(nil)
 		return n
 	}
-	if n.High != nil && !checksliceindex(l, n.High, tp) {
+	if n.High != nil && !checksliceindex(n.High) {
 		n.SetType(nil)
 		return n
 	}
-	if n.Max != nil && !checksliceindex(l, n.Max, tp) {
-		n.SetType(nil)
-		return n
-	}
-	if !checksliceconst(n.Low, n.High) || !checksliceconst(n.Low, n.Max) || !checksliceconst(n.High, n.Max) {
+	if n.Max != nil && !checksliceindex(n.Max) {
 		n.SetType(nil)
 		return n
 	}
@@ -874,18 +836,6 @@ func tcSliceHeader(n *ir.SliceHeaderExpr) ir.Node {
 	n.Len = DefaultLit(Expr(n.Len), types.Types[types.TINT])
 	n.Cap = DefaultLit(Expr(n.Cap), types.Types[types.TINT])
 
-	if ir.IsConst(n.Len, constant.Int) && ir.Int64Val(n.Len) < 0 {
-		base.Fatalf("len for OSLICEHEADER must be non-negative")
-	}
-
-	if ir.IsConst(n.Cap, constant.Int) && ir.Int64Val(n.Cap) < 0 {
-		base.Fatalf("cap for OSLICEHEADER must be non-negative")
-	}
-
-	if ir.IsConst(n.Len, constant.Int) && ir.IsConst(n.Cap, constant.Int) && constant.Compare(n.Len.Val(), token.GTR, n.Cap.Val()) {
-		base.Fatalf("len larger than cap for OSLICEHEADER")
-	}
-
 	return n
 }
 
@@ -906,10 +856,6 @@ func tcStringHeader(n *ir.StringHeaderExpr) ir.Node {
 
 	n.Ptr = Expr(n.Ptr)
 	n.Len = DefaultLit(Expr(n.Len), types.Types[types.TINT])
-
-	if ir.IsConst(n.Len, constant.Int) && ir.Int64Val(n.Len) < 0 {
-		base.Fatalf("len for OSTRINGHEADER must be non-negative")
-	}
 
 	return n
 }

@@ -20,24 +20,54 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"sync"
 )
 
 var buildInitStarted = false
 
-func BuildInit() {
+// makeCfgChangedEnv is the environment to set to
+// override the current environment for GOOS, GOARCH, and the GOARCH-specific
+// architecture environment variable to the configuration used by
+// the go command. They may be different because go tool <tool> for builtin
+// tools need to be built using the host configuration, so the configuration
+// used will be changed from that set in the environment. It is clipped
+// so its can append to it without changing it.
+var cfgChangedEnv []string
+
+func makeCfgChangedEnv() []string {
+	var env []string
+	if cfg.Getenv("GOOS") != cfg.Goos {
+		env = append(env, "GOOS="+cfg.Goos)
+	}
+	if cfg.Getenv("GOARCH") != cfg.Goarch {
+		env = append(env, "GOARCH="+cfg.Goarch)
+	}
+	if archenv, val, changed := cfg.GetArchEnv(); changed {
+		env = append(env, archenv+"="+val)
+	}
+	return slices.Clip(env)
+}
+
+func BuildInit(ld *modload.Loader) {
 	if buildInitStarted {
 		base.Fatalf("go: internal error: work.BuildInit called more than once")
 	}
 	buildInitStarted = true
 	base.AtExit(closeBuilders)
 
-	modload.Init()
+	modload.Init(ld)
 	instrumentInit()
 	buildModeInit()
-	if err := fsys.Init(base.Cwd()); err != nil {
+	initCompilerConcurrencyPool()
+	cfgChangedEnv = makeCfgChangedEnv()
+
+	if err := fsys.Init(); err != nil {
 		base.Fatal(err)
+	}
+	if from, replaced := fsys.DirContainsReplacement(cfg.GOMODCACHE); replaced {
+		base.Fatalf("go: overlay contains a replacement for %s. Files beneath GOMODCACHE (%s) must not be replaced.", from, cfg.GOMODCACHE)
 	}
 
 	// Make sure -pkgdir is absolute, because we run commands
@@ -246,8 +276,8 @@ func buildModeInit() {
 			pkgsFilter = oneMainPkg
 		}
 	case "pie":
-		if cfg.BuildRace {
-			base.Fatalf("-buildmode=pie not supported when -race is enabled")
+		if cfg.BuildRace && !platform.DefaultPIE(cfg.Goos, cfg.Goarch, cfg.BuildRace) {
+			base.Fatalf("-buildmode=pie not supported when -race is enabled on %s/%s", cfg.Goos, cfg.Goarch)
 		}
 		if gccgo {
 			codegenArg = "-fPIE"
@@ -357,7 +387,9 @@ func compilerVersion() (version, error) {
 		compiler.err = func() error {
 			compiler.name = "unknown"
 			cc := os.Getenv("CC")
-			out, err := exec.Command(cc, "--version").Output()
+			cmd := exec.Command(cc, "--version")
+			cmd.Env = append(cmd.Environ(), "LANG=C")
+			out, err := cmd.Output()
 			if err != nil {
 				// Compiler does not support "--version" flag: not Clang or GCC.
 				return err
@@ -366,7 +398,9 @@ func compilerVersion() (version, error) {
 			var match [][]byte
 			if bytes.HasPrefix(out, []byte("gcc")) {
 				compiler.name = "gcc"
-				out, err := exec.Command(cc, "-v").CombinedOutput()
+				cmd := exec.Command(cc, "-v")
+				cmd.Env = append(cmd.Environ(), "LANG=C")
+				out, err := cmd.CombinedOutput()
 				if err != nil {
 					// gcc, but does not support gcc's "-v" flag?!
 					return err

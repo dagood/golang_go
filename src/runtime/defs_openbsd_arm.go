@@ -6,9 +6,10 @@ package runtime
 import "unsafe"
 
 const (
-	_EINTR  = 0x4
-	_EFAULT = 0xe
-	_EAGAIN = 0x23
+	_EINTR     = 0x4
+	_EFAULT    = 0xe
+	_EAGAIN    = 0x23
+	_ETIMEDOUT = 0x3c
 
 	_O_WRONLY   = 0x1
 	_O_NONBLOCK = 0x4
@@ -151,7 +152,8 @@ type timespec struct {
 
 //go:nosplit
 func (ts *timespec) setNsec(ns int64) {
-	ts.tv_sec = int64(timediv(ns, 1e9, &ts.tv_nsec))
+	ts.tv_sec = int64(ns / 1e9)
+	ts.tv_nsec = int32(ns % 1e9)
 }
 
 type timeval struct {

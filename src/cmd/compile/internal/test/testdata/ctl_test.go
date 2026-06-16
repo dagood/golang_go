@@ -70,7 +70,22 @@ func switch_ssa(a int) int {
 		ret += 1
 	}
 	return ret
+}
 
+func switch_nonconstcase(n, c int) int {
+	switch n {
+	case 1:
+		return 1
+	case 2:
+		return 2
+	case c:
+		return 9
+	case 3:
+		return 3
+	case 4:
+		return 4
+	}
+	return 0
 }
 
 func fallthrough_ssa(a int) int {
@@ -92,7 +107,6 @@ func fallthrough_ssa(a int) int {
 		ret++
 	}
 	return ret
-
 }
 
 func testFallthrough(t *testing.T) {
@@ -108,6 +122,9 @@ func testSwitch(t *testing.T) {
 		if got := switch_ssa(i); got != i {
 			t.Errorf("switch_ssa(i) = %d, wanted %d", got, i)
 		}
+	}
+	if got := switch_nonconstcase(3, 3); got != 9 {
+		t.Errorf("switch_nonconstcase(3, 3) = %d, wanted 9", got)
 	}
 }
 

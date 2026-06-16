@@ -15,7 +15,7 @@ import (
 // package.
 type Hash uint
 
-// HashFunc simply returns the value of h so that Hash implements SignerOpts.
+// HashFunc simply returns the value of h so that [Hash] implements [SignerOpts].
 func (h Hash) HashFunc() Hash {
 	return h
 }
@@ -60,6 +60,8 @@ func (h Hash) String() string {
 		return "BLAKE2b-384"
 	case BLAKE2b_512:
 		return "BLAKE2b-512"
+	case MLDSAMu:
+		return "ML-DSA μ message representative"
 	default:
 		return "unknown hash value " + strconv.Itoa(int(h))
 	}
@@ -75,16 +77,24 @@ const (
 	SHA512                      // import crypto/sha512
 	MD5SHA1                     // no implementation; MD5+SHA1 used for TLS RSA
 	RIPEMD160                   // import golang.org/x/crypto/ripemd160
-	SHA3_224                    // import golang.org/x/crypto/sha3
-	SHA3_256                    // import golang.org/x/crypto/sha3
-	SHA3_384                    // import golang.org/x/crypto/sha3
-	SHA3_512                    // import golang.org/x/crypto/sha3
+	SHA3_224                    // import crypto/sha3
+	SHA3_256                    // import crypto/sha3
+	SHA3_384                    // import crypto/sha3
+	SHA3_512                    // import crypto/sha3
 	SHA512_224                  // import crypto/sha512
 	SHA512_256                  // import crypto/sha512
 	BLAKE2s_256                 // import golang.org/x/crypto/blake2s
 	BLAKE2b_256                 // import golang.org/x/crypto/blake2b
 	BLAKE2b_384                 // import golang.org/x/crypto/blake2b
 	BLAKE2b_512                 // import golang.org/x/crypto/blake2b
+
+	// MLDSAMu is a sentinel value for a [pre-hashed μ message representative].
+	// It has no implementation, but is used as a [SignerOpts.HashFunc] return
+	// value for [crypto/mldsa.PrivateKey.Sign].
+	//
+	// [pre-hashed μ message representative]: https://www.rfc-editor.org/rfc/rfc9881.html#externalmu
+	MLDSAMu
+
 	maxHash
 )
 
@@ -108,6 +118,7 @@ var digestSizes = []uint8{
 	BLAKE2b_256: 32,
 	BLAKE2b_384: 48,
 	BLAKE2b_512: 64,
+	MLDSAMu:     64,
 }
 
 // Size returns the length, in bytes, of a digest resulting from the given hash
@@ -131,7 +142,7 @@ func (h Hash) New() hash.Hash {
 			return f()
 		}
 	}
-	panic("crypto: requested hash function #" + strconv.Itoa(int(h)) + " is unavailable")
+	panic("crypto: requested hash function unavailable: " + h.String())
 }
 
 // Available reports whether the given hash function is linked into the binary.
@@ -143,8 +154,11 @@ func (h Hash) Available() bool {
 // hash function. This is intended to be called from the init function in
 // packages that implement hash functions.
 func RegisterHash(h Hash, f func() hash.Hash) {
-	if h >= maxHash {
+	if h == 0 || h >= maxHash {
 		panic("crypto: RegisterHash of unknown hash function")
+	}
+	if h == MLDSAMu {
+		panic("crypto: cannot RegisterHash for MLDSAMu")
 	}
 	hashes[h] = f
 }
@@ -171,7 +185,7 @@ type PublicKey any
 //	    Equal(x crypto.PrivateKey) bool
 //	}
 //
-// as well as purpose-specific interfaces such as Signer and Decrypter, which
+// as well as purpose-specific interfaces such as [Signer] and [Decrypter], which
 // can be used for increased type safety within applications.
 type PrivateKey any
 
@@ -198,7 +212,24 @@ type Signer interface {
 	Sign(rand io.Reader, digest []byte, opts SignerOpts) (signature []byte, err error)
 }
 
-// SignerOpts contains options for signing with a Signer.
+// MessageSigner is an interface for an opaque private key that can be used for
+// signing operations where the message is not pre-hashed by the caller.
+// It is a superset of the Signer interface so that it can be passed to APIs
+// which accept Signer, which may try to do an interface upgrade.
+//
+// MessageSigner.SignMessage and MessageSigner.Sign should produce the same
+// result given the same opts. In particular, MessageSigner.SignMessage should
+// only accept a zero opts.HashFunc if the Signer would also accept messages
+// which are not pre-hashed.
+//
+// Implementations which do not provide the pre-hashed Sign API should implement
+// Signer.Sign by always returning an error.
+type MessageSigner interface {
+	Signer
+	SignMessage(rand io.Reader, msg []byte, opts SignerOpts) (signature []byte, err error)
+}
+
+// SignerOpts contains options for signing with a [Signer].
 type SignerOpts interface {
 	// HashFunc returns an identifier for the hash function used to produce
 	// the message passed to Signer.Sign, or else zero to indicate that no
@@ -221,3 +252,45 @@ type Decrypter interface {
 }
 
 type DecrypterOpts any
+
+// SignMessage signs msg with signer. If signer implements [MessageSigner],
+// [MessageSigner.SignMessage] is called directly. Otherwise, msg is hashed
+// with opts.HashFunc() and signed with [Signer.Sign].
+func SignMessage(signer Signer, rand io.Reader, msg []byte, opts SignerOpts) (signature []byte, err error) {
+	if ms, ok := signer.(MessageSigner); ok {
+		return ms.SignMessage(rand, msg, opts)
+	}
+	if hash := opts.HashFunc(); hash != 0 {
+		if !hash.Available() {
+			return nil, hashUnavailableError(hash)
+		}
+		h := hash.New()
+		h.Write(msg)
+		msg = h.Sum(nil)
+	}
+	return signer.Sign(rand, msg, opts)
+}
+
+type hashUnavailableError Hash
+
+func (h hashUnavailableError) Error() string {
+	return "crypto: requested hash function unavailable: " + Hash(h).String()
+}
+
+// Decapsulator is an interface for an opaque private KEM key that can be used for
+// decapsulation operations. For example, an ML-KEM key kept in a hardware module.
+//
+// It is implemented, for example, by [crypto/mlkem.DecapsulationKey768].
+type Decapsulator interface {
+	Encapsulator() Encapsulator
+	Decapsulate(ciphertext []byte) (sharedKey []byte, err error)
+}
+
+// Encapsulator is an interface for a public KEM key that can be used for
+// encapsulation operations.
+//
+// It is implemented, for example, by [crypto/mlkem.EncapsulationKey768].
+type Encapsulator interface {
+	Bytes() []byte
+	Encapsulate() (sharedKey, ciphertext []byte)
+}

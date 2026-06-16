@@ -9,6 +9,7 @@ import (
 	"go/constant"
 	"go/token"
 	"os"
+	"slices"
 	"strings"
 
 	"cmd/compile/internal/base"
@@ -42,6 +43,11 @@ type Schedule struct {
 
 	Plans map[ir.Node]*Plan
 	Temps map[ir.Node]*ir.Name
+
+	// seenMutation tracks whether we've seen an initialization
+	// expression that may have modified other package-scope variables
+	// within this package.
+	seenMutation bool
 }
 
 func (s *Schedule) append(n ir.Node) {
@@ -80,26 +86,71 @@ func recordFuncForVar(v *ir.Name, fn *ir.Func) {
 	MapInitToVar[fn] = v
 }
 
+// allBlank reports whether every node in exprs is blank.
+func allBlank(exprs []ir.Node) bool {
+	for _, expr := range exprs {
+		if !ir.IsBlank(expr) {
+			return false
+		}
+	}
+	return true
+}
+
 // tryStaticInit attempts to statically execute an initialization
 // statement and reports whether it succeeded.
-func (s *Schedule) tryStaticInit(nn ir.Node) bool {
-	// Only worry about simple "l = r" assignments. Multiple
-	// variable/expression OAS2 assignments have already been
-	// replaced by multiple simple OAS assignments, and the other
-	// OAS2* assignments mostly necessitate dynamic execution
-	// anyway.
-	if nn.Op() != ir.OAS {
+func (s *Schedule) tryStaticInit(n ir.Node) bool {
+	var lhs []ir.Node
+	var rhs ir.Node
+
+	switch n.Op() {
+	default:
+		base.FatalfAt(n.Pos(), "unexpected initialization statement: %v", n)
+	case ir.OAS:
+		n := n.(*ir.AssignStmt)
+		lhs, rhs = []ir.Node{n.X}, n.Y
+	case ir.OAS2:
+		// Usually OAS2 has been rewritten to separate OASes by types2.
+		// What's left here is "var a, b = tmp1, tmp2" as a result from rewriting
+		// "var a, b = f()" that needs type conversion, which is not static.
+		n := n.(*ir.AssignListStmt)
+		for _, rhs := range n.Rhs {
+			for rhs.Op() == ir.OCONVNOP || rhs.Op() == ir.OCONVIFACE {
+				rhs = rhs.(*ir.ConvExpr).X
+			}
+			if name, ok := rhs.(*ir.Name); !ok || !name.AutoTemp() {
+				base.FatalfAt(n.Pos(), "unexpected rhs, not an autotmp: %+v", rhs)
+			}
+		}
+		return false
+	case ir.OAS2DOTTYPE, ir.OAS2FUNC, ir.OAS2MAPR, ir.OAS2RECV:
+		n := n.(*ir.AssignListStmt)
+		if len(n.Lhs) < 2 || len(n.Rhs) != 1 {
+			base.FatalfAt(n.Pos(), "unexpected shape for %v: %v", n.Op(), n)
+		}
+		lhs, rhs = n.Lhs, n.Rhs[0]
+	case ir.OCALLFUNC:
+		return false // outlined map init call; no mutations
+	}
+
+	if !s.seenMutation {
+		s.seenMutation = mayModifyPkgVar(rhs)
+	}
+
+	if allBlank(lhs) && !AnySideEffects(rhs) {
+		return true // discard
+	}
+
+	// Only worry about simple "l = r" assignments. The OAS2*
+	// assignments mostly necessitate dynamic execution anyway.
+	if len(lhs) > 1 {
 		return false
 	}
-	n := nn.(*ir.AssignStmt)
-	if ir.IsBlank(n.X) && !AnySideEffects(n.Y) {
-		// Discard.
-		return true
-	}
+
 	lno := ir.SetPos(n)
 	defer func() { base.Pos = lno }()
-	nam := n.X.(*ir.Name)
-	return s.StaticAssign(nam, 0, n.Y, nam.Type())
+
+	nam := lhs[0].(*ir.Name)
+	return s.StaticAssign(nam, 0, rhs, nam.Type())
 }
 
 // like staticassign but we are copying an already
@@ -132,6 +183,15 @@ func (s *Schedule) staticcopy(l *ir.Name, loff int64, rn *ir.Name, typ *types.Ty
 	if r == nil {
 		// types2.InitOrder doesn't include default initializers.
 		base.Fatalf("unexpected initializer: %v", rn.Defn)
+	}
+
+	// Variable may have been reassigned by a user-written function call
+	// that was invoked to initialize another global variable (#51913).
+	if s.seenMutation {
+		if base.Debug.StaticCopy != 0 {
+			base.WarnfAt(l.Pos(), "skipping static copy of %v+%v with %v", l, loff, r)
+		}
+		return false
 	}
 
 	for r.Op() == ir.OCONVNOP && !types.Identical(r.Type(), typ) {
@@ -169,6 +229,9 @@ func (s *Schedule) staticcopy(l *ir.Name, loff int64, rn *ir.Name, typ *types.Ty
 	case ir.OADDR:
 		r := r.(*ir.AddrExpr)
 		if a, ok := r.X.(*ir.Name); ok && a.Op() == ir.ONAME {
+			if a.Class != ir.PEXTERN {
+				return false // e.g. local from new(expr)
+			}
 			staticdata.InitAddr(l, loff, staticdata.GlobalLinksym(a))
 			return true
 		}
@@ -220,6 +283,14 @@ func (s *Schedule) staticcopy(l *ir.Name, loff int64, rn *ir.Name, typ *types.Ty
 }
 
 func (s *Schedule) StaticAssign(l *ir.Name, loff int64, r ir.Node, typ *types.Type) bool {
+	// If we're building for FIPS, avoid global data relocations
+	// by treating all address-of operations as non-static.
+	// See ../../../internal/obj/fips.go for more context.
+	// We do this even in non-PIE mode to avoid generating
+	// static temporaries that would go into SRODATAFIPS
+	// but need relocations. We can't handle that in the verification.
+	disableGlobalAddrs := base.Ctxt.IsFIPS()
+
 	if r == nil {
 		// No explicit initialization value. Either zero or supplied
 		// externally.
@@ -245,10 +316,16 @@ func (s *Schedule) StaticAssign(l *ir.Name, loff int64, r ir.Node, typ *types.Ty
 
 	switch r.Op() {
 	case ir.ONAME:
+		if disableGlobalAddrs {
+			return false
+		}
 		r := r.(*ir.Name)
 		return s.staticcopy(l, loff, r, typ)
 
 	case ir.OMETHEXPR:
+		if disableGlobalAddrs {
+			return false
+		}
 		r := r.(*ir.SelectorExpr)
 		return s.staticcopy(l, loff, r.FuncName(), typ)
 
@@ -259,10 +336,16 @@ func (s *Schedule) StaticAssign(l *ir.Name, loff int64, r ir.Node, typ *types.Ty
 		if ir.IsZero(r) {
 			return true
 		}
+		if disableGlobalAddrs && r.Type().IsString() {
+			return false
+		}
 		staticdata.InitConst(l, loff, r, int(typ.Size()))
 		return true
 
 	case ir.OADDR:
+		if disableGlobalAddrs {
+			return false
+		}
 		r := r.(*ir.AddrExpr)
 		if name, offset, ok := StaticLoc(r.X); ok && name.Class == ir.PEXTERN {
 			staticdata.InitAddrOffset(l, loff, name.Linksym(), offset)
@@ -271,6 +354,9 @@ func (s *Schedule) StaticAssign(l *ir.Name, loff int64, r ir.Node, typ *types.Ty
 		fallthrough
 
 	case ir.OPTRLIT:
+		if disableGlobalAddrs {
+			return false
+		}
 		r := r.(*ir.AddrExpr)
 		switch r.X.Op() {
 		case ir.OARRAYLIT, ir.OSLICELIT, ir.OMAPLIT, ir.OSTRUCTLIT:
@@ -287,6 +373,9 @@ func (s *Schedule) StaticAssign(l *ir.Name, loff int64, r ir.Node, typ *types.Ty
 		//dump("not static ptrlit", r);
 
 	case ir.OSTR2BYTES:
+		if disableGlobalAddrs {
+			return false
+		}
 		r := r.(*ir.ConvExpr)
 		if l.Class == ir.PEXTERN && r.X.Op() == ir.OLITERAL {
 			sval := ir.StringVal(r.X)
@@ -295,6 +384,9 @@ func (s *Schedule) StaticAssign(l *ir.Name, loff int64, r ir.Node, typ *types.Ty
 		}
 
 	case ir.OSLICELIT:
+		if disableGlobalAddrs {
+			return false
+		}
 		r := r.(*ir.CompLitExpr)
 		s.initplan(r)
 		// Init slice.
@@ -315,7 +407,7 @@ func (s *Schedule) StaticAssign(l *ir.Name, loff int64, r ir.Node, typ *types.Ty
 		p := s.Plans[r]
 		for i := range p.E {
 			e := &p.E[i]
-			if e.Expr.Op() == ir.OLITERAL || e.Expr.Op() == ir.ONIL {
+			if e.Expr.Op() == ir.OLITERAL && !disableGlobalAddrs || e.Expr.Op() == ir.ONIL {
 				staticdata.InitConst(l, loff+e.Xoffset, e.Expr, int(e.Expr.Type().Size()))
 				continue
 			}
@@ -329,17 +421,14 @@ func (s *Schedule) StaticAssign(l *ir.Name, loff int64, r ir.Node, typ *types.Ty
 		break
 
 	case ir.OCLOSURE:
+		if disableGlobalAddrs {
+			return false
+		}
 		r := r.(*ir.ClosureExpr)
-		if ir.IsTrivialClosure(r) {
+		if !r.Func.IsClosure() {
 			if base.Debug.Closure > 0 {
 				base.WarnfAt(r.Pos(), "closure converted to global")
 			}
-			// Issue 59680: if the closure we're looking at was produced
-			// by inlining, it could be marked as hidden, which we don't
-			// want (moving the func to a static init will effectively
-			// hide it from escape analysis). Mark as non-hidden here.
-			// so that it will participated in escape analysis.
-			r.Func.SetIsHiddenClosure(false)
 			// Closures with no captured variables are globals,
 			// so the assignment can be done at link time.
 			// TODO if roff != 0 { panic }
@@ -351,6 +440,10 @@ func (s *Schedule) StaticAssign(l *ir.Name, loff int64, r ir.Node, typ *types.Ty
 	case ir.OCONVIFACE:
 		// This logic is mirrored in isStaticCompositeLiteral.
 		// If you change something here, change it there, and vice versa.
+
+		if disableGlobalAddrs {
+			return false
+		}
 
 		// Determine the underlying concrete type and value we are converting from.
 		r := r.(*ir.ConvExpr)
@@ -407,6 +500,9 @@ func (s *Schedule) StaticAssign(l *ir.Name, loff int64, r ir.Node, typ *types.Ty
 		return true
 
 	case ir.OINLCALL:
+		if disableGlobalAddrs {
+			return false
+		}
 		r := r.(*ir.InlinedCallExpr)
 		return s.staticAssignInlinedCall(l, loff, r, typ)
 	}
@@ -434,9 +530,6 @@ func (s *Schedule) initplan(n ir.Node) {
 			if a.Op() == ir.OKEY {
 				kv := a.(*ir.KeyExpr)
 				k = typecheck.IndexConst(kv.Key)
-				if k < 0 {
-					base.Fatalf("initplan arraylit: invalid index %v", kv.Key)
-				}
 				a = kv.Value
 			}
 			s.addvalue(p, k*n.Type().Elem().Size(), a)
@@ -453,7 +546,7 @@ func (s *Schedule) initplan(n ir.Node) {
 			if a.Sym().IsBlank() {
 				continue
 			}
-			s.addvalue(p, a.Field.Offset, a.Value)
+			s.addvalue(p, typecheck.FieldOffset(n.Type(), a.Field), a.Value)
 		}
 
 	case ir.OMAPLIT:
@@ -533,12 +626,6 @@ func (s *Schedule) staticAssignInlinedCall(l *ir.Name, loff int64, call *ir.Inli
 	// 	INLCALL-ReturnVars
 	// 	.   NAME-p.~R0 Class:PAUTO Offset:0 OnStack Used PTR-*T tc(1) # x.go:18:13
 	//
-	// In non-unified IR, the tree is slightly different:
-	//  - if there are no arguments to the inlined function,
-	//    the INLCALL-init omits the AS2.
-	//  - the DCL inside BLOCK is on the AS2's init list,
-	//    not its own statement in the top level of the BLOCK.
-	//
 	// If the init values are side-effect-free and each either only
 	// appears once in the function body or is safely repeatable,
 	// then we inline the value expressions into the return argument
@@ -558,39 +645,26 @@ func (s *Schedule) staticAssignInlinedCall(l *ir.Name, loff int64, call *ir.Inli
 	// is the most important case for us to get right.
 
 	init := call.Init()
-	var as2init *ir.AssignListStmt
-	if len(init) == 2 && init[0].Op() == ir.OAS2 && init[1].Op() == ir.OINLMARK {
-		as2init = init[0].(*ir.AssignListStmt)
-	} else if len(init) == 1 && init[0].Op() == ir.OINLMARK {
-		as2init = new(ir.AssignListStmt)
-	} else {
+	if len(init) != 2 || init[0].Op() != ir.OAS2 || init[1].Op() != ir.OINLMARK {
 		return false
 	}
+	as2init := init[0].(*ir.AssignListStmt)
+
 	if len(call.Body) != 2 || call.Body[0].Op() != ir.OBLOCK || call.Body[1].Op() != ir.OLABEL {
 		return false
 	}
 	label := call.Body[1].(*ir.LabelStmt).Label
 	block := call.Body[0].(*ir.BlockStmt)
 	list := block.List
-	var dcl *ir.Decl
-	if len(list) == 3 && list[0].Op() == ir.ODCL {
-		dcl = list[0].(*ir.Decl)
-		list = list[1:]
-	}
-	if len(list) != 2 ||
-		list[0].Op() != ir.OAS2 ||
-		list[1].Op() != ir.OGOTO ||
-		list[1].(*ir.BranchStmt).Label != label {
+	if len(list) != 3 ||
+		list[0].Op() != ir.ODCL ||
+		list[1].Op() != ir.OAS2 ||
+		list[2].Op() != ir.OGOTO ||
+		list[2].(*ir.BranchStmt).Label != label {
 		return false
 	}
-	as2body := list[0].(*ir.AssignListStmt)
-	if dcl == nil {
-		ainit := as2body.Init()
-		if len(ainit) != 1 || ainit[0].Op() != ir.ODCL {
-			return false
-		}
-		dcl = ainit[0].(*ir.Decl)
-	}
+	dcl := list[0].(*ir.Decl)
+	as2body := list[1].(*ir.AssignListStmt)
 	if len(as2body.Lhs) != 1 || as2body.Lhs[0] != dcl.X {
 		return false
 	}
@@ -615,7 +689,7 @@ func (s *Schedule) staticAssignInlinedCall(l *ir.Name, loff int64, call *ir.Inli
 		count[x.(*ir.Name)] = 0
 	}
 
-	hasNonTrivialClosure := false
+	hasClosure := false
 	ir.Visit(as2body.Rhs[0], func(n ir.Node) {
 		if name, ok := n.(*ir.Name); ok {
 			if c, ok := count[name]; ok {
@@ -623,13 +697,13 @@ func (s *Schedule) staticAssignInlinedCall(l *ir.Name, loff int64, call *ir.Inli
 			}
 		}
 		if clo, ok := n.(*ir.ClosureExpr); ok {
-			hasNonTrivialClosure = hasNonTrivialClosure || !ir.IsTrivialClosure(clo)
+			hasClosure = hasClosure || clo.Func.IsClosure()
 		}
 	})
 
-	// If there's a non-trivial closure, it has captured the param,
+	// If there's a closure, it has captured the param,
 	// so we can't substitute arg for param.
-	if hasNonTrivialClosure {
+	if hasClosure {
 		return false
 	}
 
@@ -678,10 +752,9 @@ func (s *Schedule) staticAssignInlinedCall(l *ir.Name, loff int64, call *ir.Inli
 var statuniqgen int // name generator for static temps
 
 // StaticName returns a name backed by a (writable) static data symbol.
-// Use readonlystaticname for read-only node.
 func StaticName(t *types.Type) *ir.Name {
 	// Don't use LookupNum; it interns the resulting string, but these are all unique.
-	sym := typecheck.Lookup(fmt.Sprintf("%s%d", obj.StaticNamePref, statuniqgen))
+	sym := typecheck.Lookup(fmt.Sprintf("%s%d", obj.StaticNamePrefix, statuniqgen))
 	statuniqgen++
 
 	n := ir.NewNameAt(base.Pos, sym, t)
@@ -691,6 +764,8 @@ func StaticName(t *types.Type) *ir.Name {
 	typecheck.Target.Externs = append(typecheck.Target.Externs, n)
 
 	n.Linksym().Set(obj.AttrStatic, true)
+	n.Linksym().Align = int16(t.Alignment())
+
 	return n
 }
 
@@ -830,6 +905,55 @@ func AnySideEffects(n ir.Node) bool {
 	return ir.Any(n, isSideEffect)
 }
 
+// mayModifyPkgVar reports whether expression n may modify any
+// package-scope variables declared within the current package.
+func mayModifyPkgVar(n ir.Node) bool {
+	// safeLHS reports whether the assigned-to variable lhs is either a
+	// local variable or a global from another package.
+	safeLHS := func(lhs ir.Node) bool {
+		outer := ir.OuterValue(lhs)
+		// "*p = ..." should be safe if p is a local variable.
+		// TODO: Should ir.OuterValue handle this?
+		for outer.Op() == ir.ODEREF {
+			outer = outer.(*ir.StarExpr).X
+		}
+		v, ok := outer.(*ir.Name)
+		return ok && v.Op() == ir.ONAME && !(v.Class == ir.PEXTERN && v.Sym().Pkg == types.LocalPkg)
+	}
+
+	return ir.Any(n, func(n ir.Node) bool {
+		switch n.Op() {
+		case ir.OCALLFUNC, ir.OCALLINTER:
+			return !ir.IsFuncPCIntrinsic(n.(*ir.CallExpr))
+
+		case ir.OAPPEND, ir.OCLEAR, ir.OCOPY:
+			return true // could mutate a global array
+
+		case ir.OASOP:
+			n := n.(*ir.AssignOpStmt)
+			if !safeLHS(n.X) {
+				return true
+			}
+
+		case ir.OAS:
+			n := n.(*ir.AssignStmt)
+			if !safeLHS(n.X) {
+				return true
+			}
+
+		case ir.OAS2, ir.OAS2DOTTYPE, ir.OAS2FUNC, ir.OAS2MAPR, ir.OAS2RECV:
+			n := n.(*ir.AssignListStmt)
+			for _, lhs := range n.Lhs {
+				if !safeLHS(lhs) {
+					return true
+				}
+			}
+		}
+
+		return false
+	})
+}
+
 // canRepeat reports whether executing n multiple times has the same effect as
 // assigning n to a single variable and using that variable multiple times.
 func canRepeat(n ir.Node) bool {
@@ -951,7 +1075,7 @@ func addStr(n *ir.AddStringExpr) ir.Node {
 		for _, c := range s {
 			strs = append(strs, ir.StringVal(c))
 		}
-		return typecheck.OrigConst(n, constant.MakeString(strings.Join(strs, "")))
+		return ir.NewConstExpr(constant.MakeString(strings.Join(strs, "")), n)
 	}
 	newList := make([]ir.Node, 0, need)
 	for i := 0; i < len(s); i++ {
@@ -964,9 +1088,7 @@ func addStr(n *ir.AddStringExpr) ir.Node {
 				i2++
 			}
 
-			nl := ir.Copy(n).(*ir.AddStringExpr)
-			nl.List = s[i:i2]
-			newList = append(newList, typecheck.OrigConst(nl, constant.MakeString(strings.Join(strs, ""))))
+			newList = append(newList, ir.NewConstExpr(constant.MakeString(strings.Join(strs, "")), s[i]))
 			i = i2 - 1
 		} else {
 			newList = append(newList, s[i])
@@ -980,26 +1102,26 @@ func addStr(n *ir.AddStringExpr) ir.Node {
 
 const wrapGlobalMapInitSizeThreshold = 20
 
-// tryWrapGlobalMapInit examines the node 'n' to see if it is a map
-// variable initialization, and if so, possibly returns the mapvar
-// being assigned, a new function containing the init code, and a call
-// to the function passing the mapvar. Returns will be nil if the
-// assignment is not to a map, or the map init is not big enough,
-// or if the expression being assigned to the map has side effects.
-func tryWrapGlobalMapInit(n ir.Node) (mapvar *ir.Name, genfn *ir.Func, call ir.Node) {
+// tryWrapGlobalInit returns a new outlined function to contain global
+// initializer statement n, if possible and worthwhile. Otherwise, it
+// returns nil.
+//
+// Currently, it outlines map assignment statements with large,
+// side-effect-free RHS expressions.
+func tryWrapGlobalInit(n ir.Node) *ir.Func {
 	// Look for "X = ..." where X has map type.
 	// FIXME: might also be worth trying to look for cases where
 	// the LHS is of interface type but RHS is map type.
 	if n.Op() != ir.OAS {
-		return nil, nil, nil
+		return nil
 	}
 	as := n.(*ir.AssignStmt)
 	if ir.IsBlank(as.X) || as.X.Op() != ir.ONAME {
-		return nil, nil, nil
+		return nil
 	}
 	nm := as.X.(*ir.Name)
 	if !nm.Type().IsMap() {
-		return nil, nil, nil
+		return nil
 	}
 
 	// Determine size of RHS.
@@ -1019,7 +1141,7 @@ func tryWrapGlobalMapInit(n ir.Node) (mapvar *ir.Name, genfn *ir.Func, call ir.N
 			fmt.Fprintf(os.Stderr, "=-= skipping %v size too small at %d\n",
 				nm, rsiz)
 		}
-		return nil, nil, nil
+		return nil
 	}
 
 	// Reject right hand sides with side effects.
@@ -1027,7 +1149,7 @@ func tryWrapGlobalMapInit(n ir.Node) (mapvar *ir.Name, genfn *ir.Func, call ir.N
 		if base.Debug.WrapGlobalMapDbg > 0 {
 			fmt.Fprintf(os.Stderr, "=-= rejected %v due to side effects\n", nm)
 		}
-		return nil, nil, nil
+		return nil
 	}
 
 	if base.Debug.WrapGlobalMapDbg > 1 {
@@ -1036,17 +1158,19 @@ func tryWrapGlobalMapInit(n ir.Node) (mapvar *ir.Name, genfn *ir.Func, call ir.N
 
 	// Create a new function that will (eventually) have this form:
 	//
-	//    func map.init.%d() {
-	//      globmapvar = <map initialization>
-	//    }
+	//	func map.init.%d() {
+	//		globmapvar = <map initialization>
+	//	}
 	//
+	// Note: cmd/link expects the function name to contain "map.init".
 	minitsym := typecheck.LookupNum("map.init.", mapinitgen)
 	mapinitgen++
 
-	newfn := ir.NewFunc(base.Pos, base.Pos, minitsym, types.NewSignature(nil, nil, nil))
-	typecheck.DeclFunc(newfn)
+	fn := ir.NewFunc(n.Pos(), n.Pos(), minitsym, types.NewSignature(nil, nil, nil))
+	fn.SetInlinabilityChecked(true) // suppress inlining (which would defeat the point)
+	typecheck.DeclFunc(fn)
 	if base.Debug.WrapGlobalMapDbg > 0 {
-		fmt.Fprintf(os.Stderr, "=-= generated func is %v\n", newfn)
+		fmt.Fprintf(os.Stderr, "=-= generated func is %v\n", fn)
 	}
 
 	// NB: we're relying on this phase being run before inlining;
@@ -1054,24 +1178,17 @@ func tryWrapGlobalMapInit(n ir.Node) (mapvar *ir.Name, genfn *ir.Func, call ir.N
 	// need code here that relocates or duplicates inline temps.
 
 	// Insert assignment into function body; mark body finished.
-	newfn.Body = append(newfn.Body, as)
+	fn.Body = []ir.Node{as}
 	typecheck.FinishFuncBody()
-
-	const no = `
-	// Register new function with decls.
-	typecheck.Target.Decls = append(typecheck.Target.Decls, newfn)
-`
-
-	// Create call to function, passing mapvar.
-	fncall := ir.NewCallExpr(n.Pos(), ir.OCALL, newfn.Nname, nil)
 
 	if base.Debug.WrapGlobalMapDbg > 1 {
 		fmt.Fprintf(os.Stderr, "=-= mapvar is %v\n", nm)
-		fmt.Fprintf(os.Stderr, "=-= newfunc is %+v\n", newfn)
-		fmt.Fprintf(os.Stderr, "=-= call is %+v\n", fncall)
+		fmt.Fprintf(os.Stderr, "=-= newfunc is %+v\n", fn)
 	}
 
-	return nm, newfn, typecheck.Stmt(fncall)
+	recordFuncForVar(nm, fn)
+
+	return fn
 }
 
 // mapinitgen is a counter used to uniquify compiler-generated
@@ -1097,9 +1214,7 @@ func AddKeepRelocations() {
 		if vs == nil {
 			base.Fatalf("bad: mapvar %v has no linksym", k)
 		}
-		r := obj.Addrel(vs)
-		r.Sym = fs
-		r.Type = objabi.R_KEEP
+		vs.AddRel(base.Ctxt, obj.Reloc{Type: objabi.R_KEEP, Sym: fs})
 		if base.Debug.WrapGlobalMapDbg > 1 {
 			fmt.Fprintf(os.Stderr, "=-= add R_KEEP relo from %s to %s\n",
 				vs.Name, fs.Name)
@@ -1108,31 +1223,79 @@ func AddKeepRelocations() {
 	varToMapInit = nil
 }
 
-// OutlineMapInits walks through a list of init statements (candidates
-// for inclusion in the package "init" function) and returns an
-// updated list in which items corresponding to map variable
-// initializations have been replaced with calls to outline "map init"
-// functions (if legal/profitable). Return value is an updated list
-// and a list of any newly generated "map init" functions.
-func OutlineMapInits(stmts []ir.Node) ([]ir.Node, []*ir.Func) {
+// OutlineMapInits replaces global map initializers with outlined
+// calls to separate "map init" functions (where possible and
+// profitable), to facilitate better dead-code elimination by the
+// linker.
+func OutlineMapInits(fn *ir.Func) {
 	if base.Debug.WrapGlobalMapCtl == 1 {
-		return stmts, nil
+		return
 	}
-	newfuncs := []*ir.Func{}
-	for i := range stmts {
-		s := stmts[i]
-		// Call the helper tryWrapGlobalMapInit to see if the LHS of
-		// this assignment is to a map var, and if so whether the RHS
-		// should be outlined into a separate init function. If the
-		// outline goes through, then replace the original init
-		// statement with the call to the outlined func, and append
-		// the new outlined func to our return list.
-		if mapvar, genfn, call := tryWrapGlobalMapInit(s); call != nil {
-			stmts[i] = call
-			newfuncs = append(newfuncs, genfn)
-			recordFuncForVar(mapvar, genfn)
+
+	outlined := 0
+	for i, stmt := range fn.Body {
+		// Attempt to outline stmt. If successful, replace it with a call
+		// to the returned wrapper function.
+		if wrapperFn := tryWrapGlobalInit(stmt); wrapperFn != nil {
+			ir.WithFunc(fn, func() {
+				fn.Body[i] = typecheck.Call(stmt.Pos(), wrapperFn.Nname, nil, false)
+			})
+			outlined++
 		}
 	}
 
-	return stmts, newfuncs
+	if base.Debug.WrapGlobalMapDbg > 1 {
+		fmt.Fprintf(os.Stderr, "=-= outlined %v map initializations\n", outlined)
+	}
+}
+
+const maxInitStatements = 1000
+
+// SplitLargeInit breaks up a large "init" function into smaller chunks to avoid slow compilation.
+func SplitLargeInit(fn *ir.Func) {
+	if !fn.IsPackageInit() || len(fn.Body) <= maxInitStatements {
+		return
+	}
+	var calls []ir.Node
+	for chunk := range slices.Chunk(fn.Body, maxInitStatements) {
+		varInitFn := generateVarInitFunc(chunk)
+		ir.WithFunc(fn, func() {
+			calls = append(calls, typecheck.Call(varInitFn.Pos(), varInitFn.Nname, nil, false))
+		})
+	}
+	fn.Body = calls
+}
+
+// CanOptimize reports whether the given fn can be optimized for static assignments.
+func CanOptimize(fn *ir.Func) bool {
+	name := fn.Sym().Name
+	return name == "init" || strings.HasPrefix(name, varInitFuncPrefix)
+}
+
+// varInitGen is a counter used to uniquify compiler-generated functions for initializing variables.
+var varInitGen int
+
+const varInitFuncPrefix = "init.var."
+
+// Create a new function that will (eventually) have this form:
+//
+//	func init.var.%d() {
+//		...
+//	}
+func generateVarInitFunc(body []ir.Node) *ir.Func {
+	pos := base.AutogeneratedPos
+	base.Pos = pos
+
+	sym := typecheck.LookupNum(varInitFuncPrefix, varInitGen)
+	varInitGen++
+
+	fn := ir.NewFunc(pos, pos, sym, types.NewSignature(nil, nil, nil))
+	fn.SetInlinabilityChecked(true) // suppress inlining; otherwise, we end up with giant init eventually.
+	fn.SetWrapper(true)             // less disruptive on backtraces.
+	typecheck.DeclFunc(fn)
+
+	fn.Body = body
+	typecheck.FinishFuncBody()
+
+	return fn
 }

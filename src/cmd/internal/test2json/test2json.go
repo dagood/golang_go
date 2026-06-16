@@ -29,12 +29,17 @@ const (
 
 // event is the JSON struct we emit.
 type event struct {
-	Time    *time.Time `json:",omitempty"`
-	Action  string
-	Package string     `json:",omitempty"`
-	Test    string     `json:",omitempty"`
-	Elapsed *float64   `json:",omitempty"`
-	Output  *textBytes `json:",omitempty"`
+	Time        *time.Time `json:",omitempty"`
+	Action      string
+	Package     string     `json:",omitempty"`
+	Test        string     `json:",omitempty"`
+	Elapsed     *float64   `json:",omitempty"`
+	Output      *textBytes `json:",omitempty"`
+	OutputType  string     `json:",omitempty"`
+	FailedBuild string     `json:",omitempty"`
+	Key         string     `json:",omitempty"`
+	Value       string     `json:",omitempty"`
+	Path        string     `json:",omitempty"`
 }
 
 // textBytes is a hack to get JSON to emit a []byte as a string
@@ -49,16 +54,23 @@ func (b textBytes) MarshalText() ([]byte, error) { return b, nil }
 // It implements io.WriteCloser; the caller writes test output in,
 // and the converter writes JSON output to w.
 type Converter struct {
-	w          io.Writer  // JSON output stream
-	pkg        string     // package to name in events
-	mode       Mode       // mode bits
-	start      time.Time  // time converter started
-	testName   string     // name of current test, for output attribution
-	report     []*event   // pending test result reports (nested for subtests)
-	result     string     // overall test result if seen
-	input      lineBuffer // input buffer
-	output     lineBuffer // output buffer
-	needMarker bool       // require ^V marker to introduce test framing line
+	w           io.Writer  // JSON output stream
+	pkg         string     // package to name in events
+	mode        Mode       // mode bits
+	start       time.Time  // time converter started
+	testName    string     // name of current test, for output attribution
+	report      []*event   // pending test result reports (nested for subtests)
+	result      string     // overall test result if seen
+	input       lineBuffer // input buffer
+	output      lineBuffer // output buffer
+	markFraming bool       // require ^V marker to introduce test framing line
+	markErrEnd  bool       // within an error, require ^N marker to end
+	markEscape  bool       // the next character should be considered to be escaped
+	isFraming   bool       // indicates the output being written is framing
+
+	// failedBuild is set to the package ID of the cause of a build failure,
+	// if that's what caused this test to fail.
+	failedBuild string
 }
 
 // inBuffer and outBuffer are the input and output buffer sizes.
@@ -88,6 +100,15 @@ var (
 // NewConverter returns a "test to json" converter.
 // Writes on the returned writer are written as JSON to w,
 // with minimal delay.
+//
+// Writes on the returned writer are expected to contain markers. Test framing
+// such as "=== RUN" and friends are expected to be prefixed with ^V (\x22).
+// Error output is expected to be prefixed with ^O (\x0f) and suffixed with ^N
+// (\x0e). Other occurrences of these control characters (e.g. calls to T.Log)
+// must be escaped with ^[ (\x1b). Test framing will generate events such as
+// start, run, etc as well as output events with an output type of "frame".
+// Error output will generate output events with an output type of "error" or
+// "error-continue". See cmd/test2json help for details.
 //
 // The writes to w are whole JSON events ending in \n,
 // so that it is safe to run multiple tests writing to multiple converters
@@ -140,7 +161,19 @@ func (c *Converter) Exited(err error) {
 	}
 }
 
-const marker = byte(0x16) // ^V
+// SetFailedBuild sets the package ID that is the root cause of a build failure
+// for this test. This will be reported in the final "fail" event's FailedBuild
+// field.
+func (c *Converter) SetFailedBuild(pkgID string) {
+	c.failedBuild = pkgID
+}
+
+const (
+	markFraming  byte = 'V' &^ '@' // ^V: framing
+	markErrBegin byte = 'O' &^ '@' // ^O: start of error
+	markErrEnd   byte = 'N' &^ '@' // ^N: end of error
+	markEscape   byte = '[' &^ '@' // ^[: escape
+)
 
 var (
 	// printed by test on successful run.
@@ -165,6 +198,8 @@ var (
 		[]byte("=== PASS  "),
 		[]byte("=== FAIL  "),
 		[]byte("=== SKIP  "),
+		[]byte("=== ATTR  "),
+		[]byte("=== ARTIFACTS "),
 	}
 
 	reports = [][]byte{
@@ -188,11 +223,11 @@ func (c *Converter) handleInputLine(line []byte) {
 		return
 	}
 	sawMarker := false
-	if c.needMarker && line[0] != marker {
+	if c.markFraming && line[0] != markFraming {
 		c.output.write(line)
 		return
 	}
-	if line[0] == marker {
+	if line[0] == markFraming {
 		c.output.flush()
 		sawMarker = true
 		line = line[1:]
@@ -217,8 +252,8 @@ func (c *Converter) handleInputLine(line []byte) {
 	if bytes.Equal(trim, bigPass) || bytes.Equal(trim, bigFail) || bytes.HasPrefix(trim, bigFailErrorPrefix) {
 		c.flushReport(0)
 		c.testName = ""
-		c.needMarker = sawMarker
-		c.output.write(line)
+		c.markFraming = sawMarker
+		c.writeFraming(line)
 		if bytes.Equal(trim, bigPass) {
 			c.result = "pass"
 		} else {
@@ -236,7 +271,6 @@ func (c *Converter) handleInputLine(line []byte) {
 	// "=== RUN   "
 	// "=== PAUSE "
 	// "=== CONT  "
-	actionColon := false
 	origLine := line
 	ok := false
 	indent := 0
@@ -258,7 +292,6 @@ func (c *Converter) handleInputLine(line []byte) {
 		}
 		for _, magic := range reports {
 			if bytes.HasPrefix(line, magic) {
-				actionColon = true
 				ok = true
 				break
 			}
@@ -281,16 +314,11 @@ func (c *Converter) handleInputLine(line []byte) {
 		return
 	}
 
-	// Parse out action and test name.
-	i := 0
-	if actionColon {
-		i = bytes.IndexByte(line, ':') + 1
-	}
-	if i == 0 {
-		i = len(updates[0])
-	}
-	action := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(string(line[4:i])), ":"))
-	name := strings.TrimSpace(string(line[i:]))
+	// Parse out action and test name from "=== ACTION: Name".
+	action, name, _ := strings.Cut(string(line[len("=== "):]), " ")
+	action = strings.TrimSuffix(action, ":")
+	action = strings.ToLower(action)
+	name = strings.TrimSpace(name)
 
 	e := &event{Action: action}
 	if line[0] == '-' { // PASS or FAIL report
@@ -313,17 +341,25 @@ func (c *Converter) handleInputLine(line []byte) {
 			return
 		}
 		// Flush reports at this indentation level or deeper.
-		c.needMarker = sawMarker
+		c.markFraming = sawMarker
 		c.flushReport(indent)
 		e.Test = name
 		c.testName = name
 		c.report = append(c.report, e)
-		c.output.write(origLine)
+		c.writeFraming(origLine)
 		return
+	}
+	switch action {
+	case "artifacts":
+		name, e.Path, _ = strings.Cut(name, " ")
+	case "attr":
+		var rest string
+		name, rest, _ = strings.Cut(name, " ")
+		e.Key, e.Value, _ = strings.Cut(rest, " ")
 	}
 	// === update.
 	// Finish any pending PASS/FAIL reports.
-	c.needMarker = sawMarker
+	c.markFraming = sawMarker
 	c.flushReport(0)
 	c.testName = name
 
@@ -337,14 +373,22 @@ func (c *Converter) handleInputLine(line []byte) {
 		// For a pause, we want to write the pause notification before
 		// delivering the pause event, just so it doesn't look like the test
 		// is generating output immediately after being paused.
-		c.output.write(origLine)
+		c.writeFraming(origLine)
 	}
 	c.writeEvent(e)
 	if action != "pause" {
-		c.output.write(origLine)
+		c.writeFraming(origLine)
 	}
 
 	return
+}
+
+func (c *Converter) writeFraming(line []byte) {
+	// This is a less than ideal way to 'pass' state around, but it's the best
+	// we can do without substantially modifying the line buffer.
+	c.isFraming = true
+	defer func() { c.isFraming = false }()
+	c.output.write(line)
 }
 
 // flushReport flushes all pending PASS/FAIL reports at levels >= depth.
@@ -369,6 +413,9 @@ func (c *Converter) Close() error {
 			dt := time.Since(c.start).Round(1 * time.Millisecond).Seconds()
 			e.Elapsed = &dt
 		}
+		if c.result == "fail" {
+			e.FailedBuild = c.failedBuild
+		}
 		c.writeEvent(e)
 	}
 	return nil
@@ -376,10 +423,91 @@ func (c *Converter) Close() error {
 
 // writeOutputEvent writes a single output event with the given bytes.
 func (c *Converter) writeOutputEvent(out []byte) {
-	c.writeEvent(&event{
-		Action: "output",
-		Output: (*textBytes)(&out),
-	})
+	var typ string
+	if c.isFraming {
+		typ = "frame"
+	} else if c.markErrEnd {
+		typ = "error-continue"
+	}
+
+	// Check for markers.
+	//
+	// An escape mark and the character it escapes may be passed in separate
+	// buffers. We must maintain state between calls to account for this, thus
+	// [Converter.markEscape] is set on one loop iteration and used to skip a
+	// character on the next.
+	//
+	// In most cases, [markErrBegin] will be the first character of a line and
+	// [markErrEnd] will be the last. However we cannot rely on that. For
+	// example, if a call to [T.Error] is preceded by a call to [fmt.Print] that
+	// does not print a newline. Thus we track the error status with
+	// [Converter.markErrEnd] and issue separate events if there is content
+	// before [markErrBegin] or after [markErrEnd].
+	for i := 0; i < len(out); i++ {
+		if c.markEscape {
+			c.markEscape = false
+			continue
+		}
+
+		switch out[i] {
+		case markEscape:
+			// Elide the mark
+			out = append(out[:i], out[i+1:]...)
+			i--
+
+			// Skip the next character
+			c.markEscape = true
+
+		case markErrBegin:
+			// If there is content before the mark, emit it as a separate event
+			if i > 0 {
+				out2 := out[:i]
+				c.writeEvent(&event{
+					Action:     "output",
+					Output:     (*textBytes)(&out2),
+					OutputType: typ,
+				})
+			}
+
+			// Process the error
+			c.markErrEnd = true
+			typ = "error"
+			out = out[i+1:]
+			i = 0
+
+		case markErrEnd:
+			// Elide the mark
+			out = append(out[:i], out[i+1:]...)
+
+			// If the next character is \n, include it
+			if i < len(out) && out[i] == '\n' {
+				i++
+			}
+
+			// Emit the error
+			out2 := out[:i]
+			c.writeEvent(&event{
+				Action:     "output",
+				Output:     (*textBytes)(&out2),
+				OutputType: typ,
+			})
+
+			// Process the rest
+			c.markErrEnd = false
+			typ = ""
+			out = out[i:]
+			i = 0
+		}
+	}
+
+	// Send the remaining output
+	if len(out) > 0 {
+		c.writeEvent(&event{
+			Action:     "output",
+			Output:     (*textBytes)(&out),
+			OutputType: typ,
+		})
+	}
 }
 
 // writeEvent writes a single event.
@@ -414,10 +542,11 @@ func (c *Converter) writeEvent(e *event) {
 // calling part(x) for sections of the line. The line will be split at UTF8 boundaries,
 // and the final call to part for a long line includes the final newline.
 type lineBuffer struct {
-	b    []byte       // buffer
-	mid  bool         // whether we're in the middle of a long line
-	line func([]byte) // line callback
-	part func([]byte) // partial line callback
+	b       []byte       // buffer
+	mid     bool         // whether we're in the middle of a long line
+	line    func([]byte) // line callback
+	part    func([]byte) // partial line callback
+	escaped bool
 }
 
 // write writes b to the buffer.
@@ -431,7 +560,7 @@ func (l *lineBuffer) write(b []byte) {
 		// Process lines in l.b.
 		i := 0
 		for i < len(l.b) {
-			j, w := indexEOL(l.b[i:])
+			j, w := l.indexEOL(l.b[i:])
 			if j < 0 {
 				if !l.mid {
 					if j := bytes.IndexByte(l.b[i:], '\t'); j >= 0 {
@@ -479,12 +608,26 @@ func (l *lineBuffer) write(b []byte) {
 // A line ending is either a \n or the empty string just before a ^V not beginning a line.
 // The output width for \n is 1 (meaning it should be printed)
 // but the output width for ^V is 0 (meaning it should be left to begin the next line).
-func indexEOL(b []byte) (pos, wid int) {
+func (l *lineBuffer) indexEOL(b []byte) (pos, wid int) {
 	for i, c := range b {
+		// Escape has no effect on \n
 		if c == '\n' {
 			return i, 1
 		}
-		if c == marker && i > 0 { // test -v=json emits ^V at start of framing lines
+
+		// Ignore this character if the previous one was ^[
+		if l.escaped {
+			l.escaped = false
+			continue
+		}
+
+		// If this character is `^[`, set the escaped flag and continue
+		if c == markEscape {
+			l.escaped = true
+			continue
+		}
+
+		if c == markFraming && i > 0 { // test -v=json emits ^V at start of framing lines
 			return i, 0
 		}
 	}

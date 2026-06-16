@@ -32,9 +32,13 @@ type Tree struct {
 	treeSet    map[string]*Tree
 	actionLine int // line of left delim starting action
 	rangeDepth int
+	stackDepth int // depth of nested parenthesized expressions
+
+	leftDelim  string
+	rightDelim string
 }
 
-// A mode value is a set of flags (or 0). Modes control parser behavior.
+// A Mode value is a set of flags (or 0). Modes control parser behavior.
 type Mode uint
 
 const (
@@ -42,20 +46,33 @@ const (
 	SkipFuncCheck                  // do not check that functions are defined
 )
 
-// Copy returns a copy of the Tree. Any parsing state is discarded.
+// maxStackDepth is the maximum depth permitted for nested
+// parenthesized expressions.
+var maxStackDepth = 10000
+
+// init reduces maxStackDepth for WebAssembly due to its smaller stack size.
+func init() {
+	if runtime.GOARCH == "wasm" {
+		maxStackDepth = 1000
+	}
+}
+
+// Copy returns a copy of the [Tree]. Any parsing state is discarded.
 func (t *Tree) Copy() *Tree {
 	if t == nil {
 		return nil
 	}
 	return &Tree{
-		Name:      t.Name,
-		ParseName: t.ParseName,
-		Root:      t.Root.CopyList(),
-		text:      t.text,
+		Name:       t.Name,
+		ParseName:  t.ParseName,
+		Root:       t.Root.CopyList(),
+		text:       t.text,
+		leftDelim:  t.leftDelim,
+		rightDelim: t.rightDelim,
 	}
 }
 
-// Parse returns a map from template name to parse.Tree, created by parsing the
+// Parse returns a map from template name to [Tree], created by parsing the
 // templates described in the argument string. The top-level template will be
 // given the specified name. If an error is encountered, parsing stops and an
 // empty map is returned with the error.
@@ -223,6 +240,7 @@ func (t *Tree) startParse(funcs []map[string]any, lex *lexer, treeSet map[string
 	t.vars = []string{"$"}
 	t.funcs = funcs
 	t.treeSet = treeSet
+	t.stackDepth = 0
 	lex.options = lexOptions{
 		emitComment: t.Mode&ParseComments != 0,
 		breakOK:     !t.hasFunction("break"),
@@ -245,7 +263,15 @@ func (t *Tree) stopParse() {
 func (t *Tree) Parse(text, leftDelim, rightDelim string, treeSet map[string]*Tree, funcs ...map[string]any) (tree *Tree, err error) {
 	defer t.recover(&err)
 	t.ParseName = t.Name
-	lexer := lex(t.Name, text, leftDelim, rightDelim)
+	t.leftDelim = leftDelim
+	if t.leftDelim == "" {
+		t.leftDelim = defaultLeftDelim
+	}
+	t.rightDelim = rightDelim
+	if t.rightDelim == "" {
+		t.rightDelim = defaultRightDelim
+	}
+	lexer := lex(t.Name, text, t.leftDelim, t.rightDelim)
 	t.startParse(funcs, lexer, treeSet)
 	t.text = text
 	t.parse()
@@ -305,6 +331,8 @@ func (t *Tree) parse() {
 				newT := New("definition") // name will be updated once we know it.
 				newT.text = t.text
 				newT.Mode = t.Mode
+				newT.leftDelim = t.leftDelim
+				newT.rightDelim = t.rightDelim
 				newT.ParseName = t.ParseName
 				newT.startParse(t.funcs, t.lex, t.treeSet)
 				newT.parseDefinition()
@@ -521,7 +549,7 @@ func (t *Tree) checkPipeline(pipe *PipeNode, context string) {
 	}
 }
 
-func (t *Tree) parseControl(allowElseIf bool, context string) (pos Pos, line int, pipe *PipeNode, list, elseList *ListNode) {
+func (t *Tree) parseControl(context string) (pos Pos, line int, pipe *PipeNode, list, elseList *ListNode) {
 	defer t.popVars(len(t.vars))
 	pipe = t.pipeline(context, itemRightDelim)
 	if context == "range" {
@@ -533,28 +561,31 @@ func (t *Tree) parseControl(allowElseIf bool, context string) (pos Pos, line int
 		t.rangeDepth--
 	}
 	switch next.Type() {
-	case nodeEnd: //done
+	case nodeEnd: // done
 	case nodeElse:
-		if allowElseIf {
-			// Special case for "else if". If the "else" is followed immediately by an "if",
-			// the elseControl will have left the "if" token pending. Treat
-			//	{{if a}}_{{else if b}}_{{end}}
-			// as
-			//	{{if a}}_{{else}}{{if b}}_{{end}}{{end}}.
-			// To do this, parse the if as usual and stop at it {{end}}; the subsequent{{end}}
-			// is assumed. This technique works even for long if-else-if chains.
-			// TODO: Should we allow else-if in with and range?
-			if t.peek().typ == itemIf {
-				t.next() // Consume the "if" token.
-				elseList = t.newList(next.Position())
-				elseList.append(t.ifControl())
-				// Do not consume the next item - only one {{end}} required.
-				break
+		// Special case for "else if" and "else with".
+		// If the "else" is followed immediately by an "if" or "with",
+		// the elseControl will have left the "if" or "with" token pending. Treat
+		//	{{if a}}_{{else if b}}_{{end}}
+		//  {{with a}}_{{else with b}}_{{end}}
+		// as
+		//	{{if a}}_{{else}}{{if b}}_{{end}}{{end}}
+		//  {{with a}}_{{else}}{{with b}}_{{end}}{{end}}.
+		// To do this, parse the "if" or "with" as usual and stop at it {{end}};
+		// the subsequent{{end}} is assumed. This technique works even for long if-else-if chains.
+		if context == "if" && t.peek().typ == itemIf {
+			t.next() // Consume the "if" token.
+			elseList = t.newList(next.Position())
+			elseList.append(t.ifControl())
+		} else if context == "with" && t.peek().typ == itemWith {
+			t.next()
+			elseList = t.newList(next.Position())
+			elseList.append(t.withControl())
+		} else {
+			elseList, next = t.itemList()
+			if next.Type() != nodeEnd {
+				t.errorf("expected end; found %s", next)
 			}
-		}
-		elseList, next = t.itemList()
-		if next.Type() != nodeEnd {
-			t.errorf("expected end; found %s", next)
 		}
 	}
 	return pipe.Position(), pipe.Line, pipe, list, elseList
@@ -567,7 +598,7 @@ func (t *Tree) parseControl(allowElseIf bool, context string) (pos Pos, line int
 //
 // If keyword is past.
 func (t *Tree) ifControl() Node {
-	return t.newIf(t.parseControl(true, "if"))
+	return t.newIf(t.parseControl("if"))
 }
 
 // Range:
@@ -577,7 +608,7 @@ func (t *Tree) ifControl() Node {
 //
 // Range keyword is past.
 func (t *Tree) rangeControl() Node {
-	r := t.newRange(t.parseControl(false, "range"))
+	r := t.newRange(t.parseControl("range"))
 	return r
 }
 
@@ -588,7 +619,7 @@ func (t *Tree) rangeControl() Node {
 //
 // If keyword is past.
 func (t *Tree) withControl() Node {
-	return t.newWith(t.parseControl(false, "with"))
+	return t.newWith(t.parseControl("with"))
 }
 
 // End:
@@ -606,10 +637,11 @@ func (t *Tree) endControl() Node {
 //
 // Else keyword is past.
 func (t *Tree) elseControl() Node {
-	// Special case for "else if".
 	peek := t.peekNonSpace()
-	if peek.typ == itemIf {
-		// We see "{{else if ... " but in effect rewrite it to {{else}}{{if ... ".
+	// The "{{else if ... " and "{{else with ..." will be
+	// treated as "{{else}}{{if ..." and "{{else}}{{with ...".
+	// So return the else node here.
+	if peek.typ == itemIf || peek.typ == itemWith {
 		return t.newElse(peek.pos, peek.line)
 	}
 	token := t.expect(itemRightDelim, "else")
@@ -633,6 +665,8 @@ func (t *Tree) blockControl() Node {
 	block := New(name) // name will be updated once we know it.
 	block.text = t.text
 	block.Mode = t.Mode
+	block.leftDelim = t.leftDelim
+	block.rightDelim = t.rightDelim
 	block.ParseName = t.ParseName
 	block.startParse(t.funcs, t.lex, t.treeSet)
 	var end Node
@@ -783,6 +817,11 @@ func (t *Tree) term() Node {
 		}
 		return number
 	case itemLeftParen:
+		if t.stackDepth >= maxStackDepth {
+			t.errorf("max expression depth exceeded")
+		}
+		t.stackDepth++
+		defer func() { t.stackDepth-- }()
 		return t.pipeline("parenthesized pipeline", itemRightParen)
 	case itemString, itemRawString:
 		s, err := strconv.Unquote(token.val)

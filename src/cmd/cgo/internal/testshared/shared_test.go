@@ -79,10 +79,10 @@ func goCmd(t *testing.T, args ...string) string {
 	if err != nil {
 		if t != nil {
 			t.Helper()
-			t.Fatalf("executing %s failed %v:\n%s", strings.Join(c.Args, " "), err, stderr)
+			t.Fatalf("executing %#q failed %v:\n%s\n%s", c, err, stderr, output)
 		} else {
 			// Panic instead of using log.Fatalf so that deferred cleanup may run in testMain.
-			log.Panicf("executing %s failed %v:\n%s", strings.Join(c.Args, " "), err, stderr)
+			log.Panicf("executing %#q failed %v:\n%s\n%s", c, err, stderr, output)
 		}
 	}
 	if testing.Verbose() && t != nil {
@@ -96,7 +96,7 @@ func goCmd(t *testing.T, args ...string) string {
 
 // TestMain calls testMain so that the latter can use defer (TestMain exits with os.Exit).
 func testMain(m *testing.M) (int, error) {
-	if testing.Short() && os.Getenv("GO_BUILDER_NAME") == "" {
+	if testing.Short() && testenv.Builder() == "" {
 		globalSkip = func(t testing.TB) { t.Skip("short mode and $GO_BUILDER_NAME not set") }
 		return m.Run(), nil
 	}
@@ -554,7 +554,7 @@ func checkPIE(t *testing.T, name string) {
 }
 
 func TestTrivialPIE(t *testing.T) {
-	if strings.HasSuffix(os.Getenv("GO_BUILDER_NAME"), "-alpine") {
+	if strings.Contains(testenv.Builder(), "-alpine") {
 		t.Skip("skipping on alpine until issue #54354 resolved")
 	}
 	globalSkip(t)
@@ -1159,6 +1159,12 @@ func TestIssue47873(t *testing.T) {
 	goCmd(t, "run", "-linkshared", "./issue47837/main")
 }
 
+func TestIssue62277(t *testing.T) {
+	globalSkip(t)
+	goCmd(t, "install", "-buildmode=shared", "-linkshared", "./issue62277/p")
+	goCmd(t, "test", "-linkshared", "./issue62277")
+}
+
 // Test that we can build std in shared mode.
 func TestStd(t *testing.T) {
 	if testing.Short() {
@@ -1169,10 +1175,10 @@ func TestStd(t *testing.T) {
 	tmpDir := t.TempDir()
 	// Use a temporary pkgdir to not interfere with other tests, and not write to GOROOT.
 	// Cannot use goCmd as it runs with cloned GOROOT which is incomplete.
-	runWithEnv(t, "building std", []string{"GOROOT=" + oldGOROOT},
+	runWithEnv(t, "building std", []string{"GOROOT=" + oldGOROOT, "GOEXPERIMENT=nosimd"},
 		filepath.Join(oldGOROOT, "bin", "go"), "install", "-buildmode=shared", "-pkgdir="+tmpDir, "std")
 
 	// Issue #58966.
-	runWithEnv(t, "testing issue #58966", []string{"GOROOT=" + oldGOROOT},
+	runWithEnv(t, "testing issue #58966", []string{"GOROOT=" + oldGOROOT, "GOEXPERIMENT=nosimd"},
 		filepath.Join(oldGOROOT, "bin", "go"), "run", "-linkshared", "-pkgdir="+tmpDir, "./issue58966/main.go")
 }
