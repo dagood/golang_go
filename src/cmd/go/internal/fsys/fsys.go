@@ -116,6 +116,25 @@ type replace struct {
 
 var binds []replace
 
+// extraReplace holds file replacements registered programmatically via Replace,
+// for example the MS_GOTOOLSET* go.mod/go.sum overrides. They are merged into
+// overlay by Init alongside any entries from the -overlay file.
+var extraReplace []replace
+
+// Replace arranges for the file named actual to be used in place of the file
+// named from. Unlike Bind, which mounts a directory, Replace operates on a
+// single regular file, so the replaced path continues to appear as a file
+// (not a directory) when its parent directory is read.
+//
+// Replace must be called before Init. It is intended for redirecting individual
+// files such as go.mod and go.sum to alternate locations.
+func Replace(from, actual string) {
+	if from == "" || actual == "" {
+		panic("Replace of empty path")
+	}
+	extraReplace = append(extraReplace, replace{from: abs(from), to: abs(actual)})
+}
+
 // Bind makes the virtual file system use dir as if it were mounted at mtpt,
 // like Plan 9's “bind” or Linux's “mount --bind”, or like os.Symlink
 // but without the symbolic link.
@@ -176,6 +195,7 @@ type info struct {
 	replaced bool
 	dir      bool // must be dir
 	file     bool // must be file
+	binded   bool // actual is reached through a Bind; may be a file or a directory
 	actual   string
 }
 
@@ -188,6 +208,7 @@ func stat(path string) info {
 
 	// Apply bind replacements before applying overlay.
 	replaced := false
+	binded := false
 	for _, r := range binds {
 		if str.HasFilePathPrefix(apath, r.from) {
 			// apath is below r.from.
@@ -195,6 +216,7 @@ func stat(path string) info {
 			apath = r.to + apath[len(r.from):]
 			path = apath
 			replaced = true
+			binded = true
 			break
 		}
 		if str.HasFilePathPrefix(r.from, apath) {
@@ -239,7 +261,7 @@ func stat(path string) info {
 		// Parent replaced by file; path is deleted.
 		return info{abs: apath, deleted: true}
 	}
-	return info{abs: apath, replaced: replaced, actual: path}
+	return info{abs: apath, replaced: replaced, binded: binded, actual: path}
 }
 
 // children returns a sequence of (name, info)
@@ -346,14 +368,21 @@ func Init() error {
 		return nil
 	}
 
-	if OverlayFile == "" {
+	if OverlayFile == "" && len(extraReplace) == 0 {
 		return nil
 	}
 
-	Trace("ReadFile", OverlayFile)
-	b, err := os.ReadFile(OverlayFile)
-	if err != nil {
-		return fmt.Errorf("reading overlay: %v", err)
+	var b []byte
+	if OverlayFile != "" {
+		Trace("ReadFile", OverlayFile)
+		var err error
+		b, err = os.ReadFile(OverlayFile)
+		if err != nil {
+			return fmt.Errorf("reading overlay: %v", err)
+		}
+	} else {
+		// No -overlay file, but we still have programmatic replacements to apply.
+		b = []byte("{}")
 	}
 	return initFromJSON(b)
 }
@@ -376,6 +405,15 @@ func initFromJSON(js []byte) error {
 		}
 		seen[afrom] = from
 		list = append(list, replace{from: afrom, to: abs(ojs.Replace[from])})
+	}
+
+	// Merge in any replacements registered via Replace (already abs).
+	for _, r := range extraReplace {
+		if old, ok := seen[r.from]; ok {
+			return fmt.Errorf("duplicate paths %s and %s in overlay map", old, r.from)
+		}
+		seen[r.from] = r.from
+		list = append(list, r)
 	}
 
 	slices.SortFunc(list, func(x, y replace) int { return cmp(x.from, y.from) })
@@ -409,6 +447,14 @@ func IsDir(path string) (bool, error) {
 	switch info := stat(path); {
 	case info.dir:
 		return true, nil
+	case info.binded:
+		// Reached through a Bind; actual is a real path that may be a
+		// file or a directory. Consult the real file system.
+		fi, err := os.Stat(info.actual)
+		if err != nil {
+			return false, err
+		}
+		return fi.IsDir(), nil
 	case info.deleted, info.replaced:
 		return false, nil
 	}
@@ -657,6 +703,11 @@ func overlayStat(op, path string, osStat func(string) (fs.FileInfo, error)) (fs.
 			return nil, err
 		}
 		if ainfo.IsDir() {
+			if info.binded {
+				// Reached through a Bind, which may legitimately map to a
+				// directory. Report it as a directory rather than rejecting it.
+				return fakeFile{name: filepath.Base(path), real: ainfo}, nil
+			}
 			return nil, &fs.PathError{Op: op, Path: path, Err: fmt.Errorf("overlay maps to directory")}
 		}
 		return fakeFile{name: filepath.Base(path), real: ainfo}, nil

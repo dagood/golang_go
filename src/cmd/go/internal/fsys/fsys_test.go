@@ -24,6 +24,7 @@ func resetForTesting() {
 	cwd = sync.OnceValue(cwdOnce)
 	overlay = nil
 	binds = nil
+	extraReplace = nil
 }
 
 // initOverlay resets the overlay state to reflect the config.
@@ -1263,6 +1264,92 @@ xx.go
 	testReadDir(t, "mtpt2/a", "b/")
 	testReadDir(t, "mtpt2/a/b", "x/", "x.go")
 	testReadFile(t, "mtpt2/a/b/x.go", "replaced/x.go\n")
+}
+
+// TestBindDirStat checks that Stat, Lstat, and IsDir report directories
+// reached through a Bind as directories, rather than rejecting them the way an
+// overlay file replacement that maps to a directory is rejected. This supports
+// binding a directory (such as an out-of-tree vendor directory) into the
+// virtual file system.
+func TestBindDirStat(t *testing.T) {
+	initOverlay(t, `{}
+-- replaced/x/y/z.go --
+replaced/x/y/z.go
+`)
+
+	Bind("replaced", "mtpt")
+
+	// The mountpoint and intermediate directories must look like directories.
+	for _, dir := range []string{"mtpt", "mtpt/x", "mtpt/x/y"} {
+		fi, err := Stat(dir)
+		if err != nil {
+			t.Errorf("Stat(%q): unexpected error %v", dir, err)
+		} else if !fi.IsDir() {
+			t.Errorf("Stat(%q).IsDir() = false, want true", dir)
+		}
+		fi, err = Lstat(dir)
+		if err != nil {
+			t.Errorf("Lstat(%q): unexpected error %v", dir, err)
+		} else if !fi.IsDir() {
+			t.Errorf("Lstat(%q).IsDir() = false, want true", dir)
+		}
+		isDir, err := IsDir(dir)
+		if err != nil {
+			t.Errorf("IsDir(%q): unexpected error %v", dir, err)
+		} else if !isDir {
+			t.Errorf("IsDir(%q) = false, want true", dir)
+		}
+	}
+
+	// A file reached through the bind must still look like a file.
+	file := "mtpt/x/y/z.go"
+	fi, err := Stat(file)
+	if err != nil {
+		t.Errorf("Stat(%q): unexpected error %v", file, err)
+	} else if fi.IsDir() {
+		t.Errorf("Stat(%q).IsDir() = true, want false", file)
+	}
+	if isDir, err := IsDir(file); err != nil {
+		t.Errorf("IsDir(%q): unexpected error %v", file, err)
+	} else if isDir {
+		t.Errorf("IsDir(%q) = true, want false", file)
+	}
+}
+
+// TestReplace checks that a single file registered with Replace is used in
+// place of the original path, while continuing to appear as a regular file.
+func TestReplace(t *testing.T) {
+	initOverlay(t, `{}
+-- original/go.mod --
+original go.mod
+-- actual/go.mod --
+actual go.mod
+`)
+
+	dir := cwd()
+	from := filepath.Join(dir, "original", "go.mod")
+	actual := filepath.Join(dir, "actual", "go.mod")
+	Replace(from, actual)
+	// Rebuild the overlay so the registered replacement takes effect.
+	if err := initFromJSON([]byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+
+	testReadFile(t, "original/go.mod", "actual go.mod\n")
+
+	if !Replaced(from) {
+		t.Errorf("Replaced(%q) = false, want true", from)
+	}
+	if got := Actual(from); got != actual {
+		t.Errorf("Actual(%q) = %q, want %q", from, got, actual)
+	}
+	fi, err := Stat(from)
+	if err != nil {
+		t.Fatalf("Stat(%q): unexpected error %v", from, err)
+	}
+	if fi.IsDir() {
+		t.Errorf("Stat(%q).IsDir() = true, want false", from)
+	}
 }
 
 var badOverlayTests = []struct {

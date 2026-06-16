@@ -29,6 +29,7 @@ import (
 	"cmd/go/internal/gover"
 	"cmd/go/internal/lockedfile"
 	"cmd/go/internal/modfetch"
+	"cmd/go/internal/mstoolset"
 	"cmd/go/internal/search"
 
 	"golang.org/x/mod/modfile"
@@ -347,6 +348,7 @@ func BinDir(ld *Loader) string {
 func (ld *Loader) InitWorkfile() {
 	// Initialize fsys early because we need overlay to read go.work file.
 	fips140.Init()
+	mstoolset.Init()
 	if err := fsys.Init(); err != nil {
 		base.Fatal(err)
 	}
@@ -470,6 +472,7 @@ func NewLoader() *Loader {
 
 func NewDisabledState() *Loader {
 	fips140.Init()
+	mstoolset.Init()
 	return &Loader{initialized: true, modulesEnabled: false}
 }
 
@@ -488,6 +491,7 @@ func Init(ld *Loader) {
 	ld.initialized = true
 
 	fips140.Init()
+	mstoolset.Init()
 
 	// Keep in sync with WillBeEnabled. We perform extra validation here, and
 	// there are lots of diagnostics and side effects, so we can't use

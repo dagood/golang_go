@@ -1969,7 +1969,7 @@ func (pld *packageLoader) stdVendor(ld *Loader, parentPath, path string) string 
 		if !pld.VendorModulesInGOROOTSrc || !ld.MainModules.Contains("cmd") {
 			vendorPath := pathpkg.Join("cmd", "vendor", path)
 
-			if _, err := os.Stat(filepath.Join(cfg.GOROOTsrc, filepath.FromSlash(vendorPath))); err == nil {
+			if _, err := fsys.Stat(filepath.Join(cfg.GOROOTsrc, filepath.FromSlash(vendorPath))); err == nil {
 				return vendorPath
 			}
 		}
@@ -1987,7 +1987,7 @@ func (pld *packageLoader) stdVendor(ld *Loader, parentPath, path string) string 
 		// pattern, they are not part of the std *module*, and do not affect
 		// 'go mod tidy' and similar module commands when working within std.)
 		vendorPath := pathpkg.Join("vendor", path)
-		if _, err := os.Stat(filepath.Join(cfg.GOROOTsrc, filepath.FromSlash(vendorPath))); err == nil {
+		if _, err := fsys.Stat(filepath.Join(cfg.GOROOTsrc, filepath.FromSlash(vendorPath))); err == nil {
 			return vendorPath
 		}
 	}

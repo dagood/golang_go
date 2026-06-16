@@ -32,6 +32,7 @@ import (
 	"cmd/go/internal/modfetch"
 	"cmd/go/internal/modget"
 	"cmd/go/internal/modload"
+	"cmd/go/internal/mstoolset"
 	"cmd/go/internal/run"
 	"cmd/go/internal/telemetrycmd"
 	"cmd/go/internal/telemetrystats"
@@ -103,6 +104,7 @@ func main() {
 		counter.Open() // Open the telemetry counter file so counters can be written to it.
 	}
 	handleChdirFlag()
+	mstoolset.Init() // Register MS_GOTOOLSET* overrides before any file system access.
 	toolchain.Select()
 
 	if !cmdIsGoTelemetryOff {

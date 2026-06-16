@@ -8,12 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
 	"cmd/go/internal/base"
+	"cmd/go/internal/fsys"
 	"cmd/go/internal/gover"
 
 	"golang.org/x/mod/modfile"
@@ -44,7 +44,7 @@ func readVendorList(vendorDir string) {
 		vendorVersion = make(map[string]string)
 		vendorMeta = make(map[module.Version]vendorMetadata)
 		vendorFile := filepath.Join(vendorDir, "modules.txt")
-		data, err := os.ReadFile(vendorFile)
+		data, err := fsys.ReadFile(vendorFile)
 		if err != nil {
 			if !errors.Is(err, fs.ErrNotExist) {
 				base.Fatalf("go: %s", err)
