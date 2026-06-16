@@ -34,10 +34,10 @@ cd ../importstd
 stderr 'use of vendored package'
 
 
-# When run within the 'std' module, 'go list -test' should report vendored
-# transitive dependencies at their vendored paths.
+# When explicitly run in vendor mode within the 'std' module, 'go list -test'
+# should report vendored transitive dependencies at their vendored paths.
 cd $GOROOT/src
-go list -test -f '{{range .Deps}}{{.}}{{"\n"}}{{end}}' net/http
+go list -mod=vendor -test -f '{{range .Deps}}{{.}}{{"\n"}}{{end}}' net/http
 ! stdout ^golang.org/x/net/http2/hpack
 stdout ^vendor/golang.org/x/net/http2/hpack
 
