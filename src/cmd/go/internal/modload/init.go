@@ -1550,8 +1550,6 @@ func appendGoAndToolchainRoots(roots []module.Version, goVersion, toolchain stri
 
 // mainModuleIsStdOrCmd reports whether one of the main modules is the
 // standard library module ("std" or "cmd") rooted in GOROOT/src.
-// mainModuleIsStdOrCmd reports whether one of the main modules is the
-// standard library module ("std" or "cmd") rooted in GOROOT/src.
 func (ld *Loader) mainModuleIsStdOrCmd() bool {
 	if ld.MainModules == nil {
 		return false
