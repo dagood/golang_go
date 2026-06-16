@@ -220,6 +220,7 @@ func bootstrapBuildTools() {
 	cmd := []string{
 		pathf("%s/bin/go", goroot_bootstrap),
 		"install",
+		"-mod=mod",
 		"-tags=math_big_pure_go compiler_bootstrap purego",
 	}
 	if vflag > 0 {

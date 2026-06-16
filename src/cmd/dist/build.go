@@ -1355,11 +1355,10 @@ func cmdbootstrap() {
 			"Use the -force flag to build anyway.\n", goos, goarch)
 	}
 
-	// Set GOPATH to an internal directory. We shouldn't actually
-	// need to store files here, since the toolchain won't
-	// depend on modules outside of vendor directories, but if
-	// GOPATH points somewhere else (e.g., to GOROOT), the
-	// go tool may complain.
+	// Set GOPATH to an internal directory. The toolchain mostly
+	// uses vendor directories, but may download modules missing
+	// from vendor. If GOPATH points somewhere else (e.g., to
+	// GOROOT), the go tool may complain.
 	os.Setenv("GOPATH", pathf("%s/pkg/obj/gopath", goroot))
 
 	// Use a build cache separate from the default user one.
@@ -1642,6 +1641,7 @@ func appendCompilerFlags(args []string) []string {
 
 func goCmd(env []string, goBinary string, cmd string, args ...string) {
 	goCmd := []string{goBinary, cmd}
+	goCmd = append(goCmd, "-mod=mod")
 	if noOpt {
 		goCmd = append(goCmd, "-tags=noopt")
 	}
@@ -1659,7 +1659,7 @@ func goCmd(env []string, goBinary string, cmd string, args ...string) {
 }
 
 func checkNotStale(env []string, goBinary string, targets ...string) {
-	goCmd := []string{goBinary, "list"}
+	goCmd := []string{goBinary, "list", "-mod=mod"}
 	if noOpt {
 		goCmd = append(goCmd, "-tags=noopt")
 	}
