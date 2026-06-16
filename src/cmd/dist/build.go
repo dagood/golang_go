@@ -1002,6 +1002,36 @@ func packagefile(pkg string) string {
 	return pathf("%s/pkg/obj/go-bootstrap/%s_%s/%s.a", goroot, goos, goarch, pkg)
 }
 
+func stageBootstrapVendor() {
+	gorootBootstrap := os.Getenv("GOROOT_BOOTSTRAP")
+	if gorootBootstrap == "" {
+		fatalf("GOROOT_BOOTSTRAP is not set")
+	}
+
+	for _, dir := range []string{"src", "src/cmd"} {
+		vendorDir := pathf("%s/%s/vendor", goroot, dir)
+		xremoveall(vendorDir)
+		xatexit(func(vendorDir string) func() {
+			return func() { xremoveall(vendorDir) }
+		}(vendorDir))
+
+		cmd := exec.Command(pathf("%s/bin/go", gorootBootstrap), "mod", "vendor")
+		cmd.Dir = pathf("%s/%s", goroot, dir)
+		cmd.Env = append(os.Environ(),
+			"GO111MODULE=on",
+			"GOENV=off",
+			"GOFLAGS=",
+			"GOROOT="+goroot,
+			"GOTOOLCHAIN=local",
+			"GOWORK=off",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			os.Stderr.Write(out)
+			fatalf("go mod vendor in %s: %v", cmd.Dir, err)
+		}
+	}
+}
+
 // unixOS is the set of GOOS values matched by the "unix" build tag.
 // This is the same list as in go/build/syslist.go and
 // cmd/go/internal/imports/build.go.
@@ -1425,6 +1455,9 @@ func cmdbootstrap() {
 
 	timelog("build", "go_bootstrap")
 	xprintf("Building Go bootstrap cmd/go (go_bootstrap) using Go toolchain1.\n")
+	stageBootstrapVendor()
+	defer xremoveall(pathf("%s/src/vendor", goroot))
+	defer xremoveall(pathf("%s/src/cmd/vendor", goroot))
 	install("runtime")     // dependency not visible in sources; also sets up textflag.h
 	install("time/tzdata") // no dependency in sources; creates generated file
 	install("cmd/go")
