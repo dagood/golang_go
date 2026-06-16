@@ -1597,6 +1597,14 @@ func setDefaultBuildMod(ld *Loader) {
 	}
 
 	if len(ld.modRoots) >= 1 {
+		if ld.MainModules != nil && len(ld.MainModules.Versions()) == 1 {
+			m := ld.MainModules.Versions()[0]
+			if m.Path == "std" && ld.MainModules.InGorootSrc(m) {
+				cfg.BuildMod = "readonly"
+				return
+			}
+		}
+
 		var goVersion string
 		var versionSource string
 		if ld.inWorkspaceMode() {

@@ -61,10 +61,29 @@ stdout ^vendor/
 go list -deps -f '{{if not .Standard}}{{.ImportPath}}{{end}}' std
 ! stdout .
 
-# However, the 'golang.org/…' module dependencies should resolve to those same
-# directories.
+# The std module should not default to -mod=vendor: explicitly-added
+# requirements should use module resolution instead of GOROOT/src/vendor.
 
-go list -f '{{.Dir}}' golang.org/x/net/http2/hpack
+cp go.mod $WORK/std.mod
+go mod edit -modfile=$WORK/std.mod -droprequire=golang.org/x/crypto -droprequire=golang.org/x/mod -droprequire=golang.org/x/net -droprequire=golang.org/x/sync -droprequire=golang.org/x/sys -droprequire=golang.org/x/term -droprequire=golang.org/x/text -droprequire=golang.org/x/tools
+go mod edit -modfile=$WORK/std.mod -require=example.com/dep@v1.0.0 -replace=example.com/dep@v1.0.0=$WORK/dep
+go list -modfile=$WORK/std.mod -f '{{.Dir}}' example.com/dep
+stdout $WORK[/\\]dep
+
+# Workspaces including std should also use normal module resolution.
+
+cd $WORK
+go work init $GOROOT/src ./dep
+env GOWORK=$WORK/go.work
+cd $GOROOT/src
+go list -f '{{.Dir}}' example.com/dep
+stdout $WORK[/\\]dep
+env GOWORK=off
+
+# With an explicit -mod=vendor, the 'golang.org/…' module dependencies should
+# resolve to the vendored directories.
+
+go list -mod=vendor -f '{{.Dir}}' golang.org/x/net/http2/hpack
 stdout $GOROOT[/\\]src[/\\]vendor
 
 # Within the std module, the packages within the module should omit the 'std/'
@@ -82,12 +101,17 @@ stdout ^bytes$
 
 # Within std, the vendored dependencies of cmd should still appear to be part of cmd.
 
-go list -f '{{if .Standard}}{{.ImportPath}}{{end}}' cmd
+go list -mod=vendor -f '{{if .Standard}}{{.ImportPath}}{{end}}' cmd
 stdout ^cmd/vendor/golang\.org/x/arch/x86/x86asm
 
-go list -f '{{if not .Standard}}{{.ImportPath}}{{end}}' cmd
+go list -mod=vendor -f '{{if not .Standard}}{{.ImportPath}}{{end}}' cmd
 ! stdout .
 
-go list cmd/...
+go list -mod=vendor cmd/...
 stdout ^cmd/compile
 ! stdout ^cmd/vendor/golang\.org/x/arch/x86/x86asm
+
+-- $WORK/dep/go.mod --
+module example.com/dep
+-- $WORK/dep/dep.go --
+package dep
